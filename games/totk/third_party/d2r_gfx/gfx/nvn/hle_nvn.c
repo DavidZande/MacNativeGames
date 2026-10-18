@@ -1498,7 +1498,7 @@ NVN(nvnCommandBufferSetRasterizerDiscard, void, NVNcommandBuffer *c, uint32_t e)
 static uint64_t g_frame;
 int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);
 static _Atomic int g_diag_env_once = -1;
-static const char *bindprog_env(void) { return getenv("TOTK_BINDPROG_LOG"); }
+static const char *bindprog_env(void) { static int read; static const char *v; if (!read) { v = getenv("TOTK_BINDPROG_LOG"); read = 1; } return v; }   /* local change: read once (was every BindProgram, 1.3% of the game threads) */
 static int diag_env_once_on(void) {
     int v = atomic_load_explicit(&g_diag_env_once, memory_order_relaxed);
     if (v < 0) {
