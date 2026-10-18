@@ -192,7 +192,7 @@ int main(int argc, char **argv) {
           }
           if ([d boolForKey:@"metalfxUpscale"]) setenv("TOTK_MFX_UPSCALE", "1", 0);
           if ([d objectForKey:@"perfLog"] && ![d boolForKey:@"perfLog"]) setenv("TOTK_PERF_LOG", "0", 0);
-          if ([d objectForKey:@"asyncCompile"] && ![d boolForKey:@"asyncCompile"]) { setenv("TOTK_ASYNC_PSO", "0", 0); setenv("TOTK_ASYNC_XLATE", "0", 0); }
+          if ([d objectForKey:@"asyncCompile"] && ![d boolForKey:@"asyncCompile"]) { setenv("TOTK_ASYNC_PSO", "0", 0); setenv("TOTK_ASYNC_XLATE", "0", 0); setenv("TOTK_ASYNC_SHLOAD", "0", 0); }
           if ([d objectForKey:@"pauseHidden"] && ![d boolForKey:@"pauseHidden"]) setenv("TOTK_PAUSE_HIDDEN", "0", 0);
           NSString *fps = [d stringForKey:@"fpsCap"] ?: @"unlimited";
           if ([fps isEqualToString:@"60"]) setenv("DM_PRESENT_HZ", "60", 0);

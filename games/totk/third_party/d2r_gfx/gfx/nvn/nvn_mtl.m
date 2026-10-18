@@ -4785,10 +4785,49 @@ static int rt_range_pr_ro(NvProg *p) {
     for (int k=0;k<6;k++) if (p->sh[k] && (k>1 || p->sh[k]->stage != k || !p->sh[k]->range_ro || p->sh[k]->rf.drv_read[0] || p->sh[k]->rf.drv_read[2])) return 0;
     return 1;
 }
-static NvShader *shader_get(NSString *pc, int stage) {
+/* Local change, TOTK_ASYNC_SHLOAD (default on; off with "Background shader compiling"): a library that is not loaded yet
+   is loaded (and compiled when the system cache does not have it) on a background thread, and the caller's draw is skipped
+   until it is ready (*pending = 1), instead of the render thread compiling it (100-700 ms per new effect). Compute shaders
+   and the first frames load in place, for the same reasons as the background translation (totk_shader_rt.m). */
+static os_unfair_lock g_shl_lock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary<NSString *, id> *g_shl_ready; static NSMutableSet<NSString *> *g_shl_pending;
+static _Atomic uint64_t g_shl_gen;
+uint64_t g_shl_async_n, g_shl_async_ns;   /* libraries loaded in the background (perf / log) */
+static uint64_t prog_gen(void) { return totk_rt_gen() + atomic_load(&g_shl_gen); }   /* moves when a pending stage may be ready */
+static int async_shload_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_SHLOAD"); v = !(e && !atoi(e)); MLOG("background shader library loading (TOTK_ASYNC_SHLOAD): %s", v ? "on" : "off"); } return v; }
+static dispatch_queue_t shload_queue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("totk.shader-load", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0)); });
+    return q;
+}
+static NvShader *shader_get_ex(NSString *pc, int stage, int *pending);
+static NvShader *shader_get(NSString *pc, int stage) { return shader_get_ex(pc, stage, NULL); }
+static NvShader *shader_get_ex(NSString *pc, int stage, int *pending) {
+    if (pending) *pending = 0;
     if (!g_shcache) g_shcache = [NSMutableDictionary dictionary];
     NvShader *o = g_shcache[pc];
     if (o) return o;
+    if (pending && stage != 5 && async_shload_on() && atomic_load(&g_cur_frame) >= 120) {
+        os_unfair_lock_lock(&g_shl_lock);
+        if (!g_shl_ready) { g_shl_ready = [NSMutableDictionary dictionary]; g_shl_pending = [NSMutableSet set]; }
+        id r = g_shl_ready[pc]; if (r) [g_shl_ready removeObjectForKey:pc];
+        BOOL inflight = [g_shl_pending containsObject:pc]; if (!r && !inflight) [g_shl_pending addObject:pc];
+        os_unfair_lock_unlock(&g_shl_lock);
+        if (r && r != (id)NSNull.null) {   /* loaded in the background: publish it here, on the submit thread */
+            o = r; g_shcache[pc] = o;
+            pso_record("S\t%s\t%d\n", pc.UTF8String, stage); pso_user_record("S\t%s\t%d\n", pc.UTF8String, stage);
+            return o;
+        }
+        if (!r) {
+            if (!inflight) dispatch_async(shload_queue(), ^{
+                uint64_t t0 = bp_now(); NvShader *x = shader_load(pc, stage);
+                os_unfair_lock_lock(&g_shl_lock); g_shl_ready[pc] = x ?: (id)NSNull.null; [g_shl_pending removeObject:pc]; os_unfair_lock_unlock(&g_shl_lock);
+                __atomic_fetch_add(&g_shl_async_n, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_shl_async_ns, bp_now() - t0, __ATOMIC_RELAXED); atomic_fetch_add(&g_shl_gen, 1);
+            });
+            *pending = 1; return nil;
+        }
+        /* NSNull: the background load failed; load in place below so the failure is reported as before */
+    }
     uint64_t bt = bp_now(); o = shader_load(pc, stage);
     if (!o) { if (survey_shader_log()) MLOG("[survey-shader] frame %llu Metal library FAILED stage %d %s after %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), stage, pc.UTF8String, (bp_now() - bt) / 1e6); return nil; }
     g_shcache[pc] = o;
@@ -4808,7 +4847,7 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
     uint64_t gen = g_ser_gen;
-    uint64_t xg = totk_rt_gen();
+    uint64_t xg = prog_gen();
     if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser)) && !(lpr->missing && lpr->xgen != xg)) { lgen = gen; return lpr; }
     __unsafe_unretained NvProg *have = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
     if (have && !(have->missing && have->xgen != xg)) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
@@ -4832,7 +4871,8 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
             MLOG("[ctl st%d]%s", st, b); } }
         NSString *variant=totk_rt_variant(@(key),st,control,(const uint8_t *)(uintptr_t)p->sd[i].data,rt_answers(st),rt_local(control,st));
         if(!variant){o->missing|=1<<st;o->ctl[st]=control;o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data;o->key[st]=@(key);continue;}   // iOS: not translated yet, its draws are skipped
-        NvShader *sh=shader_get([variant stringByAppendingString:@"_b"],st);
+        int shpend=0; NvShader *sh=shader_get_ex([variant stringByAppendingString:@"_b"],st,&shpend);
+        if(!sh&&shpend){o->missing|=1<<st;o->ctl[st]=control;o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data;o->key[st]=@(key);continue;}   /* library loading in the background */
         if(!sh)MDIE("TOTK shader translation/reflection unavailable for %s",variant.UTF8String);
         o->sh[st]=sh; o->ctl[st]=control; o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data; o->key[st]=@(key);
         o->sig[st]=stage_sig(st); o->alt[st]=[NSMutableDictionary dictionaryWithObject:sh forKey:@(o->sig[st])];
@@ -5375,12 +5415,13 @@ static int prog_fit(NvProg *pr) {
     for (int st = 0; st < 2; st++) {
         if (!pr->sh[st] || !pr->key[st]) continue;
         uint64_t sg = stage_sig(st); if (sg == pr->sig[st]) continue;
-        if (pr->miss_has[st] && sg == pr->miss_sig[st]) { if (pr->xgen == totk_rt_gen()) return -1; pr->miss_has[st] = 0; }   /* retry once a translation landed */
+        if (pr->miss_has[st] && sg == pr->miss_sig[st]) { if (pr->xgen == prog_gen()) return -1; pr->miss_has[st] = 0; }   /* retry once a translation landed */
         NvShader *v = pr->alt[st][@(sg)];
         if (!v) {
             NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), nil);
-            if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; pr->xgen = totk_rt_gen(); return -1; }   // not translated yet (iOS; Mac: in the background)
-            v = shader_get([variant stringByAppendingString:@"_b"], st);
+            if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; pr->xgen = prog_gen(); return -1; }   // not translated yet (iOS; Mac: in the background)
+            int shpend = 0; v = shader_get_ex([variant stringByAppendingString:@"_b"], st, &shpend);
+            if (!v && shpend) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; pr->xgen = prog_gen(); return -1; }   /* library loading in the background */
             if (!v) MDIE("TOTK shader translation/reflection unavailable for %s", variant.UTF8String);
             pr->alt[st][@(sg)] = v;
         }
