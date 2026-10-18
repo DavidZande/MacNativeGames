@@ -58,6 +58,7 @@ def config_env(name):
         elif p == 'sync': env.update(TOTK_ASYNC_PSO='0', TOTK_ASYNC_XLATE='0', TOTK_ASYNC_SHLOAD='0')
         elif p == 'noshload': env['TOTK_ASYNC_SHLOAD'] = '0'   # libraries loaded on the render thread (before this change)
         elif p == 'salt': env['TOTK_MSL_SALT'] = f'bench {name} {time.time()}'   # every Metal compile new to the system cache
+        elif p == 'norecycle': env['TOTK_PSO_RECYCLE'] = '0'   # background pipeline table not recycled when full (before)
         elif p == 'noprime': env['TOTK_XLATE_PRIME'] = '0'   # translated libraries compiled on the render thread (before this fix)
         elif p in ('qosutil', 'qosdef', 'qosinit'): env['TOTK_COMPILE_QOS'] = {'qosutil': 'utility', 'qosdef': 'default', 'qosinit': 'initiated'}[p]
         elif p == 'xcold': env.update(TOTK_SHADER_SEED='off', DM_PSO_MANIFEST='off', TOTK_WARM_LIGHT='0')   # empty translation cache (see run)

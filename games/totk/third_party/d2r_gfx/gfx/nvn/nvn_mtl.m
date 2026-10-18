@@ -5857,6 +5857,24 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // æ
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k), slot = -1;
     if (at < 0) for (int i = 0; i < PSO_PEND_MAX; i++) if (!g_pp[i].used) { slot = i; break; }
+    static int recycle = -1; if (recycle < 0) { const char *e = getenv("TOTK_PSO_RECYCLE"); recycle = !(e && !atoi(e)); }
+    if (at < 0 && slot < 0 && recycle) {
+        /* Local change: the table is full. Finished pipelines that no draw has taken (mostly predictions whose draw came with
+           another key, or never came) used to keep their slots forever, and from then on every new pipeline was built in
+           place on the submit thread (737 in a few minutes of open world). They are valid for their keys: move them into
+           the pipeline cache (submit thread, as pso_get) and reuse the slots. */
+        static pso_key moved_k[PSO_PEND_MAX]; static __strong id<MTLRenderPipelineState> moved_ps[PSO_PEND_MAX]; int nm = 0;
+        for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && g_pp[i].done) {
+            if (g_pp[i].ps) { moved_k[nm] = g_pp[i].k; moved_ps[nm++] = g_pp[i].ps; }
+            g_pp[i].ps = nil; g_pp[i].used = 0; if (slot < 0) slot = i;
+        }
+        pthread_mutex_unlock(&g_pp_mu);
+        for (int i = 0; i < nm; i++) { if (!hm_get_id(&g_pso, &moved_k[i])) hm_put_id(&g_pso, &moved_k[i], moved_ps[i]); moved_ps[i] = nil; }
+        static unsigned said; if (said++ < 5 || said % 100 == 0) MLOG("[pso-pend] table full: %d finished pipelines moved to the cache, slot %s", nm, slot >= 0 ? "free" : "still none");
+        pthread_mutex_lock(&g_pp_mu);
+        if (slot >= 0 && g_pp[slot].used) slot = -1;
+        if (slot < 0) for (int i = 0; i < PSO_PEND_MAX; i++) if (!g_pp[i].used) { slot = i; break; }
+    }
     if (at < 0 && slot >= 0) { g_pp[slot].k = *k; g_pp[slot].ps = nil; g_pp[slot].done = 0; g_pp[slot].used = 1; }
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
