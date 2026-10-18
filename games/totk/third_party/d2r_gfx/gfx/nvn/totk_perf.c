@@ -24,6 +24,7 @@ extern uint64_t totk_rt_block_ns(void), totk_rt_pending(void);
 extern uint64_t g_inplace_pso_n, g_inplace_pso_ns, g_inplace_pso_max_ns, g_inplace_merged_n;   /* nvn_mtl.m */
 extern void runtime_gate_counts(uint64_t *timer, uint64_t *svc) __attribute__((weak_import));   /* runtime/loader.c */     /* totk_shader_rt.m */           /* nvn_mtl.m: TOTK_ASYNC_PSO */                                   /* nvn_mtl.m: the first world frame was presented */
 extern int runtime_output_mode_get(void) __attribute__((weak_import));
+extern void runtime_handoff_stats(uint64_t out[16]) __attribute__((weak_import));   /* runtime/threads.c */
 extern uint64_t runtime_audio_underruns(void) __attribute__((weak_import));   /* runtime/audio_mixer.c */   /* runtime/game_patches.c (absent in graphics tests) */
 
 #define PERF_MAX 2048   /* frames a second, at most */
@@ -65,12 +66,12 @@ static void *writer(void *arg) {
     time_t now = time(NULL); char ts[32]; strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", localtime(&now));
     fprintf(f, "# launch %s pid %d\n", ts, getpid());
     fprintf(f, "time,uptime_s,frames,fps,frame_p50_ms,frame_p95_ms,frame_p99_ms,frame_max_ms,present_p50_ms,present_p95_ms,present_p99_ms,present_max_ms,present_dropped,gpu_avg_ms,gpu_p95_ms,cpu_pct,long50,long100,"
-               "new_pipelines,new_libraries,build_ms,skipped_draws,skipped_missing,footprint_mb,loading,world,draws_per_frame,async_queued,async_skipped,audio_underruns,xlate_block_ms,xlate_pending,timer_reads,svc_calls,inplace_pso,inplace_merged,inplace_pso_ms,inplace_pso_max_ms,"
+               "new_pipelines,new_libraries,build_ms,skipped_draws,skipped_missing,footprint_mb,loading,world,draws_per_frame,async_queued,async_skipped,audio_underruns,xlate_block_ms,xlate_pending,timer_reads,svc_calls,inplace_pso,inplace_merged,inplace_pso_ms,inplace_pso_max_ms,wakes,wake_ms,core_waits,core_wait_ms,main_wake_ms,main_core_wait_ms,main_lock_ms,main_cond_ms,main_addr_ms,main_sync_ms,main_host_wait_ms,core0_pct,core1_pct,core2_pct,"
                "mode,render_res,fps60,present_hz,mfx_upscale,mfx_output,picture,interpolation,warm_threads,async_pso\n");
     fflush(f);
     static double fr[PERF_MAX], gp[PERF_MAX], pv[PERF_MAX];
     double t0 = (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9, last_cpu = cpu_s(), last_t = t0;
-    uint64_t last_skip = 0, last_miss = 0, last_draws = 0, last_frames = 0, last_aq = 0, last_as = 0, last_au = 0, last_xb = 0, last_tr = 0, last_sv = 0, tr = 0, sv = 0, last_ipn = 0, last_ipm = 0, last_ipns = 0;
+    uint64_t last_skip = 0, last_miss = 0, last_draws = 0, last_frames = 0, last_aq = 0, last_as = 0, last_au = 0, last_xb = 0, last_tr = 0, last_sv = 0, tr = 0, sv = 0, last_ipn = 0, last_ipm = 0, last_ipns = 0, hs[16] = {0}, last_hs[16] = {0};
     for (;;) {
         sleep(1);
         pthread_mutex_lock(&g_mu);
@@ -87,15 +88,17 @@ static void *writer(void *arg) {
         uint64_t skip = 0; for (int i = 0; i < 16; i++) skip += g_draw_skip[i];
         uint64_t miss = g_draw_skip[15], passes, draws; mtl_stats(&passes, &draws);
         if (runtime_gate_counts) runtime_gate_counts(&tr, &sv);
+        if (runtime_handoff_stats) runtime_handoff_stats(hs);
         double dpf = frames > last_frames ? (double)(draws - last_draws) / (double)(frames - last_frames) : 0; last_draws = draws; last_frames = frames;
         now = time(NULL); strftime(ts, sizeof ts, "%H:%M:%S", localtime(&now));
-        fprintf(f, "%s,%.1f,%llu,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%.2f,%.2f,%.0f,%u,%u,%u,%u,%.1f,%llu,%llu,%.0f,%u,%d,%.0f,%llu,%llu,%llu,%.1f,%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s\n",
+        fprintf(f, "%s,%.1f,%llu,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%.2f,%.2f,%.0f,%u,%u,%u,%u,%.1f,%llu,%llu,%.0f,%u,%d,%.0f,%llu,%llu,%llu,%.1f,%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%llu,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f,%.0f,%.0f,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s\n",
                 ts, t - t0, (unsigned long long)frames, n, pct(fr, n, .5), pct(fr, n, .95), pct(fr, n, .99), n ? fr[n - 1] : -1, pct(pv, npv, .5), pct(pv, npv, .95), pct(pv, npv, .99), npv ? pv[npv - 1] : -1, pdrop,
                 ng ? gs / ng : -1, pct(gp, ng, .95), cpu, l50, l100, pso, lib, make,
                 (unsigned long long)(skip - last_skip), (unsigned long long)(miss - last_miss), footprint_mb(), load, mtl_world_seen(), dpf, (unsigned long long)(g_async_pso_kicked - last_aq), (unsigned long long)(g_async_pso_skipped - last_as), (unsigned long long)((runtime_audio_underruns ? runtime_audio_underruns() : 0) - last_au), (totk_rt_block_ns() - last_xb) / 1e6, (unsigned long long)totk_rt_pending(), (unsigned long long)(tr - last_tr), (unsigned long long)(sv - last_sv), (unsigned long long)(g_inplace_pso_n - last_ipn), (unsigned long long)(g_inplace_merged_n - last_ipm), (g_inplace_pso_ns - last_ipns) / 1e6, g_inplace_pso_max_ns / 1e6,
+                (unsigned long long)(hs[0] - last_hs[0]), (hs[1] - last_hs[1]) / 1e6, (unsigned long long)(hs[2] - last_hs[2]), (hs[3] - last_hs[3]) / 1e6, (hs[5] - last_hs[5]) / 1e6, (hs[7] - last_hs[7]) / 1e6, (hs[8] - last_hs[8]) / 1e6, (hs[9] - last_hs[9]) / 1e6, (hs[10] - last_hs[10]) / 1e6, (hs[11] - last_hs[11]) / 1e6, (hs[12] - last_hs[12]) / 1e6, (hs[13] - last_hs[13]) / 1e7, (hs[14] - last_hs[14]) / 1e7, (hs[15] - last_hs[15]) / 1e7,
                 env_or("TOTK_OPERATION_MODE", "docked"), env_or("TOTK_RENDER_RES", "game"), env_or("TOTK_FPS60", "1"), env_or("DM_PRESENT_HZ", "display"),
                 mfxup_enabled(), mfxup_output_enabled(), runtime_output_mode_get ? runtime_output_mode_get() : -1, mfx_requested(), env_or("TOTK_WARM_THREADS", "auto"), env_or("TOTK_ASYNC_PSO", "0"));
-        last_aq = g_async_pso_kicked; last_as = g_async_pso_skipped; last_au = runtime_audio_underruns ? runtime_audio_underruns() : 0; last_xb = totk_rt_block_ns(); last_tr = tr; last_sv = sv; last_ipn = g_inplace_pso_n; last_ipm = g_inplace_merged_n; last_ipns = g_inplace_pso_ns; g_inplace_pso_max_ns = 0;
+        last_aq = g_async_pso_kicked; last_as = g_async_pso_skipped; last_au = runtime_audio_underruns ? runtime_audio_underruns() : 0; last_xb = totk_rt_block_ns(); last_tr = tr; last_sv = sv; last_ipn = g_inplace_pso_n; last_ipm = g_inplace_merged_n; last_ipns = g_inplace_pso_ns; g_inplace_pso_max_ns = 0; memcpy(last_hs, hs, sizeof hs);
         fflush(f);
         last_skip = skip; last_miss = miss;
     }

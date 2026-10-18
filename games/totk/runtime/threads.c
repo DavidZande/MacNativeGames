@@ -62,6 +62,9 @@ typedef struct thr {
     int cur_core;              // virtual core held while running guest code, -1 while blocked / not started
     int preempt;               // a higher-priority thread waits for this thread's core
     uint64_t cseq, core_since; struct thr *cnext;
+    uint32_t woke_by;          // local change: handle of the thread whose call woke this one (TOTK_WAITSTAT)
+    uint64_t tid;              // local change: host thread id (as `sample` names threads)
+    uint64_t wake_at;          // local change: when wake() signalled this thread (handoff latency, perf.csv)
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
 } thr_t;
@@ -112,7 +115,19 @@ static thr_t *pick(int kind, uint64_t a) {
     }
     return b;
 }
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); }
+// Local change: handoff statistics for perf.csv. wake = signal -> woken thread runs again (holding G);
+// core = time spent queued for a virtual core. [0..3] all guest threads, [4..7] the guest main thread.
+static uint64_t g_hand[16];   // [13..15]: time each virtual core was held (core utilization)
+   // [12]: guest main thread time away in blocking host services (runtime_core_away)
+   // [8..11]: guest main thread time blocked in waits of kind 1..4 (lock, condition, address, sync object)
+static thr_t *g_main_thr;
+void runtime_handoff_stats(uint64_t out[16]) { for (int i = 0; i < 16; i++) out[i] = __atomic_load_n(&g_hand[i], __ATOMIC_RELAXED); }
+static void hand_note(thr_t *t, int which, uint64_t ns) {
+    __atomic_fetch_add(&g_hand[which * 2], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_hand[which * 2 + 1], ns, __ATOMIC_RELAXED);
+    if (t == g_main_thr) { __atomic_fetch_add(&g_hand[4 + which * 2], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_hand[5 + which * 2], ns, __ATOMIC_RELAXED); }
+}
+static thr_t *me_or_null(void);
+static void wake(thr_t *t, int64_t res) { { thr_t *w = me_or_null(); t->woke_by = w ? w->handle : 0; } wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; t->wake_at = now_ns(); pthread_cond_signal(&t->cv); }
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
@@ -137,7 +152,9 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
-    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
+    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL;
+    __atomic_fetch_add(&g_hand[13 + c], now_ns() - t->core_since, __ATOMIC_RELAXED);
+    core_grant(c);
 }
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
@@ -147,7 +164,29 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
+    uint64_t q0 = now_ns();
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
+    hand_note(t, 1, now_ns() - q0);
+}
+// Local change (TOTK_LOCKSTAT=1): which guest mutexes the guest main thread waits on, who holds them, how long.
+// Holding G. Logged every 5 s as "[totk] main lock waits".
+static void main_lock_note(uint64_t addr, uint32_t owner, uint64_t lr, uint64_t ns) {
+    static int on = -1; if (on < 0) on = getenv("TOTK_LOCKSTAT") != NULL; if (!on) return;
+    enum { N = 16 };
+    static struct { uint64_t addr, lr, ns, n; uint32_t owner; } e[N]; static uint64_t last;
+    int i = 0; while (i < N && e[i].n && (e[i].addr != addr || e[i].owner != owner)) i++;
+    if (i == N) i = N - 1;
+    if (e[i].addr != addr || e[i].owner != owner) { e[i].addr = addr; e[i].owner = owner; e[i].ns = e[i].n = 0; }
+    e[i].lr = lr; e[i].ns += ns; e[i].n++;
+    uint64_t now = now_ns(); if (!last) last = now; if (now - last < 5000000000ull) return;
+    double secs = (now - last) / 1e9; last = now;
+    for (int k = 0; k < N && e[k].n; k++) {
+        thr_t *o = NULL; for (thr_t *x = g_all; x; x = x->all) if (x->handle == (e[k].owner & ~WAITERS_BIT)) { o = x; break; }
+        fprintf(stderr, "[totk] main lock waits: lock %#llx owner %#x (entry %#llx arg %#llx prio %d core %d host thread %llu) %.1f ms/s %llu waits/s, caller lr %#llx\n",
+                (unsigned long long)e[k].addr, e[k].owner, o ? (unsigned long long)o->entry : 0ull, o ? (unsigned long long)o->arg : 0ull, o ? o->prio : -1, o ? o->core : -1, o ? (unsigned long long)o->tid : 0ull,
+                e[k].ns / 1e6 / secs, (unsigned long long)(e[k].n / secs), (unsigned long long)e[k].lr);
+        e[k].ns = e[k].n = 0;
+    }
 }
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
@@ -155,10 +194,13 @@ uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t
 // Host services that wait for other threads or the GPU give the core up around the wait (no host locks held).
 int runtime_core_away(void) {
     thr_t *t = me_or_null(); if (!t || t->cur_core < 0) return 0;
-    pthread_mutex_lock(&G); core_put(t); pthread_mutex_unlock(&G); return 1;
+    pthread_mutex_lock(&G); core_put(t); pthread_mutex_unlock(&G);
+    if (t == g_main_thr) t->wake_at = now_ns() | 1;   // reused as the away start: block_inner never runs while away
+    return 1;
 }
 void runtime_core_back(int *away) {
     thr_t *t = me_or_null(); if (!*away || !t) return;
+    if (t == g_main_thr && t->wake_at) { __atomic_fetch_add(&g_hand[12], now_ns() - t->wake_at, __ATOMIC_RELAXED); t->wake_at = 0; }
     pthread_mutex_lock(&G); core_take(t); pthread_mutex_unlock(&G);
 }
 // Preemption point at SVC entry: a higher-priority thread waits for this core.
@@ -168,9 +210,43 @@ void runtime_core_checkpoint(void) {
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
+// Local change (TOTK_WAITSTAT=<thread handle>, e.g. 0x1004): what one guest thread waits on (kind, address, the thread
+// that woke it, the guest caller) and for how long. Holding G. Logged every 5 s as "[totk] waits of".
+static uint32_t ws_handle(void) { static int r; static uint32_t h; if (!r) { const char *e = getenv("TOTK_WAITSTAT"); h = e ? (uint32_t)strtoul(e, NULL, 0) : 0; r = 1; } return h; }
+static void ws_note(thr_t *t, int kind, uint64_t addr, uint64_t ns) {
+    enum { N = 24 };
+    static struct { uint64_t addr, lr, ns, n; uint32_t by; int kind; } e[N]; static uint64_t last;
+    uint32_t by = t->woke_by; int i = 0;
+    while (i < N && e[i].n && (e[i].addr != addr || e[i].by != by || e[i].kind != kind)) i++;
+    if (i == N) i = N - 1;
+    if (e[i].addr != addr || e[i].by != by || e[i].kind != kind) { e[i].addr = addr; e[i].by = by; e[i].kind = kind; e[i].ns = e[i].n = 0; }
+    e[i].lr = t->last_lr; e[i].ns += ns; e[i].n++;
+    uint64_t now = now_ns(); if (!last) last = now; if (now - last < 5000000000ull) return;
+    double secs = (now - last) / 1e9; last = now;
+    for (int k = 0; k < N && e[k].n; k++) {
+        if (e[k].ns / secs > 1e6)
+            fprintf(stderr, "[totk] waits of %#x (host thread %llu): kind %d addr %#llx woken by %#x %.1f ms/s %.0f waits/s, caller lr %#llx\n", t->handle, (unsigned long long)t->tid, e[k].kind,
+                    (unsigned long long)e[k].addr, e[k].by, e[k].ns / 1e6 / secs, e[k].n / secs, (unsigned long long)e[k].lr);
+        e[k].ns = e[k].n = 0;
+    }
+}
+extern int totk_tl_on(void) __attribute__((weak_import));   // third_party/.../totk_timeline.c (TOTK_TIMELINE)
+extern void totk_tl_at(int kind, uint64_t t_ns, uint64_t a, uint64_t b) __attribute__((weak_import));
+static void tl_gblock(thr_t *t, int kind, uint64_t t0, uint32_t waker) {
+    if (totk_tl_on && totk_tl_on()) totk_tl_at(17, t0, now_ns() - t0, (uint64_t)kind | (uint64_t)(t->handle & 0xffffff) << 8 | (uint64_t)waker << 32);
+}
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
-    core_put(t); int64_t r = block_inner(t, kind, ns); core_take(t); return r;
+    uint64_t b0 = t == g_main_thr && kind >= 1 && kind <= 4 ? now_ns() : 0;
+    uint64_t w0 = ws_handle() && t->handle == ws_handle() ? now_ns() : 0, wa = kind == 2 ? t->wkey : t->waddr;
+    t->woke_by = 0;
+    uint64_t tl0 = now_ns();
+    core_put(t); int64_t r = block_inner(t, kind, ns);
+    if (b0) __atomic_fetch_add(&g_hand[7 + kind], now_ns() - b0, __ATOMIC_RELAXED);
+    if (w0) ws_note(t, kind, wa, now_ns() - w0);
+    tl_gblock(t, kind, tl0, t->woke_by);
+    uint64_t c0 = now_ns(); core_take(t); if (now_ns() - c0 > 20000) tl_gblock(t, 6, c0, 0);
+    return r;
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
@@ -190,6 +266,7 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
         } else rc = ns > 0 ? pthread_cond_timedwait(&t->cv, &G, &dl) : pthread_cond_wait(&t->cv, &G);
         if (rc == ETIMEDOUT && !t->woke && (!det_wait || guest_ns() >= guest_deadline)) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     }
+    if (t->wake_at) { uint64_t n = now_ns(); hand_note(t, 0, n > t->wake_at ? n - t->wake_at : 0); t->wake_at = 0; }
     return t->wres;
 }
 
@@ -234,7 +311,8 @@ static void *thread_main(void *p) {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
-    t->mport = pthread_mach_thread_np(pthread_self());
+    t->mport = pthread_mach_thread_np(pthread_self()); pthread_threadid_np(NULL, &t->tid);
+    if (getenv("TOTK_WAITSTAT") || getenv("TOTK_LOCKSTAT")) fprintf(stderr, "[totk] guest thread %#x = host thread %llu (entry %#llx arg %#llx prio %d core %d)\n", t->handle, (unsigned long long)t->tid, (unsigned long long)t->entry, (unsigned long long)t->arg, t->prio, t->core);
 
     guest_thread_init();
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
@@ -273,9 +351,10 @@ uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
+    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt); pthread_threadid_np(NULL, &t->tid);
     t->cur_core = -1;
-    pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); g_main_thr = t; pthread_mutex_unlock(&G);
+    if (getenv("TOTK_WAITSTAT") || getenv("TOTK_LOCKSTAT")) fprintf(stderr, "[totk] guest main thread %#x = host thread %llu\n", t->handle, (unsigned long long)t->tid);
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
@@ -355,7 +434,7 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x0B: {  // SleepThread(x0 ns)；0/-1/-2 = 各类让出 | SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
         int64_t ns = (int64_t)regs[0];
 
-        thr_t *self = cur();
+        thr_t *self = cur(); uint64_t sl0 = now_ns();
         if (ns > 0) { pthread_mutex_lock(&G); core_put(self); pthread_mutex_unlock(&G); }
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
@@ -371,7 +450,7 @@ int svc_thread(int num, uint64_t *regs) {
             if (!give) sched_yield();
             if (me && me->handle == 0x1001) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
         }
-        if (ns > 0) { pthread_mutex_lock(&G); core_take(self); pthread_mutex_unlock(&G); }
+        if (ns > 0) { pthread_mutex_lock(&G); core_take(self); pthread_mutex_unlock(&G); tl_gblock(self, 5, sl0, 0); }
 
         return 1;
     }
@@ -392,7 +471,11 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *t = cur(); uint64_t addr = regs[1];
         pthread_mutex_lock(&G);
         int64_t r = 0;
-        if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) { t->waddr = addr; t->wtag = (uint32_t)regs[2]; r = block(t, 1, -1); }
+        if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) {
+            uint64_t w0 = t == g_main_thr ? now_ns() : 0;
+            t->waddr = addr; t->wtag = (uint32_t)regs[2]; r = block(t, 1, -1);
+            if (w0) main_lock_note(addr, (uint32_t)regs[0], regs[30], now_ns() - w0);
+        }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }

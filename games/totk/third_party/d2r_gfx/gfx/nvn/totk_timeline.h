@@ -18,6 +18,7 @@ enum {
     TL_FINISH_IN, TL_FINISH_OUT,    /* nvnQueueFinish */
     TL_FENCE,                       /* fence value of commit a: b */
     TL_RS_JOIN,                     /* the replay thread waited a ns for the encode stage (b = join count) */
+    TL_GBLOCK,                      /* local change: a guest thread waited (runtime/threads.c): t = start, a = ns, b = kind | handle << 8 | waker << 32 (kind 1 lock, 2 condition, 3 address, 4 sync object, 5 sleep, 6 virtual core) */
 };
 
 int totk_tl_on(void);                                   /* the window is open (cheap after the first call) */

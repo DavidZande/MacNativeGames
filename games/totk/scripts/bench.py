@@ -59,6 +59,8 @@ def config_env(name):
         elif p == 'noshload': env['TOTK_ASYNC_SHLOAD'] = '0'   # libraries loaded on the render thread (before this change)
         elif p == 'salt': env['TOTK_MSL_SALT'] = f'bench {name} {time.time()}'   # every Metal compile new to the system cache
         elif p == 'norecycle': env['TOTK_PSO_RECYCLE'] = '0'   # background pipeline table not recycled when full (before)
+        elif p == 'synclog': env['TOTK_SYNC_LOG'] = '1'   # GPU-fence waits: calls, blocked, time
+        elif p == 'freecores': env['TOTK_FREE_CORES'] = '1'   # no Switch core arbitration between guest threads
         elif p == 'fine': env.update(DM_PRESENT_HZ='120', TOTK_INTERVAL_SCALE='2')   # 60 FPS cap paced on 120 Hz ticks
         elif p == 'noprime': env['TOTK_XLATE_PRIME'] = '0'   # translated libraries compiled on the render thread (before this fix)
         elif p in ('qosutil', 'qosdef', 'qosinit'): env['TOTK_COMPILE_QOS'] = {'qosutil': 'utility', 'qosdef': 'default', 'qosinit': 'initiated'}[p]
