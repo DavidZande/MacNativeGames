@@ -146,6 +146,7 @@ def run(name, args, outdir):
            'TMPDIR': os.environ.get('TMPDIR', '/tmp'), 'TOTK_PROFILE_DIR': str(profile), 'TOTK_INPUT_FILE': str(cmd_file),
            'TOTK_SLOT_OWNER': 'claude', 'TOTK_SLOT_PURPOSE': f'benchmark {name}', 'TOTK_ASSUME_FOCUS': '1', **config_env(name)}
     if args.hidden: env['TOTK_PAUSE_HIDDEN'] = '1'
+    if args.profile: env['TOTK_SYMBOL_MAP'] = str(rd / 'symbols.txt')
     perf_off = PERF.stat().st_size if PERF.exists() else 0
     log = rd / 'totk.log'
     if args.app:   # the packaged app's launcher (it writes ~/Library/Logs/MacNativeGames/totk.log)
@@ -218,6 +219,11 @@ def play(name, args, rd, cmd_file, perf_off, phase, phases):
         def pan():   # hold the right stick in 2.5 s steps (the input file allows 5 s per key command)
             for _ in range(max(1, args.seconds // 3)): send(cmd_file, f'key {KEY_RIGHT_STICK_RIGHT} 2500')
         phase('pan', args.seconds, pan)
+        if args.profile:   # standing still, CPU profile with guest code named (scripts/profile_guest.py)
+            log = rd / 'totk.log' if (rd / 'totk.log').exists() else LOG
+            r = subprocess.run([sys.executable, '-I', str(Path(__file__).with_name('profile_guest.py')), '--log', str(log), '--symbols', str(rd / 'symbols.txt'),
+                                '--input-file', str(cmd_file), '--perf', str(PERF), '--seconds', str(args.profile), '--out', str(rd / 'sample.txt')], capture_output=True, text=True)
+            (rd / 'profile.txt').write_text(r.stdout + r.stderr); print(r.stdout + r.stderr, flush=True)
 
 
 def main():
@@ -227,6 +233,7 @@ def main():
     ap.add_argument('--settle', type=int, default=8, help='seconds to wait before a phase')
     ap.add_argument('--title-only', action='store_true', help='no input: title screen only')
     ap.add_argument('--quit-running', action='store_true', help='quit a running game first')
+    ap.add_argument('--profile', type=int, default=0, help='after the pan: a CPU profile of N seconds standing still')
     ap.add_argument('--hidden', action='store_true', help='title, then minimized, then restored (no game input)')
     ap.add_argument('--app', action='store_true', help="run the packaged app's launcher instead of the work tree's binary")
     args = ap.parse_args()

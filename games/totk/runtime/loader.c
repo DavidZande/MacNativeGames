@@ -23,6 +23,7 @@
 #define NM (sizeof(modules)/sizeof(modules[0]))
 pthread_key_t runtime_keys[8];
 static uint64_t timer_calls, svc_calls;
+void runtime_gate_counts(uint64_t *timer, uint64_t *svc) { *timer = __atomic_load_n(&timer_calls, __ATOMIC_RELAXED); *svc = __atomic_load_n(&svc_calls, __ATOMIC_RELAXED); }   /* local change: perf.csv */
 _Noreturn void runtime_fail(const char *message) { fprintf(stderr,"[totk] FAIL: %s\n",message); exit(1); }
 static void need(bool c,const char *m) { if(!c) runtime_fail(m); }
 static size_t page_up(size_t x) { return (x+0x3fff)&~(size_t)0x3fff; }
@@ -190,7 +191,13 @@ static void map_module(Module *m,const char *dir) {
  uint64_t *key=(void *)(m->base+m->key_off);
  for(unsigned i=0;i<8;i++)key[i]=runtime_keys[i]*8;
  make_hash(m);
- fprintf(stderr,"[totk] mapped %s size=%zu symbols=%u\n",m->name,m->size,m->nsym);
+ fprintf(stderr,"[totk] mapped %s size=%zu symbols=%u base=%p gates=%u\n",m->name,m->size,m->nsym,m->base,m->ngate);
+ /* Local change: TOTK_SYMBOL_MAP=<file> appends "module base size" and the module's defined symbols ("offset size name"),
+    for scripts/profile_guest.py to name guest addresses. */
+ {const char *map=getenv("TOTK_SYMBOL_MAP");FILE *f=map&&*map?fopen(map,"a"):NULL;
+  if(f){fprintf(f,"module %s %p %zu\n",m->name,m->base,m->size);
+   for(unsigned i=1;i<m->nsym;i++)if(m->symbols[i].defined&&m->symbols[i].value<m->size)fprintf(f,"%llx %llx %s\n",(unsigned long long)m->symbols[i].value,(unsigned long long)m->symbols[i].size,m->symbols[i].name);
+   fclose(f);}}
 }
 /* TOTK_EXPORT_IOS=<dir>: after the game patches, write each module's text [0, page_up(TEXT_END)) for ios/tools/gen_embed.py.
    Relocations never reach the text (they start at DATA_OFF), so the exported bytes differ from the verified image only at
