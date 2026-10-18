@@ -187,7 +187,7 @@ def run(name, args, outdir):
                 w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
     try:
         time.sleep(3)
-        if not wait_for(lambda: log.exists() and 'first presented frame' in log.read_text(errors='replace'), 120): raise RuntimeError('no first frame')
+        if not wait_for(lambda: log.exists() and 'first presented frame' in log.read_text(errors='replace'), 900): raise RuntimeError('no first frame')
         if not {'cold', 'xcold'} & set(name.split('-')): wait_for(lambda: '管线预热完成' in log.read_text(errors='replace'), 600)   # warm-up done
         time.sleep(args.settle)
         play(name, args, rd, cmd_file, perf_off, phase, phases)
