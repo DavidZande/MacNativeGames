@@ -44,7 +44,7 @@ RES = {'540p': '960x540', '720p': '1280x720', '900p': '0', '1080p': '1920x1080',
 def config_env(name):
     """'900p-60', '720p-mfx-30', '540p-mfx-60', 'handheld-30' ... -> environment for the launcher."""
     parts = name.split('-')
-    env = {'TOTK_SETTINGS': 'off', 'TOTK_PAUSE_HIDDEN': '0', 'TOTK_OPERATION_MODE': 'docked', 'TOTK_RENDER_RES': '0', 'TOTK_MFX_UPSCALE': '0', 'TOTK_MFX': '0'}
+    env = {'TOTK_SETTINGS': 'off', 'TOTK_PAUSE_HIDDEN': '0', 'TOTK_FULLSCREEN': '0', 'TOTK_OPERATION_MODE': 'docked', 'TOTK_RENDER_RES': '0', 'TOTK_MFX_UPSCALE': '0', 'TOTK_MFX': '0'}
     for p in parts:
         if p in RES:
             env['TOTK_RENDER_RES'] = RES[p]
@@ -56,6 +56,7 @@ def config_env(name):
         elif p == 'unl': env.update(TOTK_FPS60='1')
         elif p == 'async': env['TOTK_ASYNC_PSO'] = '1'
         elif p == 'sync': env['TOTK_ASYNC_PSO'] = '0'
+        elif p == 'fs': env['TOTK_FULLSCREEN'] = '1'   # full screen (macOS Game Mode)
         elif p == 'rawaudio': env['TOTK_AUDIO_SMOOTH'] = '0'
         elif p.startswith('lat') and p[3:].isdigit(): env['DM_PRESENT_LATENCY'] = p[3:]   # CAMetalDisplayLink preferredFrameLatency
         elif p == 'cold': env.update(DM_PSO_MANIFEST='off', TOTK_WARM_LIGHT='0')   # no warm-up; with a fresh binary copy (cold Metal cache, see run)

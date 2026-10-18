@@ -356,7 +356,7 @@ static NSUserDefaults *settings_defaults(void){
  static NSUserDefaults *d;static dispatch_once_t once;
  dispatch_once(&once,^{d=[[NSUserDefaults alloc] initWithSuiteName:@"org.macnativegames.totk.settings"];
   [d registerDefaults:@{@"mode":@"docked",@"renderRes":@"900",@"metalfxUpscale":@NO,@"perfLog":@YES,@"asyncCompile":@YES,@"pauseHidden":@YES,@"padLayout":@"labels",@"padDeadzone":@0.12,@"customWidth":@1600,@"customHeight":@900,@"fpsCap":@"unlimited",@"pictureMode":@0,
-   @"interpolation":@0,@"showHints":@YES,@"fpsCounter":@YES,@"shaderCounter":@YES,@"loadCounter":@YES,@"startFullscreen":@NO,
+   @"interpolation":@0,@"showHints":@YES,@"fpsCounter":@YES,@"shaderCounter":@YES,@"loadCounter":@YES,@"startFullscreen":@YES,
    @"warmThreads":@0,@"aliasGiB":@8}];});
  return d;
 }
@@ -635,6 +635,8 @@ static void settings_install(void){
  NSApp.mainMenu=bar;NSApp.windowsMenu=winMenu;
  /* Saved changes made with keys 1-3 while the window is closed. */
  [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t){(void)t;if(!settings.panel.visible&&liveApplied)[settings pollLive];}];
- if([d boolForKey:@"startFullscreen"])dispatch_after(dispatch_time(DISPATCH_TIME_NOW,500*NSEC_PER_MSEC),dispatch_get_main_queue(),^{if(!(window.styleMask&NSWindowStyleMaskFullScreen))[window toggleFullScreen:nil];});
+ /* Full screen by default (macOS Game Mode only engages there); TOTK_FULLSCREEN=0|1 decides for this run. */
+ const char *fsenv=getenv("TOTK_FULLSCREEN");
+ if(fsenv?atoi(fsenv)!=0:(!settings_off()&&[d boolForKey:@"startFullscreen"]))dispatch_after(dispatch_time(DISPATCH_TIME_NOW,500*NSEC_PER_MSEC),dispatch_get_main_queue(),^{if(!(window.styleMask&NSWindowStyleMaskFullScreen))[window toggleFullScreen:nil];});
  fprintf(stderr,"[totk] settings: %s\n",[[d dictionaryRepresentation] objectsForKeys:@[@"mode",@"renderRes",@"metalfxUpscale",@"fpsCap",@"pictureMode",@"interpolation"] notFoundMarker:@"-"].description.UTF8String);
 }
