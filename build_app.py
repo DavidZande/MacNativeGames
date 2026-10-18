@@ -530,7 +530,7 @@ def step_shaders(tree, logs, *, version='v0'):
     run([tree/'.venv/bin/python', 'scripts/prepare_shader_seed.py', '--extra',
          '--romfs', tree/f'extracted/{version}/romfs', '--output', tree/f'build/shader-seed/{version}-extra',
          '--translator', translator, '--spirv-cross', tree/'build/spirv-cross/spirv-cross',
-         '--version', version], logs/'prepare-shader-seed-extra.log', cwd=tree)
+         '--version', version, '--modules', tree/f'rewritten/{version}'], logs/'prepare-shader-seed-extra.log', cwd=tree)
 
 
 def step_binary(tree, game, keys, env, logs, *, version="v0"):

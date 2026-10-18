@@ -224,12 +224,30 @@ def prepare(romfs, output, translator, spirv_cross, version):
     return report
 
 
-def prepare_extra(romfs, output, translator, spirv_cross, version, jobs=8):
+def module_shaders(modules):
+    """Shaders embedded in the decompressed game modules (main/sdk/subsdk0 .patched.bin): 40 in 1.0.0, all in main."""
+    found = {}
+    for path in sorted(Path(modules).glob('*.patched.bin')) if modules else []:
+        data = path.read_bytes(); pos = 0
+        while True:
+            pos = data.find(b'BNSH\0\0\0\0', pos)
+            if pos < 0: break
+            try:
+                size = struct.unpack_from('<I', checked(data, pos+28, 4))[0]
+                for key, stage, control, code in bnsh_shaders(checked(data, pos, size)):
+                    found.setdefault(key, (stage, control, code, path.name))
+                pos += max(size, 8)
+            except ValueError:
+                pos += 8
+    return found
+
+
+def prepare_extra(romfs, output, translator, spirv_cross, version, jobs=8, modules=None):
     """Local change: the effect and UI shaders (Effect/, UI/) not in the startup set, translated with `jobs` translator
     processes in parallel. Shipped as a second seed; the runtime imports it into the cache and compiles it into the
     system's Metal cache in a low-priority background pass, without loading it into memory (prime_only)."""
     import concurrent.futures, threading
-    identity = dict(schema=1, chain=CHAIN, version=version, prime_only=True,
+    identity = dict(schema=1, chain=CHAIN, version=version, prime_only=True, modules=bool(modules),
                     source_romfs_sha256=json.loads((romfs/'index.json').read_text())['romfs_sha256'],
                     translator_sha256=digest(translator.read_bytes()), spirv_cross_sha256=digest(spirv_cross.read_bytes()),
                     preparation_sha256=digest(Path(__file__).read_bytes()))
@@ -245,6 +263,7 @@ def prepare_extra(romfs, output, translator, spirv_cross, version, jobs=8):
     staging.mkdir(parents=True)
     _, startup, _ = inventory(romfs)
     _, found, archives = inventory(romfs, extra=True)
+    for key, value in module_shaders(modules).items(): found.setdefault(key, value)   # plus the game code's own shaders
     shaders = {k: v for k, v in found.items() if k not in startup}
     print(f'{len(shaders)} effect/UI shaders not in the startup set ({len(found)} found)', flush=True)
     local = threading.local(); procs = []; lock = threading.Lock()
@@ -304,8 +323,9 @@ def main():
     p.add_argument('--version', required=True)
     p.add_argument('--extra', action='store_true', help='the effect and UI shaders (Effect/, UI/) instead of the startup set')
     p.add_argument('--jobs', type=int, default=8)
+    p.add_argument('--modules', type=Path, help='with --extra: folder of the decompressed modules (*.patched.bin) to scan too')
     a = p.parse_args()
-    if a.extra: prepare_extra(a.romfs.resolve(), a.output.resolve(), a.translator.resolve(), a.spirv_cross.resolve(), a.version, a.jobs)
+    if a.extra: prepare_extra(a.romfs.resolve(), a.output.resolve(), a.translator.resolve(), a.spirv_cross.resolve(), a.version, a.jobs, a.modules.resolve() if a.modules else None)
     else: prepare(a.romfs.resolve(), a.output.resolve(), a.translator.resolve(), a.spirv_cross.resolve(), a.version)
 
 
