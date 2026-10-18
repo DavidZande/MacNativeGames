@@ -153,7 +153,8 @@ int main(int argc, char **argv) {
         }
         /* Local change: the RomFS lives outside the signed app (build_app.py step_app), in <data>/game-data/<version>/romfs. */
         if (![NSFileManager.defaultManager fileExistsAtPath:[root stringByAppendingPathComponent:@"extracted/" TOTK_GAME_DIR "/romfs/romfs.bin"]]) {
-            NSString *store = [data stringByAppendingPathComponent:@"game-data/" TOTK_GAME_DIR "/romfs"];
+            NSString *store = [[NSString stringWithContentsOfFile:[root stringByAppendingPathComponent:@"game-data.path"] encoding:NSUTF8StringEncoding error:nil]
+                               stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";   /* written by build_app.py */
             if (![NSFileManager.defaultManager fileExistsAtPath:[store stringByAppendingPathComponent:@"romfs.bin"]]) {
                 show_error([NSString stringWithFormat:@"The game data is missing from %@. Build the app again with build_app.py.", store]);
                 return 1;
@@ -191,7 +192,7 @@ int main(int argc, char **argv) {
           }
           if ([d boolForKey:@"metalfxUpscale"]) setenv("TOTK_MFX_UPSCALE", "1", 0);
           if ([d objectForKey:@"perfLog"] && ![d boolForKey:@"perfLog"]) setenv("TOTK_PERF_LOG", "0", 0);
-          if ([d objectForKey:@"asyncCompile"] && ![d boolForKey:@"asyncCompile"]) setenv("TOTK_ASYNC_PSO", "0", 0);
+          if ([d objectForKey:@"asyncCompile"] && ![d boolForKey:@"asyncCompile"]) { setenv("TOTK_ASYNC_PSO", "0", 0); setenv("TOTK_ASYNC_XLATE", "0", 0); }
           if ([d objectForKey:@"pauseHidden"] && ![d boolForKey:@"pauseHidden"]) setenv("TOTK_PAUSE_HIDDEN", "0", 0);
           NSString *fps = [d stringForKey:@"fpsCap"] ?: @"unlimited";
           if ([fps isEqualToString:@"60"]) setenv("DM_PRESENT_HZ", "60", 0);

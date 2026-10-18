@@ -559,9 +559,6 @@ def sign_app(app, logs):
     run(['codesign', '--verify', '--deep', '--strict', app], logs / 'verify-app-signature.log')
 
 
-GAME_DATA = Path.home() / 'Library/Application Support/MacNativeGames/TOTK/game-data'   # local change: see step_app
-
-
 def step_app(tree, out, logs, *, version="v0"):
     expected = VERSIONS[version]
     tmp = out.with_name(out.name + '.partial')
@@ -574,17 +571,19 @@ def step_app(tree, out, logs, *, version="v0"):
                 f'rewritten/{version}/subsdk0.patched.bin'):
         clone(tree / rel, res / rel)
     # Local change: the 17 GB RomFS is not sealed into the app. A code signature covers every file of the bundle, so each
-    # rebuild made macOS hash all 17 GB again on the next start ("Verifying..."). The image and its index go once to the
-    # player's data folder (an APFS clone on the same volume: instant, no extra space); the launcher passes the folder as
-    # TOTK_ROMFS, and the game still checks the image's SHA-256 (runtime/romfs.c) before using it.
-    store = GAME_DATA / version / 'romfs'
-    store.mkdir(parents=True, exist_ok=True)
+    # rebuild made macOS hash all 17 GB again on the next start ("Verifying..."). The image and its index go next to the
+    # work folder (<work>/game-data/<version>/romfs, an APFS clone on the same volume: instant, no extra space); the app
+    # names that folder in game-data.path, the launcher passes it as TOTK_ROMFS, and the game still checks the image's
+    # SHA-256 (runtime/romfs.c) before using it.
+    store = tree.parent / 'game-data' / version / 'romfs'
     for name in ('romfs.bin', 'runtime-index.bin'):
         src, dst = tree / f'extracted/{version}/romfs/{name}', store / name
-        if not (dst.is_file() and dst.stat().st_size == src.stat().st_size and dst.stat().st_mtime >= src.stat().st_mtime):
-            part = dst.with_name(name + '.partial')
-            if part.exists(): part.unlink()
-            clone(src, part); part.replace(dst)
+        if dst.is_file() and src.is_file() and dst.stat().st_size == src.stat().st_size and dst.stat().st_mtime >= src.stat().st_mtime:
+            continue
+        part = dst.with_name(name + '.partial')
+        if part.exists(): part.unlink()
+        clone(src, part); part.replace(dst)
+    (res / 'game-data.path').write_text(str(store.resolve()) + '\n')
     clone(tree / 'prebuilt/macos-arm64/totk_xlate', res / 'build/shader-service/totk_xlate')   # where totk_shader_rt.m looks for it
     for rel in (f'extracted/{version}/romfs-patches', f'extracted/{version}/romfs-patches-out', 'extracted/firmware/shared-fonts'):
         copy_tree(tree / rel, res / rel)
