@@ -31,6 +31,7 @@
 #include "nvn_dirty.h"
 #include "totk_vpool.h"
 #include "totk_lifelog.h"
+#include "totk_perf.h"
 #include <mach/mach_time.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -2557,6 +2558,17 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
+    {   /* Local change, TOTK_PAUSE_HIDDEN (default on; "Pause when hidden" in the settings): while the window is minimized
+           or fully covered, macOS shows none of these frames, so the game's present waits here and the game stops with it.
+           The real-time frame step ignores the gap (runtime_frame_step_update drops intervals over 0.25 s). */
+        extern int runtime_front_window_visible(void) __attribute__((weak_import));
+        static int on = -1; if (on < 0) { const char *e = getenv("TOTK_PAUSE_HIDDEN"); on = !(e && !strcmp(e, "0")); }
+        if (on && runtime_front_window_visible && runtime_front_window_visible() == 0) {
+            uint64_t t0 = now_ns(); LOG("[pause] window hidden: game paused");
+            while (runtime_front_window_visible() == 0) usleep(50000);
+            LOG("[pause] window visible again after %.1f s: game resumed", (now_ns() - t0) / 1e9);
+        }
+    }
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);
@@ -2666,7 +2678,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
               if (hidden) strlcat(b, "；接读取画面，不可见", sizeof b);
-              dm_longframe_note(b); } }
+              dm_longframe_note(b); }
+          if (r->f == f - 8) totk_perf_frame(r->fr, g, r->pso, r->lib, r->make_ms, r->ls); }   /* local change: perf.csv */
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();

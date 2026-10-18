@@ -107,6 +107,7 @@ void mfx_set(int m) {
     atomic_store(&g_req, v);
     MLOG("[flag] mfx_interp = %d: %s (from the next game frame)", v, mfx_mode_name(v));
 }
+int mfx_requested(void) { pthread_once(&g_once, mfx_init); return atomic_load(&g_req); }   /* local change: the settings window */
 int mfx_latch(void) {
     pthread_once(&g_once, mfx_init);
     int r = atomic_load(&g_req), was = atomic_load(&g_on);

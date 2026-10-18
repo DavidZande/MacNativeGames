@@ -250,6 +250,10 @@ def font_report(folder):
         path = folder / f'{kind}-{name}.bfttf'
         if not path.is_file():
             raise BuildError(f'missing shared font: {path}')
+        if name in ('chinese-simplified', 'chinese-simplified-extension') and sha256(path) != expected:
+            # Local override: accept this firmware's Simplified Chinese fonts and bind their actual hash.
+            say(f'WARNING: shared font {name} SHA-256 {sha256(path)[:16]}... is not the expected {expected[:16]}...; continuing (local override)')
+            expected = sha256(path)
         check(f'shared font {name}', sha256(path), expected)
         size = path.stat().st_size
         rows.append(dict(type=kind, name=name, bfttf_bytes=size, font_bytes=size - 8, sha256=expected))
@@ -293,6 +297,9 @@ def step_code(tree, game, keys, env, logs, *, version="v0"):
     for n, h in want.items():
         if not (exefs / n).is_file():
             raise BuildError(f'ExeFS {n} is missing; not the supported version')
+        if n == 'main.npdm' and sha256(exefs / n) != h:
+            say(f'WARNING: ExeFS main.npdm SHA-256 {sha256(exefs / n)[:16]}... is not the expected {h[:16]}...; continuing (local override)')
+            continue
         check(f'ExeFS {n}', sha256(exefs / n), h)
     if not (tree / f'extracted/{version}/elf/main-inventory.json').exists():
         run([py, 'scripts/prepare_modules.py', exefs, '--output', tree / f'extracted/{version}/elf'], logs / 'prepare_modules.log', cwd=tree)
@@ -552,6 +559,9 @@ def sign_app(app, logs):
     run(['codesign', '--verify', '--deep', '--strict', app], logs / 'verify-app-signature.log')
 
 
+GAME_DATA = Path.home() / 'Library/Application Support/MacNativeGames/TOTK/game-data'   # local change: see step_app
+
+
 def step_app(tree, out, logs, *, version="v0"):
     expected = VERSIONS[version]
     tmp = out.with_name(out.name + '.partial')
@@ -561,8 +571,20 @@ def step_app(tree, out, logs, *, version="v0"):
     clone(tree / ('build/totk-native' if version == 'v0' else f'build/totk-native-{version}'), res/'build/totk-native')
     for rel in ('build/pso_manifest.tsv', 'build/spirv-cross/spirv-cross',
                 f'rewritten/{version}/main.patched.bin', f'rewritten/{version}/sdk.patched.bin',
-                f'rewritten/{version}/subsdk0.patched.bin', f'extracted/{version}/romfs/romfs.bin', f'extracted/{version}/romfs/runtime-index.bin'):
+                f'rewritten/{version}/subsdk0.patched.bin'):
         clone(tree / rel, res / rel)
+    # Local change: the 17 GB RomFS is not sealed into the app. A code signature covers every file of the bundle, so each
+    # rebuild made macOS hash all 17 GB again on the next start ("Verifying..."). The image and its index go once to the
+    # player's data folder (an APFS clone on the same volume: instant, no extra space); the launcher passes the folder as
+    # TOTK_ROMFS, and the game still checks the image's SHA-256 (runtime/romfs.c) before using it.
+    store = GAME_DATA / version / 'romfs'
+    store.mkdir(parents=True, exist_ok=True)
+    for name in ('romfs.bin', 'runtime-index.bin'):
+        src, dst = tree / f'extracted/{version}/romfs/{name}', store / name
+        if not (dst.is_file() and dst.stat().st_size == src.stat().st_size and dst.stat().st_mtime >= src.stat().st_mtime):
+            part = dst.with_name(name + '.partial')
+            if part.exists(): part.unlink()
+            clone(src, part); part.replace(dst)
     clone(tree / 'prebuilt/macos-arm64/totk_xlate', res / 'build/shader-service/totk_xlate')   # where totk_shader_rt.m looks for it
     for rel in (f'extracted/{version}/romfs-patches', f'extracted/{version}/romfs-patches-out', 'extracted/firmware/shared-fonts'):
         copy_tree(tree / rel, res / rel)

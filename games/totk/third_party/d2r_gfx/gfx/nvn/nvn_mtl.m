@@ -5810,6 +5810,18 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交�
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
+/* Local change, TOTK_ASYNC_PSO=1 ("Background shader compiling" in the settings): a render pipeline not built yet is
+   compiled on a background queue and its draws are skipped (draw-skip reason 9) until it is ready, instead of the submit
+   thread waiting for the compiler. Merged-pass / specialized-fragment pipelines (g_pso_lmap) stay synchronous. */
+static int async_pso_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_PSO"); v = !(e && !atoi(e));   /* default on (benchmarked: no visible breakage) */ MLOG("background pipeline compiling (TOTK_ASYNC_PSO): %s", v ? "on" : "off"); } return v; }
+uint64_t g_async_pso_kicked, g_async_pso_skipped, g_async_pso_ready;   /* perf.csv / log */
+static int pso_pend_poll(const pso_key *k, id<MTLRenderPipelineState> *out) {   /* 1 ready (taken), 0 still compiling, -1 not queued */
+    pthread_mutex_lock(&g_pp_mu);
+    int at = pso_pend_find(k), r = -1;
+    if (at >= 0) { r = g_pp[at].done; if (r) { *out = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; } }
+    pthread_mutex_unlock(&g_pp_mu);
+    return r;
+}
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRenderPassDescriptor *unused) {
     (void)unused;
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
@@ -5820,9 +5832,21 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
     if (cached) return cached;
-    id<MTLRenderPipelineState> ps;
+    id<MTLRenderPipelineState> ps = nil;
     NSError *e = nil; uint64_t bt = bp_now();
-    ps = g_pso_lmap ? nil : pso_pend_take(&k);
+    if (!g_pso_lmap && async_pso_on()) {
+        int r = pso_pend_poll(&k, &ps);
+        if (r == 0) { g_async_pso_skipped++; return nil; }   /* still compiling: skip this draw */
+        if (r < 0) {
+            if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }
+            pso_pend_kick(&k, vs, fs);
+            if (pso_pend_find(&k) >= 0) { g_async_pso_kicked++; g_async_pso_skipped++;
+                static unsigned said; if (said++ < 5 || said % 500 == 0) MLOG("[async-pso] queued %llu, draws skipped %llu, ready %llu", g_async_pso_kicked, g_async_pso_skipped, g_async_pso_ready);
+                return nil; }
+            /* the table is full: build it here as before */
+        } else if (ps) g_async_pso_ready++;
+    }
+    if (!ps && !g_pso_lmap) ps = pso_pend_take(&k);
     if (ps) g_pp_taken++;
     else {
         if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
@@ -5934,6 +5958,51 @@ static void warm_task_done(uint64_t *done,uint64_t total,uint64_t shader_total,u
     if (runtime_warm_progress && (!(*done % 64) || *done == total))
         runtime_warm_progress(*done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
 }
+/* Local change: parallel priming. The serial warm-up below compiles one MSL library at a time, so a cold first launch keeps
+   only one MTLCompilerService busy (~170 shaders a minute on an M1 Pro). Before each serial stage, compile that stage's
+   unique shader sources on TOTK_WARM_THREADS threads (default: the performance-core count; 1 = off) and drop the results:
+   the system shader cache then answers the serial shader_load calls, and no warm-up state is shared between threads. */
+static int warm_threads(void) {
+    static int v; if (v) return v;
+    const char *e = getenv("TOTK_WARM_THREADS"); int n = e ? atoi(e) : 0;
+    if (n <= 0) { int c = 0; size_t l = sizeof c; if (sysctlbyname("hw.perflevel0.logicalcpu", &c, &l, NULL, 0) || c <= 0) c = (int)NSProcessInfo.processInfo.activeProcessorCount; n = c; }
+    if (n > 32) n = 32; return v = n;
+}
+static void warm_prime(NSArray<NSString *> *keys, const char *what) {
+    int n = warm_threads(); if (n <= 1 || !keys.count) return;
+    MTLCompileOptions *opts = totk_precise_opts(); NSString *rt = totk_rt_dir();
+    __block _Atomic uint64_t compiled = 0, failed = 0; uint64_t t0 = bp_now(); NSUInteger count = keys.count;
+    dispatch_apply((size_t)n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t t) {
+        for (NSUInteger i = t; i < count; i += (NSUInteger)n) @autoreleasepool {
+            NSString *msl = [NSString stringWithContentsOfFile:[rt stringByAppendingFormat:@"/%@.metal", keys[i]] encoding:NSUTF8StringEncoding error:nil];
+            if (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"]) continue;
+            NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:msl options:opts error:&e];
+            uint64_t k = (lib ? atomic_fetch_add(&compiled, 1) : atomic_fetch_add(&failed, 1)) + 1;
+            if (t == 0 && runtime_boot_status && k % 16 == 0) {   /* the warm-up bar does not move during this step: say how far it is */
+                char d[96]; snprintf(d, sizeof d, "Compiling shaders on %d cores: %llu / %lu", n, (unsigned long long)(atomic_load(&compiled) + atomic_load(&failed)), (unsigned long)count);
+                runtime_boot_status("Compiling shaders", d); }
+        }
+    });
+    MLOG("并行预编译（%s）：%d 线程，%llu 个着色器，失败 %llu，用时 %.1f s | parallel priming (%s): %d threads, %llu shaders, %llu failed, %.1f s",
+         what, n, (unsigned long long)compiled, (unsigned long long)failed, (bp_now() - t0) / 1e9,
+         what, n, (unsigned long long)compiled, (unsigned long long)failed, (bp_now() - t0) / 1e9);
+}
+/* The shader keys one manifest file will load, in order, without duplicates (the same rows warm_worker visits). */
+static NSArray<NSString *> *warm_prime_keys(NSString *txt, NSSet<NSString *> *eligible, NSSet<NSString *> *skip) {
+    NSMutableOrderedSet<NSString *> *keys = [NSMutableOrderedSet orderedSet];
+    for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+        if (![eligible containsObject:line]) continue;
+        NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
+        if (([c[0] isEqualToString:@"S"] && c.count >= 3) || ([c[0] isEqualToString:@"C"] && c.count >= 2)) { if ([c[1] length]) [keys addObject:c[1]]; }
+        else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
+            pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) continue;
+            NSString *vs = warm_key(sk.vs, sizeof sk.vs), *fs = warm_key(sk.fs, sizeof sk.fs);
+            if (vs.length) [keys addObject:vs]; if (fs.length) [keys addObject:fs];
+        }
+    }
+    if (skip.count) [keys minusSet:skip];
+    return keys.array;
+}
 static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         NSSet<NSString *> *eligible,
                         NSMutableSet<NSString *> *planned_keys,uint64_t total,uint64_t shader_total,uint64_t pipeline_total) {
@@ -5946,6 +6015,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
             NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
             if (!txt) { MLOG("【红】预热清单读取失败：%s", path.UTF8String);
                 if (path_index++ == 0) atomic_store(&g_warm_priority_done, 1); continue; }
+            warm_prime(warm_prime_keys(txt, eligible, [NSSet setWithArray:dict.allKeys]), path.lastPathComponent.UTF8String);
             for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
                 if (![eligible containsObject:line] || [seen containsObject:line]) continue;
                 [seen addObject:line];
@@ -6007,6 +6077,9 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
             if (![planned_keys containsObject:key]) { [planned_keys addObject:key]; ++shader_total; }
         }
         if (runtime_warm_progress) runtime_warm_progress(done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
+        { NSMutableArray<NSString *> *rest = [NSMutableArray array];
+          for (NSString *file in cache_files) if ([file hasSuffix:@"_b.metal"]) { NSString *key = [file stringByDeletingPathExtension]; if (!dict[key]) [rest addObject:key]; }
+          warm_prime(rest, "translation cache"); }
         uint64_t cached = 0, failed = 0;
         for (NSString *file in cache_files) {
             if (![file hasSuffix:@"_b.metal"]) continue;
@@ -6085,6 +6158,7 @@ static void warm_filled(void) {
    cache take a few ms each. TOTK_WARM_LIGHT=0 turns it off. */
 static _Atomic int g_world_on;   // set at the first world frame (hle_nvn.c, nvnQueuePresentTexture)
 void mtl_note_world(void) { atomic_store(&g_world_on, 1); }
+int mtl_world_seen(void) { return atomic_load(&g_world_on); }   /* local change: perf.csv */
 static void warm_light(void) {
 #if TARGET_OS_IPHONE
     const char *e = getenv("TOTK_WARM_LIGHT"); if (e && !atoi(e)) return;
@@ -10739,7 +10813,7 @@ static NSUInteger g_outup_size[4];            // in and out size of the last ups
 static id<MTLTexture> output_upscale(id<MTL4CommandBuffer> cb, id<MTLTexture> src, NSUInteger cx, NSUInteger cy, NSUInteger cw, NSUInteger ch, MTLViewport vp, int slot) {
     static NSUInteger sw, sh; static int same;
     if (slot >= 0 && slot < 3) g_outup_timed[slot] = 0;
-    if (!mfxup_enabled() || !mfxup_output_enabled()) { g_outup_skip[0]++; return nil; }
+    if (!mfxup_output_enabled()) { g_outup_skip[0]++; return nil; }   /* local change: the output stage has its own switch (picture mode); mfx_upscale is the render upscale */
     NSUInteger ow = (NSUInteger)vp.width, oh = (NSUInteger)vp.height;
     if (cx || cy || ow < cw + 16 || oh < ch + 9) { g_outup_skip[1]++; return nil; }
     if (ow != sw || oh != sh) { sw = ow; sh = oh; same = 0; }

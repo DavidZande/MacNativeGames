@@ -150,7 +150,7 @@ void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, i
     if (info->gen > 0 && info->fps >= 0) snprintf(gen, sizeof gen, "+%d", info->gen > 999 ? 999 : info->gen);   // interpolated frames a second (key 2)
     // MetalFX did the upscale in the last frames (key 3 selects the manual MetalFX mode); 2K: true 2K output.
     // The whole line in the system font, so switching MetalFX does not switch the font.
-    snprintf(text, sizeof text, "FPS %s%s  %s%s%s", fps, gen, ss, info->mfx ? "  MetalFX已开启" : "", info->big ? "  2K" : "");
+    snprintf(text, sizeof text, "FPS %s%s  %s%s%s", fps, gen, ss, info->mfx ? "  MetalFX on" : "", info->big ? "  2K" : "");
     raster_line_ct(text, 0, scale, out, FPS_OVERLAY_TEX_W, FPS_OVERLAY_TEX_H, box_w, box_h);
 }
 
@@ -169,7 +169,7 @@ void shader_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total, uin
     char t[16];
     (void)pipelines;   // user 2026-10-17: the pipeline count is not shown
     if (total < 0) snprintf(t, sizeof t, "--"); else snprintf(t, sizeof t, "%lld", (long long)(total > 999999 ? 999999 : total));
-    snprintf(out, n, "新着色器 %llu / 总计 %s", (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
+    snprintf(out, n, "New shaders %llu / total %s", (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
 }
 
 /* A count's rate, re-measured every half second (game presents; interpolated frames shown). stale_s > 0: a gap longer

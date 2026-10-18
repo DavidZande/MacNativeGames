@@ -180,15 +180,24 @@ int runtime_output_res_toggle(void){
     fprintf(stderr,"[totk] 1.4.3 output requested %ux%u (display config %s)\n",full?output_w:1920,full?output_h:1080,config?"ready":"not published yet");
     return 1;
 }
-int runtime_output_mode_cycle(void){
+/* Local change: the picture mode as a value (0 off, 1 MetalFX 2K, 2 native 2K; -1 no 2K-capable start), for the settings window. */
+int runtime_output_mode_get(void){
+    if(!output_page)return -1;
+    extern int mfxup_output_enabled(void);
+    if(atomic_load((_Atomic uint64_t *)(void *)(output_page+32))==pack_size(output_w,output_h))return 2;
+    return mfxup_output_enabled()?1:0;
+}
+int runtime_output_mode_set(int mode){
     if(!output_page)return 0;
-    extern int mfxup_output_enabled(void);extern void dm_gfx_set_flag(const char *,int);
+    extern void dm_gfx_set_flag(const char *,int);
+    static const char *const names[3]={"关闭 2K","MetalFX 2K","原生 2K"};
+    if(mode<0||mode>2)mode=0;
     int full=atomic_load((_Atomic uint64_t *)(void *)(output_page+32))==pack_size(output_w,output_h);
-    int native=0,mfx=0;const char *name;
-    if(full)name="关闭 2K";
-    else if(mfxup_output_enabled()){native=1;name="原生 2K";}
-    else{mfx=1;name="MetalFX 2K";}
-    if(full!=native)runtime_output_res_toggle();
-    dm_gfx_set_flag("mfx_output",mfx);dm_gfx_set_flag("mfx_upscale",mfx);
-    fprintf(stderr,"[totk] key 3: %s\n",name);return 1;
+    if(full!=(mode==2))runtime_output_res_toggle();
+    dm_gfx_set_flag("mfx_output",mode==1);   /* local change: mfx_upscale is its own setting */
+    fprintf(stderr,"[totk] key 3: %s\n",names[mode]);return 1;
+}
+int runtime_output_mode_cycle(void){
+    int mode=runtime_output_mode_get();
+    return runtime_output_mode_set(mode==2?0:mode==1?2:1);
 }

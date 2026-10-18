@@ -326,25 +326,31 @@ int runtime_output_res_toggle(void) {
 }
 /* Key 3: cycle the active 2K presentation path. The normal startup is 1080p game output with the MetalFX output scaler
    enabled; native 2K switches the game's canvas/UI to 2560x1440; off returns to 1080p and disables the output scaler. */
-int runtime_output_mode_cycle(void) {
+/* Local change: the picture mode as a value (0 off, 1 MetalFX 2K, 2 native 2K; -1 no 2K-capable start), for the settings window. */
+int runtime_output_mode_get(void) {
+    if (!output_page) return -1;
+    extern int mfxup_output_enabled(void);
+    if (atomic_load((_Atomic uint64_t *)(void *)(output_page + DP_OUTPUT_SIZE)) == pack_size(output_w, output_h)) return 2;
+    return mfxup_output_enabled() ? 1 : 0;
+}
+int runtime_output_mode_set(int mode) {
     if (!output_page) {
         fprintf(stderr, "[totk] key 3: 2K mode cycling needs a 2K-capable start (TOTK_OUTPUT_RES=auto with the HeapDef overlay, or <w>x<h>)\n");
         return 0;
     }
     _Atomic uint64_t *size = (_Atomic uint64_t *)(void *)(output_page + DP_OUTPUT_SIZE);
     int full = atomic_load(size) == pack_size(output_w, output_h);
-    extern int mfxup_output_enabled(void);
     extern void dm_gfx_set_flag(const char *name, int value);
-    int next_full, next_mfx;
-    const char *name;
-    if (full) { next_full = 0; next_mfx = 0; name = "关闭 2K"; }
-    else if (mfxup_output_enabled()) { next_full = 1; next_mfx = 0; name = "原生 2K"; }
-    else { next_full = 0; next_mfx = 1; name = "MetalFX 2K"; }
-    if (full != next_full) runtime_output_res_toggle();
-    dm_gfx_set_flag("mfx_output", next_mfx);
-    dm_gfx_set_flag("mfx_upscale", next_mfx);
-    fprintf(stderr, "[totk] key 3: %s\n", name);
+    static const char *const names[3] = {"关闭 2K", "MetalFX 2K", "原生 2K"};
+    if (mode < 0 || mode > 2) mode = 0;
+    if (full != (mode == 2)) runtime_output_res_toggle();
+    dm_gfx_set_flag("mfx_output", mode == 1);   /* local change: the render upscale (mfx_upscale) is its own setting */
+    fprintf(stderr, "[totk] key 3: %s\n", names[mode]);
     return 1;
+}
+int runtime_output_mode_cycle(void) {
+    int mode = runtime_output_mode_get();
+    return runtime_output_mode_set(mode == 2 ? 0 : mode == 1 ? 2 : 1);
 }
 
 /* Diagnostic (Mac): TOTK_TRAP_AT=<main offset> writes brk #0 there; the crash handler (runtime/loader.c, SIGTRAP) then prints

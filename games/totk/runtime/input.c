@@ -181,11 +181,15 @@ static void *input_file(void *arg) {
             runtime_frame_step_pin(ms);
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
+        } else if (!strncmp(line, "settings ", 9)) {   /* local change: "settings show|hide|shot <path>" (the settings window, runtime/frontend.m) */
+            line[strcspn(line, "\r\n")] = 0; char *arg = strchr(line + 9, ' '); if (arg) *arg++ = 0;
+            runtime_front_settings_cmd(line + 9, arg);
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
         else runtime_fail("invalid diagnostic input command");
     }
     fclose(f); return NULL;
 }
+__attribute__((weak)) void runtime_front_settings_cmd(const char *op, const char *arg) { (void)op; (void)arg; }
 __attribute__((constructor)) static void input_file_start(void) {
     const char *e = getenv("TOTK_INPUT_FILE"); if (!e || !*e) return;
     pthread_t t; if (pthread_create(&t, NULL, input_file, (void *)e)) runtime_fail("diagnostic input thread"); pthread_detach(t);

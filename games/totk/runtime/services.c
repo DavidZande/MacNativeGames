@@ -26,7 +26,7 @@
 #if TARGET_OS_IPHONE
 #define ALIAS_DEFAULT_GIB 16   /* iPhone: ~51 GiB of free address space without extended virtual addressing; the game uses < 3 GiB */
 #else
-#define ALIAS_DEFAULT_GIB 64
+#define ALIAS_DEFAULT_GIB 8    /* local change: macOS 27 leaves no 64 GiB gap below 2^39 (see memory_init) */
 #endif
 static uint64_t alias_size(void){static uint64_t v;if(!v){const char *e=getenv("TOTK_ALIAS_GIB");uint64_t g=e?strtoull(e,NULL,0):ALIAS_DEFAULT_GIB;if(g<1||g>64)runtime_fail("TOTK_ALIAS_GIB must be 1..64");v=g<<30;}return v;}
 #define ALIAS_SIZE alias_size()
@@ -73,9 +73,16 @@ static void memory_init(void) {
  alias_space=low_space+LOW_SIZE;
 #else
  alias_space=reserve_fixed(ALIAS_SPACE_AT,ALIAS_SIZE);
- if(!alias_space)runtime_fail("reserve the 64 GiB alias region at 0x70_0000_0000");
- for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE<=ALIAS_SPACE_AT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,LOW_SIZE);
- if(!low_space)runtime_fail("reserve guest stack and heap regions below 2^39");
+ if(alias_space)for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE<=ALIAS_SPACE_AT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,LOW_SIZE);
+ /* local change: on macOS 27 the dyld shared cache fills 0x1_8000_0000..0x10_0000_0000 and malloc places ~24 GiB at a
+    random spot in 0x70..0x80_0000_0000, so reserve stack+heap and the alias region together in the free part below 2^39. */
+ if(!low_space){
+  if(alias_space)mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)alias_space,ALIAS_SIZE);
+  for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE+ALIAS_SIZE<=GUEST_ADDRESS_LIMIT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,LOW_SIZE+ALIAS_SIZE);
+  if(!low_space)runtime_fail("reserve guest stack, heap and alias regions below 2^39");
+  alias_space=low_space+LOW_SIZE;
+  fprintf(stderr,"[totk] guest memory: stack+heap at %p, %llu GiB alias region at %p (combined fallback)\n",(void *)low_space,(unsigned long long)(ALIAS_SIZE>>30),(void *)alias_space);
+ }
 #endif
  heap=low_space+HEAP_OFF;
  fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP);

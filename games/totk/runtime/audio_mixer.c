@@ -13,6 +13,8 @@
 #include "audio_mixer.h"
 #include "audio_reverb.h"
 #include <AudioToolbox/AudioToolbox.h>
+#include <os/workgroup.h>
+#include <pthread.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -35,11 +37,15 @@ typedef struct Mixer {
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
     AudioComponentInstance unit; int unit_ok;
     float ring[RING_FRAMES * 2]; _Atomic uint64_t wr, rd, underruns, overruns;
+    int smooth, priming, rate; float gain;          /* local change: TOTK_AUDIO_SMOOTH (pull) */
+    os_workgroup_t wg;                             /* the output device's real-time workgroup */
     EffectState *effect; int *effect_order; unsigned effect_reported;
     unsigned reported;                             /* one-time reports */
 } Mixer;
 
 static float device_volume = 1.0f;
+static _Atomic uint64_t *g_underruns;   /* perf.csv (gfx/nvn/totk_perf.c) */
+uint64_t runtime_audio_underruns(void) { return g_underruns ? atomic_load(g_underruns) : 0; }
 static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
     if (m->reported & (1u << bit)) return;
     m->reported |= 1u << bit; fprintf(stderr, "[totk-audio] 【红】%s (%d)\n", msg, value);
@@ -50,6 +56,23 @@ static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTi
     (void)flags; (void)ts; (void)bus;
     Mixer *m = ctx; float *out = io->mBuffers[0].mData;
     uint64_t rd = atomic_load(&m->rd), wr = atomic_load_explicit(&m->wr, memory_order_acquire), have = wr - rd;
+    if (m->smooth) {
+        /* Local change, TOTK_AUDIO_SMOOTH (default on): after an underrun, wait until ~40 ms are buffered again instead
+           of playing each late fragment as it arrives (crackle), and ramp the gain down / up over ~2 ms instead of cutting
+           to silence (click). */
+        if (m->priming && have >= (uint64_t)(m->rate / 25)) m->priming = 0;
+        UInt32 n = m->priming ? 0 : (frames < have ? frames : (UInt32)have);
+        const float step = 1.0f / (float)(m->rate / 500 > 0 ? m->rate / 500 : 96);
+        for (UInt32 i = 0; i < frames; i++) {
+            int live = i < n; uint64_t k = (rd + (live ? i : (n ? n - 1 : 0))) % RING_FRAMES;
+            m->gain = live ? (m->gain + step > 1 ? 1 : m->gain + step) : (m->gain - step < 0 ? 0 : m->gain - step);
+            float l = (live || n) && wr ? m->ring[2 * k] : 0, r = (live || n) && wr ? m->ring[2 * k + 1] : 0;   /* the last sample, faded */
+            out[2 * i] = l * m->gain; out[2 * i + 1] = r * m->gain;
+        }
+        if (n < frames && wr && !m->priming) { atomic_fetch_add(&m->underruns, 1); m->priming = 1; }
+        atomic_store_explicit(&m->rd, rd + n, memory_order_release);
+        return noErr;
+    }
     UInt32 n = frames < have ? frames : (UInt32)have;
     for (UInt32 i = 0; i < n; i++) { uint64_t k = (rd + i) % RING_FRAMES; out[2 * i] = m->ring[2 * k]; out[2 * i + 1] = m->ring[2 * k + 1]; }
     if (n < frames) { memset(out + 2 * n, 0, (frames - n) * 2 * sizeof(float)); if (wr) atomic_fetch_add(&m->underruns, 1); }
@@ -73,6 +96,11 @@ static void output_open(Mixer *m, int rate) {
         fprintf(stderr, "[totk-audio] 【红】CoreAudio output setup failed: mixing without sound\n"); AudioComponentInstanceDispose(m->unit); return;
     }
     m->unit_ok = 1; fprintf(stderr, "[totk-audio] CoreAudio output %d Hz stereo\n", rate);
+    { const char *e = getenv("TOTK_AUDIO_SMOOTH"); m->smooth = !(e && !strcmp(e, "0")); m->rate = rate; m->priming = 1; m->gain = 0;
+      UInt32 sz = sizeof m->wg; os_workgroup_t wg = NULL;
+      if (m->smooth && !AudioUnitGetProperty(m->unit, kAudioOutputUnitProperty_OSWorkgroup, kAudioUnitScope_Global, 0, &wg, &sz) && wg) m->wg = wg;
+      fprintf(stderr, "[totk-audio] smooth output (TOTK_AUDIO_SMOOTH): %s; device workgroup %s\n", m->smooth ? "on" : "off", m->wg ? "found" : "not used"); }
+    g_underruns = &m->underruns;
 }
 static void output_push(Mixer *m, const float *lr, int frames) {
     uint64_t wr = atomic_load(&m->wr), rd = atomic_load_explicit(&m->rd, memory_order_acquire);
@@ -381,6 +409,12 @@ static const float *splitter_filter(SplitDest *d,const float *input,float *outpu
     return output;
 }
 void audio_mixer_render(AudioRenderer *r, double seconds) {
+    {   /* Local change: the thread that renders the game's audio joins the output device's real-time workgroup once, so
+           macOS schedules it with the audio deadline instead of as an ordinary thread. */
+        Mixer *mm = r->mixer; static __thread int joined;
+        if (mm && mm->wg && !joined) { os_workgroup_join_token_s tok; int e = os_workgroup_join(mm->wg, &tok); joined = 1;
+            fprintf(stderr, "[totk-audio] render thread joined the device workgroup: %s\n", e ? strerror(e) : "ok"); }
+    }
     (void)seconds;
     Mixer *m = r->mixer; if (!m) return;
     const int frames = m->frame, mc = r->param.submix_count + 1;

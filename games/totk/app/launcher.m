@@ -13,8 +13,26 @@
 #include <sys/file.h>
 #include <sys/proc.h>
 #include <unistd.h>
+#include <sys/clonefile.h>
 #include "dmsh_chain.h"   // DMSH_CHAIN: the shader translation chain the cache folder is named after
 #include "game_version.h"
+
+/* Local change: rolling save backups. An APFS clone (clonefile: instant, shares the data) of the profile folder goes to
+   <data>/backups/<yyyyMMdd-HHmmss>-<reason>; the newest 10 are kept. Shared with runtime/frontend.m (same rules). */
+static void profile_backup(NSString *profile, NSString *reason) {
+    NSFileManager *fm = NSFileManager.defaultManager; BOOL dir = NO;
+    if (![fm fileExistsAtPath:profile isDirectory:&dir] || !dir) return;
+    NSString *backups = [[profile stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"backups"];
+    [fm createDirectoryAtPath:backups withIntermediateDirectories:YES attributes:nil error:nil];
+    NSDateFormatter *f = [NSDateFormatter new]; f.dateFormat = @"yyyyMMdd-HHmmss"; f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    NSString *dst = [backups stringByAppendingPathComponent:[NSString stringWithFormat:@"%@-%@", [f stringFromDate:NSDate.date], reason]];
+    if (clonefile(profile.fileSystemRepresentation, dst.fileSystemRepresentation, 0) != 0) { fprintf(stderr, "[backup] clone of %s failed: %s\n", profile.UTF8String, strerror(errno)); return; }
+    NSArray<NSString *> *all = [[fm contentsOfDirectoryAtPath:backups error:nil] sortedArrayUsingSelector:@selector(compare:)];
+    NSMutableArray<NSString *> *mine = [NSMutableArray array];
+    for (NSString *n in all) if (n.length > 15 && [n characterAtIndex:8] == '-' && ![n hasPrefix:@"."]) [mine addObject:n];
+    for (NSUInteger i = 0; i + 10 < mine.count; i++) [fm removeItemAtPath:[backups stringByAppendingPathComponent:mine[i]] error:nil];
+    fprintf(stderr, "[backup] %s\n", dst.UTF8String);
+}
 
 static void show_error(NSString *detail) {
     NSAlert *alert = [NSAlert new];
@@ -115,6 +133,33 @@ int main(int argc, char **argv) {
             }
         }
 #endif
+        /* Local change: a restore chosen in the settings window happens here, before the game opens any save file; then
+           the profile is backed up at every player launch. */
+        if (!getenv("TOTK_SLOT_OWNER") || !strcmp(getenv("TOTK_SLOT_OWNER"), "user")) {
+            NSString *backups = [[profile stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"backups"];
+            NSString *request = [backups stringByAppendingPathComponent:@"restore-request"];
+            NSString *pick = [[NSString stringWithContentsOfFile:request encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (pick.length) {
+                [NSFileManager.defaultManager removeItemAtPath:request error:nil];
+                NSString *src = [backups stringByAppendingPathComponent:pick.lastPathComponent];
+                if ([NSFileManager.defaultManager fileExistsAtPath:src]) {
+                    profile_backup(profile, @"before-restore");
+                    NSString *aside = [profile stringByAppendingFormat:@".replaced-%d", getpid()];
+                    if (rename(profile.fileSystemRepresentation, aside.fileSystemRepresentation) == 0 &&
+                        clonefile(src.fileSystemRepresentation, profile.fileSystemRepresentation, 0) == 0) [NSFileManager.defaultManager removeItemAtPath:aside error:nil];
+                    else { rename(aside.fileSystemRepresentation, profile.fileSystemRepresentation); show_error([@"Restoring the backup failed: " stringByAppendingString:@(strerror(errno))]); }
+                }
+            } else profile_backup(profile, @"launch");
+        }
+        /* Local change: the RomFS lives outside the signed app (build_app.py step_app), in <data>/game-data/<version>/romfs. */
+        if (![NSFileManager.defaultManager fileExistsAtPath:[root stringByAppendingPathComponent:@"extracted/" TOTK_GAME_DIR "/romfs/romfs.bin"]]) {
+            NSString *store = [data stringByAppendingPathComponent:@"game-data/" TOTK_GAME_DIR "/romfs"];
+            if (![NSFileManager.defaultManager fileExistsAtPath:[store stringByAppendingPathComponent:@"romfs.bin"]]) {
+                show_error([NSString stringWithFormat:@"The game data is missing from %@. Build the app again with build_app.py.", store]);
+                return 1;
+            }
+            setenv("TOTK_ROMFS", store.fileSystemRepresentation, 0);
+        }
         if (chdir(root.fileSystemRepresentation) != 0) {   // the game reads its data relative to this folder
             show_error(@"Cannot open the game folder inside the app.");
             return 1;
@@ -132,6 +177,31 @@ int main(int argc, char **argv) {
         setenv("TOTK_SLOT_OWNER", "user", 0);
         setenv("TOTK_SLOT_PURPOSE", "player", 0);
         unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console
+        /* Local change: the settings window (runtime/frontend.m) saves its startup options here; they become the environment
+           variables the game already reads. A variable already set (open --env ...) wins (setenv without overwrite). */
+        const char *settingsMode = getenv("TOTK_SETTINGS");   /* off: benchmarks run with their own environment only */
+        if (!(settingsMode && !strcmp(settingsMode, "off"))) { NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"org.macnativegames.totk.settings"];
+          if ([[d stringForKey:@"mode"] isEqualToString:@"handheld"]) setenv("TOTK_OPERATION_MODE", "handheld", 0);
+          NSString *res = [d stringForKey:@"renderRes"] ?: @"900";
+          NSDictionary *sizes = @{@"540": @"960x540", @"720": @"1280x720", @"1080": @"1920x1080"};   /* 900: the game's own (dynamic, up to 1600x900) */
+          if (sizes[res]) setenv("TOTK_RENDER_RES", [sizes[res] UTF8String], 0);
+          else if ([res isEqualToString:@"custom"]) {
+              NSInteger w = [d integerForKey:@"customWidth"], h = [d integerForKey:@"customHeight"];
+              if (w >= 64 && h >= 64 && w <= 4096 && h <= 4096) setenv("TOTK_RENDER_RES", [NSString stringWithFormat:@"%ldx%ld", (long)w, (long)h].UTF8String, 0);
+          }
+          if ([d boolForKey:@"metalfxUpscale"]) setenv("TOTK_MFX_UPSCALE", "1", 0);
+          if ([d objectForKey:@"perfLog"] && ![d boolForKey:@"perfLog"]) setenv("TOTK_PERF_LOG", "0", 0);
+          if ([d objectForKey:@"asyncCompile"] && ![d boolForKey:@"asyncCompile"]) setenv("TOTK_ASYNC_PSO", "0", 0);
+          if ([d objectForKey:@"pauseHidden"] && ![d boolForKey:@"pauseHidden"]) setenv("TOTK_PAUSE_HIDDEN", "0", 0);
+          NSString *fps = [d stringForKey:@"fpsCap"] ?: @"unlimited";
+          if ([fps isEqualToString:@"60"]) setenv("DM_PRESENT_HZ", "60", 0);
+          else if ([fps isEqualToString:@"30"]) { setenv("TOTK_FPS60", "0", 0); setenv("DM_PRESENT_HZ", "60", 0); }
+          if ([d objectForKey:@"fpsCounter"] && ![d boolForKey:@"fpsCounter"]) setenv("TOTK_FPS_OVERLAY", "0", 0);
+          if ([d objectForKey:@"shaderCounter"] && ![d boolForKey:@"shaderCounter"]) setenv("TOTK_SHADER_OVERLAY", "0", 0);
+          if ([d objectForKey:@"loadCounter"] && ![d boolForKey:@"loadCounter"]) setenv("TOTK_LOAD_OVERLAY", "0", 0);
+          NSInteger threads = [d integerForKey:@"warmThreads"], gib = [d integerForKey:@"aliasGiB"];
+          if (threads > 0) setenv("TOTK_WARM_THREADS", [NSString stringWithFormat:@"%ld", (long)threads].UTF8String, 0);
+          if (gib > 0) setenv("TOTK_ALIAS_GIB", [NSString stringWithFormat:@"%ld", (long)gib].UTF8String, 0); }
         /* runtime command channel (runtime/input.c): echo "shot ~/Desktop/shot.png" >> "<data>/input.txt" */
         { NSString *cmds = env_or("TOTK_INPUT_FILE", [data stringByAppendingPathComponent:@"input.txt"]);
           FILE *cf = fopen(cmds.fileSystemRepresentation, "w"); if (cf) fclose(cf);
