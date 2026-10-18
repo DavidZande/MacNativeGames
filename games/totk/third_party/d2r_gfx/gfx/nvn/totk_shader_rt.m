@@ -140,7 +140,7 @@ static int g_xn;
 static pthread_mutex_t g_xp_mu = PTHREAD_MUTEX_INITIALIZER;
 static dispatch_semaphore_t g_xp_sem;
 static NSMutableSet<NSString *> *g_xlate_pending;
-static _Atomic uint64_t g_xlate_gen, g_xlate_done, g_xlate_ns;
+static _Atomic uint64_t g_xlate_gen, g_xlate_done, g_xlate_ns, g_xlate_prime_ns;
 static dispatch_queue_t xlate_queue(void) {
     static dispatch_queue_t q; static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -154,6 +154,7 @@ static dispatch_queue_t xlate_queue(void) {
 static NSMutableArray *variants_of(NSString *shader);
 static NSString *index_path(NSString *shader);
 static NSString *json_string(id obj);
+void mtl_prime_library(NSString *key);   /* nvn_mtl.m */
 static void xlate_run(NSString *shader, NSString *variant, NSString *stage_name, NSString *request, BOOL existed) {
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     dispatch_semaphore_wait(g_xp_sem, DISPATCH_TIME_FOREVER);
@@ -172,6 +173,10 @@ static void xlate_run(NSString *shader, NSString *variant, NSString *stage_name,
     NSData *jd = [NSData dataWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant]];
     NSDictionary *refl = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
     if (![refl isKindOfClass:[NSDictionary class]]) die("shader %s: reflection missing", variant.UTF8String);
+    uint64_t tc = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    { static int prime = -1; if (prime < 0) { const char *e = getenv("TOTK_XLATE_PRIME"); prime = !(e && !atoi(e)); }
+      if (prime) mtl_prime_library([variant stringByAppendingString:@"_b"]); }   /* before publishing: the render thread then loads it from the compiler cache */
+    atomic_fetch_add(&g_xlate_prime_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tc);
     pthread_mutex_lock(&g_rt_lock);
     NSMutableArray *vs = variants_of(shader);
     [vs addObject:@{@"variant": variant, @"deps": refl[@"deps"] ?: @{}}];

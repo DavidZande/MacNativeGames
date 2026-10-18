@@ -56,6 +56,8 @@ def config_env(name):
         elif p == 'unl': env.update(TOTK_FPS60='1')
         elif p == 'async': env['TOTK_ASYNC_PSO'] = '1'
         elif p == 'sync': env.update(TOTK_ASYNC_PSO='0', TOTK_ASYNC_XLATE='0')
+        elif p == 'salt': env['TOTK_MSL_SALT'] = f'bench {name} {time.time()}'   # every Metal compile new to the system cache
+        elif p == 'noprime': env['TOTK_XLATE_PRIME'] = '0'   # translated libraries compiled on the render thread (before this fix)
         elif p in ('qosutil', 'qosdef', 'qosinit'): env['TOTK_COMPILE_QOS'] = {'qosutil': 'utility', 'qosdef': 'default', 'qosinit': 'initiated'}[p]
         elif p == 'xcold': env.update(TOTK_SHADER_SEED='off', DM_PSO_MANIFEST='off', TOTK_WARM_LIGHT='0')   # empty translation cache (see run)
         elif p == 'fs': env['TOTK_FULLSCREEN'] = '1'   # full screen (macOS Game Mode)
@@ -67,7 +69,7 @@ def config_env(name):
 
 
 def game_running():
-    return subprocess.run(['pgrep', '-f', 'build/(cold/)?totk-native(-[0-9]+)? rewritten'], capture_output=True).returncode == 0
+    return subprocess.run(['pgrep', '-f', 'build/totk-native(-cold-[0-9]+)? rewritten'], capture_output=True).returncode == 0
 
 
 def send(cmd_file, line):
@@ -163,8 +165,9 @@ def run(name, args, outdir):
                    TOTK_GPU_MIDCLEAR='1', TOTK_GPU_BUDGET_MB='5000')
         binary = TREE / 'build/totk-native'
         if 'cold' in name.split('-'):   # macOS keeps compiled shaders and pipelines per executable path: a new path starts cold
-            binary = TREE / f'build/cold/totk-native-{int(time.time())}'; binary.parent.mkdir(exist_ok=True)
-            for old in binary.parent.glob('totk-native-*'): old.unlink()
+            # next to the real one: the game finds its tools (shader translator) relative to its own build/ folder
+            for old in (TREE / 'build').glob('totk-native-cold-*'): old.unlink()
+            binary = TREE / f'build/totk-native-cold-{int(time.time())}'
             shutil.copy2(TREE / 'build/totk-native', binary)
         with open(log, 'w') as lf:
             subprocess.Popen([str(binary), 'rewritten/v0', 'boot'], env=env, cwd=TREE, stdout=lf, stderr=lf, start_new_session=True)
@@ -205,13 +208,20 @@ def play(name, args, rd, cmd_file, perf_off, phase, phases):
         return
     if not args.title_only:
         t_press = time.time(); press_row = len(perf_rows_since(perf_off))
-        # In the world: three seconds in a row of > 700 draws a frame (the title and the save list draw about 400; the
-        # opening cave about 1100; perf.csv's 'world' flag needs a frame of > 2000 draws, which the cave never has).
-        world = lambda: (lambda r: len(r) >= 3 and all(float(x.get('draws_per_frame') or 0) > 700 for x in r[-3:]))(perf_rows_since(perf_off))
-        for i in range(4):   # Continue; on the save list, the autosave; a confirmation if one comes up
+        draws = lambda r: float(r.get('draws_per_frame') or 0)
+        # Continue (and on a save list, the autosave) until a loading screen shows (under 100 draws a frame); then the
+        # world: three seconds in a row of > 700 draws a frame after it.
+        loading = lambda: any(draws(x) < 100 for x in perf_rows_since(perf_off)[press_row:])
+        for i in range(4):
             send(cmd_file, f'key {KEY_A} 150'); send(cmd_file, f'shot {rd}/{name}-press{i + 1}.png')
-            if wait_for(world, 8): break
-        if not wait_for(world, 180): raise RuntimeError('the world did not load (no frame with world draws)')
+            if wait_for(loading, 8): break
+        if not loading(): raise RuntimeError('no loading screen after pressing A')
+        def world():
+            r = perf_rows_since(perf_off)[press_row:]
+            k = max(i for i, x in enumerate(r) if draws(x) < 100)
+            after = r[k + 1:]
+            return len(after) >= 3 and all(draws(x) > 700 for x in after[-3:])
+        if not wait_for(world, 180): raise RuntimeError('the world did not load after the loading screen')
         (rd / 'load.txt').write_text(f'{time.time() - t_press:.1f} s from the press to the world\n')
         time.sleep(5); phases['load'] = perf_rows_since(perf_off)[press_row:]   # the press, the loading screen and the first world seconds
         time.sleep(args.settle)

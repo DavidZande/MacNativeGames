@@ -4706,7 +4706,11 @@ static int drv_scan(NvShader *o, NSString *src) {   // src: the full MSL (iOS do
     if (nbad) MLOG("【红】着色器 %s（阶段 %d）读驱动段的这些位置回放层不填，读到 0：%s", o->key, o->stage, bad);
     return nunfill;
 }
-static uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated variants loaded precompiled (iOS) / compiled from MSL here
+static uint64_t g_rt_prebuilt, g_rt_compiled;
+/* TOTK_MSL_SALT=<text> (tests only): appended as a comment to every translated MSL source before compiling, so each one is
+   new to the system's Metal compiler cache (a truly cold compile, without clearing the cache of every app). */
+static NSString *msl_salted(NSString *src) { static NSString *salt; static dispatch_once_t once; dispatch_once(&once, ^{ const char *e = getenv("TOTK_MSL_SALT"); salt = e && *e ? [NSString stringWithFormat:@"\n// %s\n", e] : nil; });
+    return salt && src ? [src stringByAppendingString:salt] : src; }   // TOTK: translated variants loaded precompiled (iOS) / compiled from MSL here
 static NvShader *shader_load(NSString *pc, int stage) {
     NSError *e = nil;
     // TOTK: runtime translations are MSL source compiled here (macOS allows runtime compilation); the OS caches compiled code.
@@ -4721,7 +4725,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
         if ([NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("【红】预编译着色器库加载失败 %s：%s（改为现编）", pc.UTF8String, e.localizedDescription.UTF8String); else g_rt_prebuilt++; }
 #endif
         if (!lib) { NSString *src = [NSString stringWithContentsOfFile:rt_src encoding:NSUTF8StringEncoding error:&e];
-                    if (src) { lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e]; g_rt_compiled++; } }
+                    if (src) { lib = [g_dev newLibraryWithSource:msl_salted(src) options:totk_precise_opts() error:&e]; g_rt_compiled++; } }
     } else lib = lib_from_file(lp, &e);
     if (rt && (g_rt_prebuilt + g_rt_compiled) % 200 == 1) MLOG("着色器库：预编译加载 %llu 个，现编 %llu 个", (unsigned long long)g_rt_prebuilt, (unsigned long long)g_rt_compiled);
     NSData *jd = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.json", rt ? totk_rt_dir() : g_msl_dir, pc]];
@@ -5976,6 +5980,17 @@ static void warm_task_done(uint64_t *done,uint64_t total,uint64_t shader_total,u
     if (runtime_warm_progress && (!(*done % 64) || *done == total))
         runtime_warm_progress(*done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
 }
+/* Local change: compile a freshly translated variant's library off the render thread (totk_shader_rt.m calls this before
+   it publishes the variant), so the render thread's shader_load is a compiler-cache hit instead of a 100-400 ms compile. */
+void mtl_prime_library(NSString *key) {
+    @autoreleasepool {
+        if (!g_dev) return;
+        NSString *msl = [NSString stringWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@.metal", key] encoding:NSUTF8StringEncoding error:nil];
+        if (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"]) return;
+        static dispatch_once_t once; static MTLCompileOptions *opts; dispatch_once(&once, ^{ opts = totk_precise_opts(); });
+        NSError *e = nil; (void)[g_dev newLibraryWithSource:msl_salted(msl) options:opts error:&e];
+    }
+}
 /* Local change: parallel priming. The serial warm-up below compiles one MSL library at a time, so a cold first launch keeps
    only one MTLCompilerService busy (~170 shaders a minute on an M1 Pro). Before each serial stage, compile that stage's
    unique shader sources on TOTK_WARM_THREADS threads (default: the performance-core count; 1 = off) and drop the results:
@@ -5994,7 +6009,7 @@ static void warm_prime(NSArray<NSString *> *keys, const char *what) {
         for (NSUInteger i = t; i < count; i += (NSUInteger)n) @autoreleasepool {
             NSString *msl = [NSString stringWithContentsOfFile:[rt stringByAppendingFormat:@"/%@.metal", keys[i]] encoding:NSUTF8StringEncoding error:nil];
             if (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"]) continue;
-            NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:msl options:opts error:&e];
+            NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:msl_salted(msl) options:opts error:&e];
             uint64_t k = (lib ? atomic_fetch_add(&compiled, 1) : atomic_fetch_add(&failed, 1)) + 1;
             if (t == 0 && runtime_boot_status && k % 16 == 0) {   /* the warm-up bar does not move during this step: say how far it is */
                 char d[96]; snprintf(d, sizeof d, "Compiling shaders on %d cores: %llu / %lu", n, (unsigned long long)(atomic_load(&compiled) + atomic_load(&failed)), (unsigned long)count);
