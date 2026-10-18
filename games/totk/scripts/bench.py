@@ -56,6 +56,7 @@ def config_env(name):
         elif p == 'unl': env.update(TOTK_FPS60='1')
         elif p == 'async': env['TOTK_ASYNC_PSO'] = '1'
         elif p == 'sync': env.update(TOTK_ASYNC_PSO='0', TOTK_ASYNC_XLATE='0')
+        elif p in ('qosutil', 'qosdef', 'qosinit'): env['TOTK_COMPILE_QOS'] = {'qosutil': 'utility', 'qosdef': 'default', 'qosinit': 'initiated'}[p]
         elif p == 'xcold': env.update(TOTK_SHADER_SEED='off', DM_PSO_MANIFEST='off', TOTK_WARM_LIGHT='0')   # empty translation cache (see run)
         elif p == 'fs': env['TOTK_FULLSCREEN'] = '1'   # full screen (macOS Game Mode)
         elif p == 'rawaudio': env['TOTK_AUDIO_SMOOTH'] = '0'

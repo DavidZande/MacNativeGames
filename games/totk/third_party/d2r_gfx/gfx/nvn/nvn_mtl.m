@@ -496,6 +496,7 @@ void mtl_init(void) {
     if (latency && atoi(latency) > 0) g_present_latency = atoi(latency);
     g_res_check_on = getenv("DM_RES_CHECK") != NULL;
     g_dev = MTLCreateSystemDefaultDevice();
+    if (g_dev && [g_dev respondsToSelector:@selector(setShouldMaximizeConcurrentCompilation:)]) g_dev.shouldMaximizeConcurrentCompilation = YES;   /* local change: more compiler processes for background builds */
     if (!g_dev) MDIE("没有 Metal 设备");
     if (!g_dev.hasUnifiedMemory) MDIE("需要统一内存设备（零拷贝内存池）");
     g_q = [g_dev newCommandQueue];
@@ -5791,6 +5792,21 @@ static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
 static void pso_predict_rest(void);
 static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
+/* Local change: background pipeline builds (prediction and TOTK_ASYNC_PSO) run on their own queue below the render
+   thread: TOTK_COMPILE_QOS=utility (default) | default | initiated (the old behaviour). With background compiling off the
+   submit thread may wait for a predicted pipeline, so they keep user-initiated priority then. */
+static int async_pso_on(void);
+static dispatch_queue_t pso_compile_queue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("TOTK_COMPILE_QOS");
+        qos_class_t c = !async_pso_on() ? QOS_CLASS_USER_INITIATED : e && !strcmp(e, "initiated") ? QOS_CLASS_USER_INITIATED : e && !strcmp(e, "default") ? QOS_CLASS_DEFAULT : QOS_CLASS_UTILITY;
+        q = dispatch_queue_create("totk.pso-compile", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, c, 0));
+        MLOG("background pipeline builds: QoS %s, %lu concurrent compilations", c == QOS_CLASS_UTILITY ? "utility" : c == QOS_CLASS_DEFAULT ? "default" : "user-initiated",
+             (unsigned long)g_dev.maximumConcurrentCompilationTaskCount);
+    });
+    return q;
+}
 static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // 提交线程调：没在缓存、没在表里才丢 | Called by the submit thread: kick only if it is neither in the cache nor in the table
     if (hm_get_id(&g_pso, k)) return;
     pthread_mutex_lock(&g_pp_mu);
@@ -5800,7 +5816,7 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
     MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    dispatch_async(pso_compile_queue(), ^{
         NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
     });
