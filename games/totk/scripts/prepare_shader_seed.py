@@ -20,6 +20,10 @@ ANSWERS = dict(tex={}, img={}, attr={}, fout={})
 SUFFIX = hashlib.sha256(json.dumps(ANSWERS, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:12]
 
 
+from enumerate_agl_sharcb import stages as agl_stages, ARCHIVES as _AGL   # local change (same scripts/ folder)
+AGL_ARCHIVES = frozenset(a for a in _AGL if a.startswith('Lib/'))   # Shader/ApplicationPackage... is visited with Shader/ already
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -114,6 +118,11 @@ def inventory(romfs, extra=False):
             if data[:4] == b'SARC':
                 for member, raw in sarc(data).items():
                     visit(name+'/'+member, raw)
+            elif data[:4] == b'BAHS' and not extra:
+                # Local change: AGL shader archives (.sharcb; docs/runtime-shaders-agl-sharcb.md): complete GLSLC output in
+                # AGL's own container, 3,996 shaders in 1.0.0 that no BNSH holds (enumerate_agl_sharcb.py has the layout).
+                for key, stage, control, code, _ in agl_stages(data):
+                    shaders.setdefault(key, (stage, control, code, name))
             elif extra or data[:4] in (b'FSHA', b'BNSH'):   # effect files embed BNSH inside other containers
                 # BFSHA contains complete, independently addressed BNSH files.
                 pos = 0
@@ -130,7 +139,7 @@ def inventory(romfs, extra=False):
                         pos += 8; continue   # an unusual embedded binary in an effect file: skip it
                     pos += max(size, 8)
         startup = lambda n: (n == 'Lib/NintendoSDK/TextureShader.bnsh' or n == 'Pack/Bootup.Nin_NX_NVN.pack.zs' or
-                             n.startswith('Shader/') and n.endswith('.zs'))
+                             n.startswith('Shader/') and n.endswith('.zs') or n in AGL_ARCHIVES)
         # Local change, --extra: the effect and UI shaders (Effect/, UI/: about 15,000 more in 1.0.0) that the startup set
         # does not cover; they are met the first time an effect or a menu appears.
         names = [n for n in entries if (n.startswith(('Effect/', 'UI/')) if extra else startup(n))]
@@ -153,7 +162,7 @@ def prepare(romfs, output, translator, spirv_cross, version):
                     source_romfs_sha256=json.loads((romfs/'index.json').read_text())['romfs_sha256'],
                     translator_sha256=digest(translator.read_bytes()),
                     spirv_cross_sha256=digest(spirv_cross.read_bytes()),
-                    preparation_sha256=digest(Path(__file__).read_bytes()))
+                    preparation_sha256=digest(Path(__file__).read_bytes() + Path(__file__).with_name('enumerate_agl_sharcb.py').read_bytes()))
     marker = output/'seed-manifest.json'
     if marker.exists():
         old = json.loads(marker.read_text())
