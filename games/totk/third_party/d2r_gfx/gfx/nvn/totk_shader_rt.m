@@ -267,7 +267,15 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     uint8_t md[32]; NSData *ad = [json_string(answers) dataUsingEncoding:NSUTF8StringEncoding]; CC_SHA256(ad.bytes, (CC_LONG)ad.length, md);
     NSString *variant = [NSString stringWithFormat:@"%@-%@", shader, hex(md, 6)];
 #if !TARGET_OS_IPHONE
-    if (async_xlate_on() && [g_xlate_pending containsObject:variant]) { pthread_mutex_unlock(&g_rt_lock); return nil; }   /* still translating */
+    /* Only vertex and fragment shaders go to the background: a skipped draw only leaves an object out for a frame, but a
+       skipped compute dispatch leaves buffers unwritten that later passes read as addresses (GPU page faults, then every
+       command buffer fails). Compute shaders are translated in place, as before. */
+    /* Nor during the first frames: with every draw of the first frame skipped, the present read a canvas that was never
+       rendered (GPU page fault at start-up). Shaders met before TOTK_ASYNC_XLATE_AFTER frames (default 120, about 2 s at
+       the title) are translated in place. */
+    static long after = -1; if (after < 0) { const char *e = getenv("TOTK_ASYNC_XLATE_AFTER"); after = e ? atol(e) : 120; }
+    int async_ok = async_xlate_on() && stage != 5 && (long)dm_nvn_frame_count() >= after;
+    if (async_ok && [g_xlate_pending containsObject:variant]) { pthread_mutex_unlock(&g_rt_lock); return nil; }   /* still translating */
 #endif
     NSString *code_path = [totk_rt_dir() stringByAppendingFormat:@"/%@.code", variant];
     // Graphics code drops the 0x30-byte NVN header (the translator wants SPH + instructions); compute keeps it, as in D2R's build.
@@ -278,7 +286,7 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     if (local) rq[@"local"] = local;
     rq[@"depth_minus_w"] = totk_depth_near_minus_w() ? @YES : @NO;   // nvnDeviceSetDepthMode: NEAR_IS_MINUS_W needs the GL -> Metal clip-z conversion in every vertex shader
 #if !TARGET_OS_IPHONE
-    if (async_xlate_on()) {
+    if (async_ok) {
         BOOL existed_ = [NSFileManager.defaultManager fileExistsAtPath:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", variant]];
         if (!g_xlate_pending) g_xlate_pending = [NSMutableSet set];
         [g_xlate_pending addObject:variant];

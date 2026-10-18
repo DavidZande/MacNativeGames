@@ -5837,6 +5837,7 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交�
    thread waiting for the compiler. Merged-pass / specialized-fragment pipelines (g_pso_lmap) stay synchronous. */
 static int async_pso_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_PSO"); v = !(e && !atoi(e));   /* default on (benchmarked: no visible breakage) */ MLOG("background pipeline compiling (TOTK_ASYNC_PSO): %s", v ? "on" : "off"); } return v; }
 uint64_t g_async_pso_kicked, g_async_pso_skipped, g_async_pso_ready;   /* perf.csv / log */
+uint64_t g_inplace_pso_n, g_inplace_pso_ns, g_inplace_pso_max_ns, g_inplace_merged_n;   /* pipelines built on the render thread (perf.csv) */
 static int pso_pend_poll(const pso_key *k, id<MTLRenderPipelineState> *out) {   /* 1 ready (taken), 0 still compiling, -1 not queued */
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k), r = -1;
@@ -5873,7 +5874,10 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     else {
         if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, g_pso_fsfn, g_pso_lmap != NULL);
+        uint64_t t_in = bp_now();
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        { uint64_t dt = bp_now() - t_in; g_inplace_pso_n++; g_inplace_pso_ns += dt; if (dt > g_inplace_pso_max_ns) g_inplace_pso_max_ns = dt; if (g_pso_lmap) g_inplace_merged_n++;
+          if (g_pso_lmap && survey_shader_log()) MLOG("[merged-pso] in place %.2f ms fz %d cfmt0 %d dfmt %d", dt / 1e6, (int)g_pso_fz.kind, (int)k.cfmt[0], (int)k.dfmt); }
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }

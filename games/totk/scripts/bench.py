@@ -110,6 +110,8 @@ def summarize(rows):
             'long50': int(sum(f('long50'))), 'long100': int(sum(f('long100'))),
             'pipelines': int(sum(f('new_pipelines'))), 'libraries': int(sum(f('new_libraries'))), 'build_ms': round(sum(f('build_ms'))),
             'async_skipped': int(sum(f('async_skipped'))),
+            'inplace_pso': int(sum(f('inplace_pso'))), 'inplace_merged': int(sum(f('inplace_merged'))), 'inplace_pso_ms': round(sum(f('inplace_pso_ms'))),
+            'inplace_pso_max_ms': round(max(f('inplace_pso_max_ms')), 1) if f('inplace_pso_max_ms') else None,
             'pres_p50': round(statistics.median(f('present_p50_ms')), 2) if f('present_p50_ms') else None,
             'pres_p95': round(statistics.median(f('present_p95_ms')), 2) if f('present_p95_ms') else None,
             'pres_p99': round(max(f('present_p99_ms')), 2) if f('present_p99_ms') else None,
