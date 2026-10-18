@@ -5,6 +5,8 @@
 // build/shader-service/totk_xlate --service when it is there (tools/totk_xlate/Service.cs, NativeAOT: no Python, no .NET
 // runtime; 2026-10-17), else scripts/shader_service.py with the .NET translator. Same requests, replies and cache files.
 #import <Foundation/Foundation.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <TargetConditionals.h>
 #include "totk_shader_rt.h"
 #include "dmsh_chain.h"
@@ -74,14 +76,24 @@ NSString *totk_rt_dir(void) {
     return g_dir;
 }
 
-static void service_start(void) {
-    if (g_svc_in) return;
+static void service_spawn(FILE **in, FILE **out) {
     NSString *r = root_dir();
     int to[2], from[2];
     if (pipe(to) || pipe(from)) die("shader service pipes");
+    /* Local change: several translators run at once now, so no file descriptor may leak into another one (a translator
+       holding another's pipe ends never sees end-of-file and outlives the game): our ends are close-on-exec, and the
+       child inherits only stdin, stdout and stderr (POSIX_SPAWN_CLOEXEC_DEFAULT). */
+    fcntl(to[1], F_SETFD, FD_CLOEXEC); fcntl(from[0], F_SETFD, FD_CLOEXEC);
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, to[0], 0); posix_spawn_file_actions_adddup2(&fa, from[1], 1);
-    posix_spawn_file_actions_addclose(&fa, to[1]); posix_spawn_file_actions_addclose(&fa, from[0]);
+    posix_spawn_file_actions_addinherit_np(&fa, 2);
+    /* The background pool spawns from GCD worker threads, which block every signal; a child inherits that mask, and the
+       .NET translator then never sees SIGCHLD and waits forever for its spirv-cross child. Start it with an empty mask
+       and default handlers. */
+    posix_spawnattr_t sa; posix_spawnattr_init(&sa);
+    posix_spawnattr_setflags(&sa, POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    sigset_t none, all; sigemptyset(&none); sigfillset(&all); sigdelset(&all, SIGKILL); sigdelset(&all, SIGSTOP);
+    posix_spawnattr_setsigmask(&sa, &none); posix_spawnattr_setsigdefault(&sa, &all);
     NSString *sc = [r stringByAppendingString:@"/build/spirv-cross/spirv-cross"];
     // TOTK_SHADER_XLATE=<totk_xlate.dll> runs a trial translator build (e.g. build/totk_xlate-opt) without replacing the
     // shared one (through shader_service.py); TOTK_SHADER_DEBUGMODE=0|1 reaches either service through the environment.
@@ -95,22 +107,101 @@ static void service_start(void) {
     if (use_native) {
         const char *argv[] = {native.UTF8String, "--service", "--spirv-cross", sc.UTF8String, "--out", totk_rt_dir().UTF8String,
                               "--chain", DMSH_CHAIN, NULL};
-        if (posix_spawn(&pid, argv[0], &fa, NULL, (char *const *)argv, environ)) die("start shader service %s", argv[0]);
+        if (posix_spawn(&pid, argv[0], &fa, &sa, (char *const *)argv, environ)) die("start shader service %s", argv[0]);
         if (dm) LOG("[shader] native translator, DebugMode %s", dm);
     } else {
         NSString *script = [r stringByAppendingString:@"/scripts/shader_service.py"], *dotnet = [r stringByAppendingString:@"/tooling/dotnet/dotnet"];
         NSString *xlate = xe && *xe ? @(xe) : [r stringByAppendingString:@"/build/totk_xlate/totk_xlate.dll"];
         const char *argv[] = {"python3", "-I", script.UTF8String, "--dotnet", dotnet.UTF8String, "--xlate", xlate.UTF8String,
                               "--spirv-cross", sc.UTF8String, "--out", totk_rt_dir().UTF8String, "--chain", DMSH_CHAIN, NULL};
-        if (posix_spawnp(&pid, "python3", &fa, NULL, (char *const *)argv, environ)) die("start shader service");
+        if (posix_spawnp(&pid, "python3", &fa, &sa, (char *const *)argv, environ)) die("start shader service");
         if (xe || dm) LOG("[shader] translator %s, DebugMode %s", xlate.UTF8String, dm ? dm : "default");
     }
-    posix_spawn_file_actions_destroy(&fa);
+    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&sa);
     close(to[0]); close(from[1]);
-    g_svc_in = fdopen(to[1], "w"); g_svc_out = fdopen(from[0], "r");
-    if (!g_svc_in || !g_svc_out) die("shader service streams");
+    *in = fdopen(to[1], "w"); *out = fdopen(from[0], "r");
+    if (!*in || !*out) die("shader service streams");
     LOG("[shader] runtime translation service started (pid %d, %s), cache %s", pid,
         use_native ? "native build/shader-service/totk_xlate" : "python3 scripts/shader_service.py + .NET", totk_rt_dir().UTF8String);
+}
+
+static void service_start(void) { if (!g_svc_in) service_spawn(&g_svc_in, &g_svc_out); }
+
+/* Local change, TOTK_ASYNC_XLATE (default on; off with "Background shader compiling" in the settings): a variant that is
+   not translated yet goes to a pool of TOTK_XLATE_THREADS translator processes (default 3) on a background queue, and
+   totk_rt_variant returns nil at once, as on the iPhone: the program's draws are skipped (nvn_mtl.m, NvProg missing)
+   until the translation lands; totk_rt_gen() then changes and the program is resolved again. The render thread no longer
+   waits for the translator. A failed translation still stops the game, as before. */
+#if !TARGET_OS_IPHONE
+static int async_xlate_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_XLATE"); v = !(e && !atoi(e)); LOG("[shader] background translation (TOTK_ASYNC_XLATE): %s", v ? "on" : "off"); } return v; }
+#define XLATE_MAX 8
+static struct { FILE *in, *out; int busy; } g_xp[XLATE_MAX];
+static int g_xn;
+static pthread_mutex_t g_xp_mu = PTHREAD_MUTEX_INITIALIZER;
+static dispatch_semaphore_t g_xp_sem;
+static NSMutableSet<NSString *> *g_xlate_pending;
+static _Atomic uint64_t g_xlate_gen, g_xlate_done, g_xlate_ns;
+static dispatch_queue_t xlate_queue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("TOTK_XLATE_THREADS"); g_xn = e ? atoi(e) : 3; if (g_xn < 1) g_xn = 1; if (g_xn > XLATE_MAX) g_xn = XLATE_MAX;
+        g_xp_sem = dispatch_semaphore_create(g_xn);
+        q = dispatch_queue_create("totk.shader-translate", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0));
+        LOG("[shader] background translation: %d translator processes", g_xn);
+    });
+    return q;
+}
+static NSMutableArray *variants_of(NSString *shader);
+static NSString *index_path(NSString *shader);
+static NSString *json_string(id obj);
+static void xlate_run(NSString *shader, NSString *variant, NSString *stage_name, NSString *request, BOOL existed) {
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    dispatch_semaphore_wait(g_xp_sem, DISPATCH_TIME_FOREVER);
+    pthread_mutex_lock(&g_xp_mu); int k = 0; while (g_xp[k].busy) k++; g_xp[k].busy = 1; pthread_mutex_unlock(&g_xp_mu);
+    if (!g_xp[k].in) service_spawn(&g_xp[k].in, &g_xp[k].out);
+    if (getenv("TOTK_XLATE_TRACE")) { LOG("[xlate-trace] slot %d send %s (fd %d)", k, variant.UTF8String, fileno(g_xp[k].in));
+        [request writeToFile:[totk_rt_dir() stringByAppendingFormat:@"/%@.request.json", variant] atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+    fprintf(g_xp[k].in, "%s\n", request.UTF8String); fflush(g_xp[k].in);
+    char line[2048];
+    if (!fgets(line, sizeof line, g_xp[k].out)) die("shader service exited while translating %s", variant.UTF8String);
+    if (getenv("TOTK_XLATE_TRACE")) LOG("[xlate-trace] slot %d reply %.80s", k, line);
+    pthread_mutex_lock(&g_xp_mu); g_xp[k].busy = 0; pthread_mutex_unlock(&g_xp_mu);
+    dispatch_semaphore_signal(g_xp_sem);
+    NSDictionary *reply = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:line length:strlen(line)] options:0 error:nil];
+    if (![reply[@"ok"] boolValue]) die("shader %s (%s) translation failed: %s", variant.UTF8String, stage_name.UTF8String, [[reply[@"error"] description] UTF8String]);
+    NSData *jd = [NSData dataWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant]];
+    NSDictionary *refl = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+    if (![refl isKindOfClass:[NSDictionary class]]) die("shader %s: reflection missing", variant.UTF8String);
+    pthread_mutex_lock(&g_rt_lock);
+    NSMutableArray *vs = variants_of(shader);
+    [vs addObject:@{@"variant": variant, @"deps": refl[@"deps"] ?: @{}}];
+    [g_msl_checked addObject:variant];
+    [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];
+    g_translated++;
+    if (!existed) { atomic_fetch_add(&g_new_variants, 1); atomic_store(&g_new_variant_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }
+    [g_xlate_pending removeObject:variant];
+    uint64_t n = atomic_fetch_add(&g_xlate_done, 1) + 1;
+    pthread_mutex_unlock(&g_rt_lock);
+    atomic_fetch_add(&g_xlate_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+    atomic_fetch_add(&g_xlate_gen, 1);
+    if (n <= 8 || n % 100 == 0) LOG("[shader] translated in the background %llu: %s %s (%.0f ms)", (unsigned long long)n, stage_name.UTF8String, variant.UTF8String, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
+}
+#endif
+static _Atomic uint64_t g_xlate_block_ns;   /* time the caller (the render thread) waited for synchronous translations */
+uint64_t totk_rt_gen(void) {
+#if !TARGET_OS_IPHONE
+    return atomic_load(&g_xlate_gen);
+#else
+    return 0;
+#endif
+}
+uint64_t totk_rt_block_ns(void) { return atomic_load(&g_xlate_block_ns); }
+uint64_t totk_rt_pending(void) {
+#if !TARGET_OS_IPHONE
+    pthread_mutex_lock(&g_rt_lock); uint64_t n = g_xlate_pending.count; pthread_mutex_unlock(&g_rt_lock); return n;
+#else
+    return 0;
+#endif
 }
 
 static NSString *hex(const uint8_t *p, size_t n) {
@@ -170,6 +261,9 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     if (!stage_name) die("shader %s: NVN stage %d has no translation chain (tessellation/geometry)", shader.UTF8String, stage);
     uint8_t md[32]; NSData *ad = [json_string(answers) dataUsingEncoding:NSUTF8StringEncoding]; CC_SHA256(ad.bytes, (CC_LONG)ad.length, md);
     NSString *variant = [NSString stringWithFormat:@"%@-%@", shader, hex(md, 6)];
+#if !TARGET_OS_IPHONE
+    if (async_xlate_on() && [g_xlate_pending containsObject:variant]) { pthread_mutex_unlock(&g_rt_lock); return nil; }   /* still translating */
+#endif
     NSString *code_path = [totk_rt_dir() stringByAppendingFormat:@"/%@.code", variant];
     // Graphics code drops the 0x30-byte NVN header (the translator wants SPH + instructions); compute keeps it, as in D2R's build.
     size_t skip = stage == 5 ? 0 : 0x30;
@@ -178,6 +272,17 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     [rq addEntriesFromDictionary:answers];
     if (local) rq[@"local"] = local;
     rq[@"depth_minus_w"] = totk_depth_near_minus_w() ? @YES : @NO;   // nvnDeviceSetDepthMode: NEAR_IS_MINUS_W needs the GL -> Metal clip-z conversion in every vertex shader
+#if !TARGET_OS_IPHONE
+    if (async_xlate_on()) {
+        BOOL existed_ = [NSFileManager.defaultManager fileExistsAtPath:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", variant]];
+        if (!g_xlate_pending) g_xlate_pending = [NSMutableSet set];
+        [g_xlate_pending addObject:variant];
+        NSString *request = json_string(rq), *stg = stage_name;
+        dispatch_async(xlate_queue(), ^{ xlate_run(shader, variant, stg, request, existed_); });
+        pthread_mutex_unlock(&g_rt_lock);
+        return nil;
+    }
+#endif
 #if TARGET_OS_IPHONE
     // No translator on the phone (Python + .NET + SPIRV-Cross): the variant cache is translated on the Mac and copied over.
     // A miss records the complete request (with the guest code bytes) under shader-requests/ for ios/tools/fill_shaders.py.
@@ -221,6 +326,7 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
         (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6,
         [refl[@"softfloat64"] boolValue] ? " (FP64 fallback)" : "");
     if (g_translated <= 8 || g_translated % 100 == 0) LOG("[shader] translated %llu: %s %s", (unsigned long long)g_translated, stage_name.UTF8String, variant.UTF8String);
+    atomic_fetch_add(&g_xlate_block_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started);
     pthread_mutex_unlock(&g_rt_lock);
     return variant;
 }

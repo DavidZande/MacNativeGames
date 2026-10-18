@@ -4443,7 +4443,7 @@ static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
     // TOTK: translation inputs and the variant per bound-state signature (prog_fit)
     const uint8_t *ctl[6], *code[6]; NSString *key[6]; uint64_t sig[6]; NSMutableDictionary<NSNumber *, NvShader *> *alt[6];
     void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw; uint32_t udc_cmask;   // udc_*: udc_note_draw's summary of sh[] (valid while sh[] is the same)
-    int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip; } @end   // TOTK (iOS): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip)
+    int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip; uint64_t xgen; } @end   /* xgen (local change): totk_rt_gen() when built; a missing stage is retried once it moved */   // TOTK (iOS): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip)
 @implementation NvProg @end
 /* TOTK_EXP_SKIP_FS=<fragment key prefix>[,<prefix>...] (measurement only, 2026-10-16): drop every draw whose fragment shader key
    starts with one of the prefixes. A render pass whose draws are all dropped is never opened, so the GPU time saved is the
@@ -4803,11 +4803,13 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
     uint64_t gen = g_ser_gen;
-    if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser))) { lgen = gen; return lpr; }
+    uint64_t xg = totk_rt_gen();
+    if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser)) && !(lpr->missing && lpr->xgen != xg)) { lgen = gen; return lpr; }
     __unsafe_unretained NvProg *have = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
-    if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
+    if (have && !(have->missing && have->xgen != xg)) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
+    if (have) { lp = NULL; lpr = nil; }   /* a background translation landed: build this program again (local change) */
     shmap_load();
-    NvProg *o = [NvProg new];
+    NvProg *o = [NvProg new]; o->xgen = xg;
     for (unsigned i = 0; i < p->nstage; i++) {
         const uint8_t *control=p->sd[i].control;uint32_t length=0,nvn_stage=0;
         if (!control || !p->sd[i].data) MDIE("null TOTK shader binary");
@@ -5368,11 +5370,11 @@ static int prog_fit(NvProg *pr) {
     for (int st = 0; st < 2; st++) {
         if (!pr->sh[st] || !pr->key[st]) continue;
         uint64_t sg = stage_sig(st); if (sg == pr->sig[st]) continue;
-        if (pr->miss_has[st] && sg == pr->miss_sig[st]) return -1;
+        if (pr->miss_has[st] && sg == pr->miss_sig[st]) { if (pr->xgen == totk_rt_gen()) return -1; pr->miss_has[st] = 0; }   /* retry once a translation landed */
         NvShader *v = pr->alt[st][@(sg)];
         if (!v) {
             NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), nil);
-            if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; return -1; }   // iOS: this signature's variant is not translated yet
+            if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; pr->xgen = totk_rt_gen(); return -1; }   // not translated yet (iOS; Mac: in the background)
             v = shader_get([variant stringByAppendingString:@"_b"], st);
             if (!v) MDIE("TOTK shader translation/reflection unavailable for %s", variant.UTF8String);
             pr->alt[st][@(sg)] = v;

@@ -55,7 +55,8 @@ def config_env(name):
         elif p == '60': env.update(TOTK_FPS60='1', DM_PRESENT_HZ='60')
         elif p == 'unl': env.update(TOTK_FPS60='1')
         elif p == 'async': env['TOTK_ASYNC_PSO'] = '1'
-        elif p == 'sync': env['TOTK_ASYNC_PSO'] = '0'
+        elif p == 'sync': env.update(TOTK_ASYNC_PSO='0', TOTK_ASYNC_XLATE='0')
+        elif p == 'xcold': env.update(TOTK_SHADER_SEED='off', DM_PSO_MANIFEST='off', TOTK_WARM_LIGHT='0')   # empty translation cache (see run)
         elif p == 'fs': env['TOTK_FULLSCREEN'] = '1'   # full screen (macOS Game Mode)
         elif p == 'rawaudio': env['TOTK_AUDIO_SMOOTH'] = '0'
         elif p.startswith('lat') and p[3:].isdigit(): env['DM_PRESENT_LATENCY'] = p[3:]   # CAMetalDisplayLink preferredFrameLatency
@@ -112,6 +113,7 @@ def summarize(rows):
             'pres_max': round(max(f('present_max_ms')), 1) if f('present_max_ms') else None,
             'dropped': int(sum(f('present_dropped'))),
             'audio_underruns': int(sum(f('audio_underruns'))),
+            'xlate_block_ms': round(sum(f('xlate_block_ms'))), 'xlate_max_pending': int(max(f('xlate_pending'))) if f('xlate_pending') else 0,
             'footprint_mb': round(max(f('footprint_mb'))) if f('footprint_mb') else None}
 
 
@@ -149,7 +151,12 @@ def run(name, args, outdir):
         subprocess.Popen([str(APP / 'Contents/MacOS/TOTK')], env=env, cwd='/', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         log = LOG
     else:          # what app/launcher.m sets up, from the work tree
-        env.update(TOTK_SHADER_CACHE=str(DATA / f'shader-cache/rt-{CHAIN}'), TOTK_GAME_SLOT_DIR=str(DATA / 'game-slot'), TOTK_ROMFS_PROOF_DIR=str(DATA),
+        cache = DATA / f'shader-cache/rt-{CHAIN}'
+        if 'xcold' in name.split('-'):   # a fresh, empty translation cache for this run only (the player's cache is not touched)
+            cache = DATA / f'tests/xcold-cache/rt-{CHAIN}'
+            if cache.parent.exists(): shutil.rmtree(cache.parent)
+            cache.mkdir(parents=True)
+        env.update(TOTK_SHADER_CACHE=str(cache), TOTK_GAME_SLOT_DIR=str(DATA / 'game-slot'), TOTK_ROMFS_PROOF_DIR=str(DATA),
                    TOTK_SHARED_FONTS='extracted/firmware/shared-fonts', TOTK_GPU_ALLOW_SUBMIT='1', TOTK_GPU_WIDEN='1', TOTK_GPU_BLOCKRT='1',
                    TOTK_GPU_MIDCLEAR='1', TOTK_GPU_BUDGET_MB='5000')
         binary = TREE / 'build/totk-native'
@@ -173,7 +180,7 @@ def run(name, args, outdir):
     try:
         time.sleep(3)
         if not wait_for(lambda: log.exists() and 'first presented frame' in log.read_text(errors='replace'), 120): raise RuntimeError('no first frame')
-        if 'cold' not in name.split('-'): wait_for(lambda: '管线预热完成' in log.read_text(errors='replace'), 600)   # warm-up done
+        if not {'cold', 'xcold'} & set(name.split('-')): wait_for(lambda: '管线预热完成' in log.read_text(errors='replace'), 600)   # warm-up done
         time.sleep(args.settle)
         play(name, args, rd, cmd_file, perf_off, phase, phases)
     finally:   # always close the game, also after an error
@@ -230,7 +237,7 @@ def main():
         try: results[c] = run(c, args, outdir)
         except Exception as e: print(f'   {c}: {e}', flush=True); results[c] = {'error': str(e)}
         args.quit_running = True   # our own game from the previous config
-    cols = ['fps', 'p50_ms', 'p95_ms', 'p99_ms', 'max_ms', 'pres_p95', 'pres_p99', 'pres_max', 'dropped', 'audio_underruns', 'gpu_ms', 'cpu_pct', 'long50', 'long100', 'pipelines', 'async_skipped', 'footprint_mb']
+    cols = ['fps', 'p50_ms', 'p95_ms', 'p99_ms', 'max_ms', 'pres_p95', 'pres_p99', 'pres_max', 'dropped', 'audio_underruns', 'xlate_block_ms', 'xlate_max_pending', 'gpu_ms', 'cpu_pct', 'long50', 'long100', 'pipelines', 'async_skipped', 'footprint_mb']
     lines = ['| config | phase | ' + ' | '.join(cols) + ' | target |', '|' + '---|' * (len(cols) + 3)]
     for c, r in results.items():
         if 'error' in r: lines.append(f'| {c} | error | {r["error"]} |'); continue

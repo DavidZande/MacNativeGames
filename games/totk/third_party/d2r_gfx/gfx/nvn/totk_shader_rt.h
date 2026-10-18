@@ -11,4 +11,7 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
 #include <stdint.h>
 /* Variants new to the translation cache this run, the variants in the cache (-1 until counted in the background) and
    the CLOCK_UPTIME_RAW time of the last new one (0: none yet). Any pointer may be NULL. */
+uint64_t totk_rt_gen(void);        /* local change: changes when a background translation lands */
+uint64_t totk_rt_block_ns(void);   /* time callers waited for synchronous translations */
+uint64_t totk_rt_pending(void);    /* background translations in flight */
 void totk_rt_counts(uint64_t *fresh, int64_t *total, uint64_t *last_new_ns);
