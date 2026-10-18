@@ -2480,7 +2480,12 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
     int m = mfx_enabled();
     if (m == MFX_HALF) return 2;
     if (m == MFX_30) { int hz = g_paced_hz > 0 ? g_paced_hz : 60; return (unsigned)(hz >= 45 ? (hz + 15) / 30 : 1); }
-    return g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
+    /* Local change, TOTK_INTERVAL_SCALE=2 with DM_PRESENT_HZ=120 ("fine pacing" for the 60 FPS cap): the game's interval
+       counts 60 Hz ticks; paced on 120 Hz ticks it is doubled, so on-time frames keep their timing (16.7 / 33.3 ms) and a
+       frame that just misses lands on the next 8.3 ms tick (41.7 ms) instead of the next 16.7 ms one (50 ms). */
+    static int scale = -1; if (scale < 0) { const char *e = getenv("TOTK_INTERVAL_SCALE"); scale = e ? atoi(e) : 1; if (scale < 1 || scale > 4) scale = 1; }
+    unsigned base = g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
+    return base * (unsigned)scale;
 }
 static uint64_t present_period(const win_t *o) {
     unsigned itv = present_ticks(o); int m = mfx_enabled(), hz = g_uncapped && !uncapped_now() ? g_paced_hz : g_hz;
