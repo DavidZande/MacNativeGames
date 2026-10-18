@@ -524,6 +524,13 @@ def step_shaders(tree, logs, *, version='v0'):
          '--romfs', tree/f'extracted/{version}/romfs', '--output', tree/f'build/shader-seed/{version}',
          '--translator', translator, '--spirv-cross', tree/'build/spirv-cross/spirv-cross',
          '--version', version], logs/'prepare-shader-seed.log', cwd=tree)
+    # Local change: the effect and UI shaders (~15,000 more), translated once in parallel; the game compiles them into the
+    # system's shader cache in the background, so a new effect never waits for a translation or a compile.
+    say('3/4 shaders: translating the effect and UI shaders (a minute or two, once)')
+    run([tree/'.venv/bin/python', 'scripts/prepare_shader_seed.py', '--extra',
+         '--romfs', tree/f'extracted/{version}/romfs', '--output', tree/f'build/shader-seed/{version}-extra',
+         '--translator', translator, '--spirv-cross', tree/'build/spirv-cross/spirv-cross',
+         '--version', version], logs/'prepare-shader-seed-extra.log', cwd=tree)
 
 
 def step_binary(tree, game, keys, env, logs, *, version="v0"):
@@ -599,6 +606,11 @@ def step_app(tree, out, logs, *, version="v0"):
     except (ValueError, KeyError, OSError, TypeError) as error:
         raise BuildError(f'invalid prepared startup shader seed: {error}') from None
     copy_tree(seed, res/'build/shader-seed')
+    extra = tree/f'build/shader-seed/{version}-extra'
+    if (extra/'seed-manifest.json').is_file() and json.loads((extra/'seed-manifest.json').read_text()).get('prime_only'):
+        # local change: effect/UI shaders (see step_shaders); ~45,000 files, so one directory clone rather than one per file
+        if subprocess.run(['cp', '-c', '-R', str(extra), str(res/'build/shader-seed-extra')], capture_output=True).returncode:
+            shutil.copytree(extra, res/'build/shader-seed-extra')
     clone(tree / 'build/app-launcher', tmp / 'Contents/MacOS/TOTK')
     info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable='TOTK', CFBundleIdentifier=BUNDLE_ID, CFBundleName=APP_NAME,
                 CFBundleDisplayName=APP_NAME, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],

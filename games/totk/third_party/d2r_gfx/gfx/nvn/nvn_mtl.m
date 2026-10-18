@@ -6010,7 +6010,8 @@ static void warm_plan(NSArray<NSString *> *paths, NSArray<NSString *> *files, NS
             [eligible addObject:line]; ++*tasks;
         }
     }
-    for (NSString *file in files) if ([file hasSuffix:@"_b.metal"]) {
+    NSSet *prime_only = totk_rt_prime_only();
+    for (NSString *file in files) if ([file hasSuffix:@"_b.metal"] && ![prime_only containsObject:[file stringByDeletingPathExtension]]) {
         ++*tasks; [keys addObject:[file stringByDeletingPathExtension]];
     }
     *shaders = keys.count;
@@ -6081,6 +6082,28 @@ static NSArray<NSString *> *warm_prime_keys(NSString *txt, NSSet<NSString *> *el
     if (skip.count) [keys minusSet:skip];
     return keys.array;
 }
+/* Local change: after the warm-up, compile the effect/UI seed (totk_rt_prime_only) into the system's Metal cache on a few
+   utility-priority threads (TOTK_PRIME_THREADS, default 4; 0 = off), so the first time an effect appears its library
+   is a cache hit for the background loader. Nothing is kept in memory. Repeated starts are cache hits (seconds). */
+static void warm_prime_only(void) {
+    NSArray<NSString *> *keys = [totk_rt_prime_only().allObjects sortedArrayUsingSelector:@selector(compare:)];
+    const char *e = getenv("TOTK_PRIME_THREADS"); int n = e ? atoi(e) : 4; if (n < 0) n = 0; if (n > 16) n = 16;
+    if (!keys.count || !n) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        MTLCompileOptions *opts = totk_precise_opts(); NSString *rt = totk_rt_dir(); NSUInteger count = keys.count;
+        __block _Atomic uint64_t done = 0, failed = 0; uint64_t t0 = bp_now();
+        dispatch_apply((size_t)n, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(size_t t) {
+            for (NSUInteger i = t; i < count; i += (NSUInteger)n) @autoreleasepool {
+                NSString *msl = [NSString stringWithContentsOfFile:[rt stringByAppendingFormat:@"/%@.metal", keys[i]] encoding:NSUTF8StringEncoding error:nil];
+                if (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"]) continue;
+                NSError *er = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:msl_salted(msl) options:opts error:&er];
+                uint64_t k = (lib ? atomic_fetch_add(&done, 1) : atomic_fetch_add(&failed, 1)) + 1;
+                if (t == 0 && k % 2000 < (uint64_t)n) MLOG("[effect-prime] %llu / %lu effect/UI shaders compiled in the background (%.0f s)", (unsigned long long)k, (unsigned long)count, (bp_now() - t0) / 1e9);
+            }
+        });
+        MLOG("[effect-prime] done: %llu effect/UI shaders, %llu failed, %d threads, %.1f s", (unsigned long long)done, (unsigned long long)failed, n, (bp_now() - t0) / 1e9);
+    });
+}
 static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         NSSet<NSString *> *eligible,
                         NSMutableSet<NSString *> *planned_keys,uint64_t total,uint64_t shader_total,uint64_t pipeline_total) {
@@ -6145,7 +6168,8 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         NSMutableArray<NSString *> *cache_files = [files mutableCopy];
         NSMutableSet<NSString *> *known_files = [NSMutableSet setWithArray:files];
         NSArray<NSString *> *latest = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:rt error:nil] sortedArrayUsingSelector:@selector(compare:)];
-        for (NSString *file in latest) if ([file hasSuffix:@"_b.metal"] && ![known_files containsObject:file]) {
+        NSSet *prime_only = totk_rt_prime_only();
+        for (NSString *file in latest) if ([file hasSuffix:@"_b.metal"] && ![known_files containsObject:file] && ![prime_only containsObject:[file stringByDeletingPathExtension]]) {
             // The native service publishes reflection last. A newly written
             // MSL with no reflection yet is still in flight, not a failed shader.
             NSString *json = [[file stringByDeletingPathExtension] stringByAppendingPathExtension:@"json"];
@@ -6156,12 +6180,13 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         }
         if (runtime_warm_progress) runtime_warm_progress(done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
         { NSMutableArray<NSString *> *rest = [NSMutableArray array];
-          for (NSString *file in cache_files) if ([file hasSuffix:@"_b.metal"]) { NSString *key = [file stringByDeletingPathExtension]; if (!dict[key]) [rest addObject:key]; }
+          for (NSString *file in cache_files) if ([file hasSuffix:@"_b.metal"]) { NSString *key = [file stringByDeletingPathExtension]; if (!dict[key] && ![prime_only containsObject:key]) [rest addObject:key]; }
           warm_prime(rest, "translation cache"); }
         uint64_t cached = 0, failed = 0;
         for (NSString *file in cache_files) {
             if (![file hasSuffix:@"_b.metal"]) continue;
             NSString *key = [file stringByDeletingPathExtension];
+            if ([prime_only containsObject:key]) continue;   /* effect/UI seed: compiled below in the background, loaded on first use */
             if (dict[key]) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
             NSString *jp = [rt stringByAppendingPathComponent:[key stringByAppendingPathExtension:@"json"]];
             NSData *jd = [NSData dataWithContentsOfFile:jp];
@@ -6185,6 +6210,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
     }
     atomic_store(&g_warm_running, 0);
     if (runtime_warm_done) runtime_warm_done();
+    warm_prime_only();
 }
 // 等后台预热跑完（最多 timeout_ms；负数表示一直等）：返回实际等了多少毫秒，没在跑返回 0。首装时系统着色器缓存全冷，预热慢于玩家进局的话，
 // 没预热到的管线会在提交线程现编 = 局内卡顿；进局读取画面本来就挡着玩家，让它多读一会儿（hle_nvn.c 出图处调）。

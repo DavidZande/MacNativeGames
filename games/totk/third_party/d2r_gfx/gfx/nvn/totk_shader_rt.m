@@ -37,6 +37,8 @@ static uint64_t g_translated;
    and the variants in the cache (counted once in the background, plus the new ones since). */
 static _Atomic uint64_t g_new_variants, g_new_variant_ns, g_new_at_count;
 static _Atomic int64_t g_cached_variants = -1;
+static NSSet<NSString *> *g_prime_only;   /* local change: effect/UI seed keys (<variant>_b) */
+NSSet<NSString *> *totk_rt_prime_only(void) { (void)totk_rt_dir(); return g_prime_only; }
 
 static NSString *root_dir(void) {   // native-port/ (the executable lives in native-port/build/)
     if (g_root) return g_root;
@@ -61,6 +63,20 @@ NSString *totk_rt_dir(void) {
             NSError *error = nil;
             if (runtime_boot_status) runtime_boot_status("检查着色器缓存","校验 App 附带的着色器，并按需导入本机缓存");
             NSDictionary *seed = totk_seed_import([root_dir() stringByAppendingPathComponent:@"build/shader-seed"], g_dir, &error);
+            /* Local change: the effect and UI shaders (build/shader-seed-extra, prepare_shader_seed.py --extra). Imported like the
+               startup seed, but only compiled into the system cache in the background (nvn_mtl.m warm_prime_only), not loaded. */
+            { NSString *xs = [root_dir() stringByAppendingPathComponent:@"build/shader-seed-extra"]; NSError *xe = nil;
+              NSDictionary *extra = totk_seed_import(xs, g_dir, &xe);
+              if (!extra) LOG("[shader-seed] effect/UI shaders not imported: %s", xe.localizedDescription.UTF8String);
+              else if ([extra[@"available"] boolValue]) {
+                  NSData *raw = [NSData dataWithContentsOfFile:[xs stringByAppendingPathComponent:@"seed-manifest.json"]];
+                  NSDictionary *m = raw ? [NSJSONSerialization JSONObjectWithData:raw options:0 error:nil] : nil;
+                  NSMutableSet *keys = [NSMutableSet set];
+                  for (NSString *name in m[@"files"]) if ([name hasSuffix:@"_b.metal"]) [keys addObject:[name stringByDeletingPathExtension]];
+                  g_prime_only = keys;
+                  LOG("[shader-seed] effect/UI shaders: %lu (imported %llu files); compiled in the background after warm-up",
+                      (unsigned long)keys.count, [extra[@"imported_files"] unsignedLongLongValue]);
+              } }
             if (!seed) die("startup shader preparation: %s", error.localizedDescription.UTF8String);
             if ([seed[@"available"] boolValue]) {
                 unsigned long long imported=[seed[@"imported_files"] unsignedLongLongValue];

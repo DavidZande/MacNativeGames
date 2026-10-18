@@ -26,7 +26,9 @@ static NSDictionary *totk_seed_import(NSString *source, NSString *cache, NSError
     if (problem) goto fail;
     {
         NSString *fingerprint = totk_seed_hash(raw);
-        NSString *marker = [cache stringByAppendingPathComponent:@"seed-installed.json"];
+        /* one receipt per seed folder (local change: the effect/UI seed must not replace the startup seed's receipt) */
+        NSString *marker = [cache stringByAppendingPathComponent:[source.lastPathComponent isEqualToString:@"shader-seed"] ? @"seed-installed.json"
+                                                                 : [NSString stringWithFormat:@"seed-installed-%@.json", source.lastPathComponent]];
         NSData *oldData = [NSData dataWithContentsOfFile:marker];
         NSDictionary *old = oldData ? [NSJSONSerialization JSONObjectWithData:oldData options:0 error:nil] : nil;
         NSDictionary *files = m[@"files"];
