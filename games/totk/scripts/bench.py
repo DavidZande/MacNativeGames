@@ -73,8 +73,16 @@ def config_env(name):
     return env
 
 
+GAME_PROC = None   # the game this run started from the work tree (its own handle: pgrep -f can miss a process for seconds)
+
+
 def game_running():
-    return subprocess.run(['pgrep', '-f', 'build/totk-native(-cold-[0-9]+)? rewritten'], capture_output=True).returncode == 0
+    if GAME_PROC is not None: return GAME_PROC.poll() is None
+    # pgrep -f misses a process whose arguments cannot be read for a moment (seen in state U while it starts): ask 3 times
+    for i in range(3):
+        if subprocess.run(['pgrep', '-f', 'build/totk-native(-cold-[0-9]+)? rewritten'], capture_output=True).returncode == 0: return True
+        if i < 2: time.sleep(0.5)
+    return False
 
 
 def send(cmd_file, line):
@@ -99,7 +107,7 @@ def wait_for(pred, timeout, step=1.0):
     t0 = time.time()
     while time.time() - t0 < timeout:
         if pred(): return True
-        if not game_running(): raise RuntimeError('the game exited (or was taken over by a player launch)')
+        if not game_running(): raise RuntimeError(f'the game exited (or was taken over by a player launch; exit status {GAME_PROC.returncode if GAME_PROC else "?"})')
         time.sleep(step)
     return False
 
@@ -155,6 +163,7 @@ def run(name, args, outdir):
            'TMPDIR': os.environ.get('TMPDIR', '/tmp'), 'TOTK_PROFILE_DIR': str(profile), 'TOTK_INPUT_FILE': str(cmd_file),
            'TOTK_SLOT_OWNER': 'claude', 'TOTK_SLOT_PURPOSE': f'benchmark {name}', 'TOTK_ASSUME_FOCUS': '1', **config_env(name)}
     if args.hidden: env['TOTK_PAUSE_HIDDEN'] = '1'
+    for kv in args.env: k, _, v = kv.partition('='); env[k] = v
     if args.profile: env['TOTK_SYMBOL_MAP'] = str(rd / 'symbols.txt')
     perf_off = PERF.stat().st_size if PERF.exists() else 0
     log = rd / 'totk.log'
@@ -177,7 +186,8 @@ def run(name, args, outdir):
             binary = TREE / f'build/totk-native-cold-{int(time.time())}'
             shutil.copy2(TREE / 'build/totk-native', binary)
         with open(log, 'w') as lf:
-            subprocess.Popen([str(binary), 'rewritten/v0', 'boot'], env=env, cwd=TREE, stdout=lf, stderr=lf, start_new_session=True)
+            global GAME_PROC
+            GAME_PROC = subprocess.Popen([str(binary), 'rewritten/v0', 'boot'], env=env, cwd=TREE, stdout=lf, stderr=lf, start_new_session=True)
     phases = {}
     def phase(pname, seconds, action=None):
         start = len(perf_rows_since(perf_off))
@@ -239,7 +249,7 @@ def play(name, args, rd, cmd_file, perf_off, phase, phases):
         if args.profile:   # standing still, CPU profile with guest code named (scripts/profile_guest.py)
             log = rd / 'totk.log' if (rd / 'totk.log').exists() else LOG
             r = subprocess.run([sys.executable, '-I', str(Path(__file__).with_name('profile_guest.py')), '--log', str(log), '--symbols', str(rd / 'symbols.txt'),
-                                '--input-file', str(cmd_file), '--perf', str(PERF), '--seconds', str(args.profile), '--out', str(rd / 'sample.txt')], capture_output=True, text=True)
+                                *([] if args.profile_plain else ['--input-file', str(cmd_file)]), '--perf', str(PERF), '--seconds', str(args.profile), '--out', str(rd / 'sample.txt')], capture_output=True, text=True)
             (rd / 'profile.txt').write_text(r.stdout + r.stderr); print(r.stdout + r.stderr, flush=True)
 
 
@@ -250,6 +260,8 @@ def main():
     ap.add_argument('--settle', type=int, default=8, help='seconds to wait before a phase')
     ap.add_argument('--title-only', action='store_true', help='no input: title screen only')
     ap.add_argument('--quit-running', action='store_true', help='quit a running game first')
+    ap.add_argument('--profile-plain', action='store_true', help='profile without host-call tracing (hletrace slows the game threads and shifts the bottleneck)')
+    ap.add_argument('--env', action='append', default=[], metavar='NAME=VALUE', help='extra environment for the game (diagnostic switches)')
     ap.add_argument('--profile', type=int, default=0, help='after the pan: a CPU profile of N seconds standing still')
     ap.add_argument('--hidden', action='store_true', help='title, then minimized, then restored (no game input)')
     ap.add_argument('--app', action='store_true', help="run the packaged app's launcher instead of the work tree's binary")
