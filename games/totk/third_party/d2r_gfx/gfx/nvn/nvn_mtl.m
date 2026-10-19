@@ -2281,7 +2281,7 @@ static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); i
    so the result outlives a temporary texture object finalized before the submission runs); an invalidate over its
    memory waits for the GPU and writes every level back in the NVN layout, unless the CPU has written the memory since
    the rendering (then the CPU's bytes are newer). Runtime switch: TOTK_INPUT_FILE "flag writeback 0|1" (default 1). */
-typedef struct { tex_t t; uint64_t stamp; void *obj; } wb_ent;
+typedef struct { tex_t t; uint64_t stamp; void *obj; uint64_t fence; } wb_ent;   // fence (TOTK): completes once the GPU has finished the newest rendering into it
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
 /* TOTK: fill the driver segment c0 for vertex and compute shaders (thread-group counts, uniform / storage address tables,
@@ -2407,12 +2407,22 @@ static void wb_note(const tex_t *t) {
     uint64_t stamp = nvn_dirty_now(), k = t->serial;
     pthread_mutex_lock(&g_smu);
     wb_ent *e = nvn_hm_get(&g_wb, &k);
-    if (e) { e->stamp = stamp; e->t = *t; pthread_mutex_unlock(&g_smu); return; }
+    /* the rendering is in the submission being replayed: its final commit takes fence g_fence + 1 (mid-submission
+       commits come before it on the same queue) */
+    uint64_t fence = g_fence + 1;
+    if (e) { e->stamp = stamp; e->t = *t; e->fence = fence; pthread_mutex_unlock(&g_smu); return; }
     e = calloc(1, sizeof *e); if (!e) MDIE("write-back record");
-    e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o);
+    e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o); e->fence = fence;
     nvn_hm_put(&g_wb, &k, e);
     pthread_mutex_unlock(&g_smu);
 }
+/* TOTK diagnostic (2026-10-19): per invalidate, time in the drain, the GPU flush and the write-back blits; per blit, the
+   wall time from commit to completion and the GPU's own start delay / run time. Logged for an invalidate over 20 ms. */
+static uint64_t g_wbi_blits, g_wbi_blit_ns, g_wbi_blit_max_ns, g_wbi_gpu_delay_max_ns, g_wbi_gpu_run_max_ns;
+/* TOTK_WB_BATCH (default on; =0 the old path): an invalidate waits only for the fences of the renderings it reads back, and
+   copies every level / layer of every texture in one command buffer with one wait (it was one commit + wait each:
+   9 levels x ~1.25 ms, almost all of it the start delay of a new command buffer). */
+static int wb_batch_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WB_BATCH"); v = !(e && !strcmp(e, "0")); MLOG("GPU write-back on invalidate: %s", v ? "batched, waits only for its renderings (TOTK_WB_BATCH=0 off)" : "one command buffer per level, waits for all GPU work (TOTK_WB_BATCH=0)"); } return v; }
 static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u);
@@ -2422,10 +2432,62 @@ static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsi
     id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = enc_b_begin(cb);
     [b copyFromTexture:mt sourceSlice:layer sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(lw, lh, 1)
               toBuffer:buf destinationOffset:0 destinationBytesPerRow:lp destinationBytesPerImage:lp * lr];
-    enc_b_end(b); cb_commit(cb); cb_wait(cb);
+    enc_b_end(b); uint64_t c0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); cb_commit(cb); cb_wait(cb);
+    { uint64_t c1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), d = c1 - c0; g_wbi_blits++; g_wbi_blit_ns += d; if (d > g_wbi_blit_max_ns) g_wbi_blit_max_ns = d;
+      double gs = cb.GPUStartTime, ge = cb.GPUEndTime, cs = c0 / 1e9;   /* GPU times: seconds on the same mach clock */
+      if (gs > 0) { uint64_t dl = gs > cs ? (uint64_t)((gs - cs) * 1e9) : 0, rn = ge > gs ? (uint64_t)((ge - gs) * 1e9) : 0;
+        if (dl > g_wbi_gpu_delay_max_ns) g_wbi_gpu_delay_max_ns = dl; if (rn > g_wbi_gpu_run_max_ns) g_wbi_gpu_run_max_ns = rn; } }
     if (nvn_swizzle(&t->d, level, layer, (const uint8_t *)buf.contents, lp, t->mem)) return 0;
     g_wb_bytes += lp * lr;
     return 1;
+}
+/* Batched write-back (wb_batch_on): every level / layer of each texture is copied into its own buffer by one blit
+   encoder, one commit and one wait; then each texture's levels are put back into its memory in the NVN layout between
+   nvn_dirty_gpu_write_begin / _end (the GPU's bytes, not a CPU write), as wb_level_back does one at a time. */
+typedef struct { wb_ent *e; unsigned level, layer; size_t lp, lr; } wb_copy;
+/* One invalidate's batch, on its caller's stack: several game threads can invalidate at the same time. */
+typedef struct { wb_copy *c; int n, cap; wb_ent **ent; int ne, ecap; __strong NSMutableArray *buf; __strong id<MTLCommandBuffer> cb; __strong id<MTLBlitCommandEncoder> enc; } wb_batch;
+static void wb_batch_add(wb_batch *b, wb_ent *e, id<MTLTexture> mt) {
+    const tex_t *t = &e->t; int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    unsigned layers = t->L.layers ? t->L.layers : 1;
+    if (!b->buf) b->buf = [NSMutableArray new];
+    if (!b->cb) { b->cb = q_cb(); b->enc = enc_b_begin(b->cb); }
+    if (b->ne == b->ecap) { b->ecap = b->ecap ? b->ecap * 2 : 16; b->ent = realloc(b->ent, b->ecap * sizeof *b->ent); if (!b->ent) MDIE("write-back batch"); }
+    b->ent[b->ne++] = e;
+    for (unsigned l = 0; l < t->d.levels; l++) for (unsigned y = 0; y < layers; y++) {
+        uint32_t lw = MAX(t->d.width >> l, 1u), lh = MAX(t->d.height >> l, 1u);
+        size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
+        id<MTLBuffer> buf = [g_dev newBufferWithLength:MAX(lp * lr, (size_t)16) options:MTLResourceStorageModeShared];
+        if (!buf) continue;
+        [b->enc copyFromTexture:mt sourceSlice:y sourceLevel:l sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(lw, lh, 1)
+                       toBuffer:buf destinationOffset:0 destinationBytesPerRow:lp destinationBytesPerImage:lp * lr];
+        if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 64; b->c = realloc(b->c, b->cap * sizeof *b->c); if (!b->c) MDIE("write-back batch"); }
+        b->c[b->n++] = (wb_copy){e, l, y, lp, lr}; [b->buf addObject:buf];
+    }
+}
+static void wb_batch_run(wb_batch *b) {
+    if (b->cb) {
+        enc_b_end(b->enc); b->enc = nil;
+        uint64_t c0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); cb_commit(b->cb); cb_wait(b->cb);
+        { uint64_t d = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - c0; g_wbi_blits = (uint64_t)b->n; g_wbi_blit_ns = d; g_wbi_blit_max_ns = d; }
+    }
+    int failed = b->cb && !nogpu() && b->cb.status != MTLCommandBufferStatusCompleted;
+    b->cb = nil;
+    for (int k = 0; k < b->ne; k++) {
+        wb_ent *e = b->ent[k]; const tex_t *t = &e->t; int ok = !failed;
+        void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
+        if (!tok) { nvn_dirty_barrier_suppress(1); dm_guest_write_prepare(t->mem, t->L.size); nvn_dirty_barrier_suppress(-1); }   // graphics-layer write: no write barrier
+        for (int i = 0; i < b->n && ok; i++) if (b->c[i].e == e) {
+            id<MTLBuffer> buf = b->buf[(NSUInteger)i];
+            if (nvn_swizzle(&t->d, b->c[i].level, b->c[i].layer, (const uint8_t *)buf.contents, b->c[i].lp, t->mem)) ok = 0;
+            else g_wb_bytes += b->c[i].lp * b->c[i].lr;
+        }
+        nvn_dirty_gpu_write_end(tok);
+        if (ok) { uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u: GPU rendering written back to memory, batched (%llu so far, %llu MB; %llu skipped as written by the CPU since)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
+        else MLOG("【红】GPU 写回内存失败 ser=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
+        wb_ent_free(e);
+    }
+    free(b->c); free(b->ent); b->c = NULL; b->ent = NULL; b->n = b->ne = 0; b->buf = nil;
 }
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     if (!p || !p->mem || !atomic_load(&g_wb_on)) return;
@@ -2440,8 +2502,17 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     }
     pthread_mutex_unlock(&g_smu);
     if (!nl) return;
+    uint64_t i0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     { extern void nvn_x_drain(void) __attribute__((weak)); if (nvn_x_drain) nvn_x_drain(); }   // translation thread: nothing queued overtakes this read-back (as for ReadTexels)
-    mtl_finish_gpu();
+    uint64_t i1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    /* TOTK (2026-10-19): wait for the renderings being read back, not for all GPU work (the frame in flight cost ~17 ms
+       per invalidate, and the game invalidates several times in a row in a job the main thread waits for). */
+    int batch = wb_batch_on(); uint64_t need = 0; wb_batch wbb = {0};
+    for (int i = 0; i < nl; i++) if (list[i]->fence > need) need = list[i]->fence;
+    if (batch && need && need <= g_fence) { mtl_wait(need, UINT64_MAX); while (atomic_load(&g_up_pending)) usleep(200); }
+    else mtl_finish_gpu();
+    uint64_t i2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    g_wbi_blits = g_wbi_blit_ns = g_wbi_blit_max_ns = g_wbi_gpu_delay_max_ns = g_wbi_gpu_run_max_ns = 0;
     /* Freshness is decided for every entry before anything is written back (a write-back marks its pages written), and
        of several renderings of the same memory (texture objects over it) only the newest is written back. */
     int fresh[512];
@@ -2462,15 +2533,21 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
         if (!mt || bc_unpack(t->d.format, &upf, &ubpp) || t->d.target == 2 || t->d.samples > 1) { if (++g_wb_skip_fmt <= 8) MLOG("【红】GPU 写回内存：不支持的贴图 ser=%llu 格式 %#x 目标 %d", (unsigned long long)t->serial, t->d.format, t->d.target); wb_ent_free(e); continue; }
         /* the GPU's bytes landing in memory: not a CPU write (with dm_guest_write_prepare the page this texture shares
            with a neighbour counted as written, and the neighbour's own write-back was skipped as "CPU wrote since") */
+        unsigned layers = t->L.layers ? t->L.layers : 1, ok = 1;
+        if (batch) { wb_batch_add(&wbb, e, mt); continue; }   // copied below, all in one command buffer
         void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
         if (!tok) { nvn_dirty_barrier_suppress(1); dm_guest_write_prepare(t->mem, t->L.size); nvn_dirty_barrier_suppress(-1); }   // graphics-layer write: no write barrier
-        unsigned layers = t->L.layers ? t->L.layers : 1, ok = 1;
         for (unsigned l = 0; l < t->d.levels && ok; l++) for (unsigned y = 0; y < layers && ok; y++) ok = wb_level_back(t, mt, l, y);
         nvn_dirty_gpu_write_end(tok);
         if (ok) { uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u：GPU 渲染结果写回内存（累计 %llu 张 / %llu MB，CPU 已改写而跳过 %llu 张）", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
         else MLOG("【红】GPU 写回内存失败 ser=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
         wb_ent_free(e);
     }
+    if (batch) wb_batch_run(&wbb);
+    { uint64_t i3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+      if (i3 - i0 > 20000000ull) { static unsigned said; if (said++ < 60)
+        MLOG("[invalidate] %.1f ms: drain %.1f, GPU flush %.1f, %u textures -> %llu write-back blits %.1f ms (slowest %.1f; GPU start delay max %.1f, run max %.2f)",
+             (i3 - i0) / 1e6, (i1 - i0) / 1e6, (i2 - i1) / 1e6, nl, (unsigned long long)g_wbi_blits, g_wbi_blit_ns / 1e6, g_wbi_blit_max_ns / 1e6, g_wbi_gpu_delay_max_ns / 1e6, g_wbi_gpu_run_max_ns / 1e6); } }
 }
 static uint64_t g_pkg_uploads, g_pkg_reuploads, g_pkg_miss, g_pkg_restored;
 static uint64_t g_pfv_upgrades;

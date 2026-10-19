@@ -167,12 +167,13 @@ def summarize(rows, samples=None):
     return result
 
 
-def extra_env(values):
+def extra_env(values, play=False):
+    """--env values; pacing switches only in free play (--play), where the player tries the app's own frame caps."""
     result = {}
     for kv in values:
         key, sep, value = kv.partition('=')
         if not key or not sep: raise SystemExit('--env requires NAME=VALUE')
-        if key in UNCAPPED_ENV and value != UNCAPPED_ENV[key]:
+        if key in UNCAPPED_ENV and value != UNCAPPED_ENV[key] and not play:
             raise SystemExit(f'{key}={value} conflicts with uncapped renderer benchmarks')
         result[key] = value
     return result
@@ -201,7 +202,7 @@ def run(name, args, outdir):
     if args.play:   # on screen as the app's "unlimited" setting shows it (launcher.m), MetalFX upscaling on; the player drives
         for k in ('TOTK_PRESENT_SKIP', 'DM_PRESENT_HZ', 'DM_PRESENT_LINK'): env.pop(k, None)
         env.update(TOTK_UNCAPPED='1', TOTK_UNCAPPED_INTERVAL='1', TOTK_MFX_UPSCALE='1')
-    env.update(extra_env(args.env))
+    env.update(extra_env(args.env, args.play))
     if args.cache_ab:
         env.update(TOTK_ARG_EPOCH='0', TOTK_TEXTURE_PLAN='0', TOTK_ARG_EPOCH_CHECK='0', TOTK_TEXTURE_PLAN_CHECK='0')
     if args.gpu_passes: env['TOTK_PASS_GPU_FILE'] = str(rd / 'gpu-passes.tsv')
@@ -360,7 +361,7 @@ def main():
     args = ap.parse_args()
     if args.play: args.title_only = True
     for c in args.configs: config_env(c)
-    extra_env(args.env)
+    extra_env(args.env, args.play)
     outdir = OUT / time.strftime('%Y%m%d-%H%M%S'); outdir.mkdir(parents=True)
     results = {}
     for c in args.configs:

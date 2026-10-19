@@ -2900,6 +2900,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@texels", (double)atomic_exchange(&g_tx_n, 0)); trow(f, "@texels_drain_ms", atomic_exchange(&g_tx_drain_ns, 0) / 1e6); trow(f, "@texels_copy_ms", atomic_exchange(&g_tx_copy_ns, 0) / 1e6);
         if (dfa >= 300) fault_storm_report(f, dfa);
         frame_ext fx; frame_ext_take(&fx);
+        { extern void runtime_threads_tl_cpu(void) __attribute__((weak_import)); if (runtime_threads_tl_cpu && totk_tl_on()) runtime_threads_tl_cpu(); }
         trow(f, "@all_core_wait_ms", fx.all_core); trow(f, "@m_wake_ms", fx.m_wake); trow(f, "@m_core_ms", fx.m_core); trow(f, "@m_lock_ms", fx.m_lock); trow(f, "@m_cond_ms", fx.m_cond); trow(f, "@m_addr_ms", fx.m_addr);
         trow(f, "@m_sync_ms", fx.m_sync); trow(f, "@m_host_ms", fx.m_host); trow(f, "@rd_n", (double)fx.rd_n); trow(f, "@rd_mb", fx.rd_mb); trow(f, "@rd_ms", fx.rd_ms); trow(f, "@rd_main_ms", fx.rd_main_ms);
         trow(f, "@minflt", (double)fx.minflt); trow(f, "@majflt", (double)fx.majflt); trow(f, "@nivcsw", (double)fx.nivcsw); trow(f, "@svc", (double)fx.svc); trow(f, "@footprint_mb", fx.fp_mb);

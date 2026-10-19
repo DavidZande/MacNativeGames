@@ -68,6 +68,7 @@ typedef struct thr {
     uint32_t woke_by;          // local change: handle of the thread whose call woke this one (TOTK_WAITSTAT)
     uint64_t tid;              // local change: host thread id (as `sample` names threads)
     uint64_t wake_at;          // local change: when wake() signalled this thread (handoff latency, perf.csv)
+    uint64_t wait_t0;          // local change: when the current guest wait began (0 = not waiting; TOTK_STALL_DUMP)
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
 } thr_t;
@@ -287,13 +288,64 @@ extern void totk_tl_at(int kind, uint64_t t_ns, uint64_t a, uint64_t b) __attrib
 static void tl_gblock(thr_t *t, int kind, uint64_t t0, uint32_t waker) {
     if (totk_tl_on && totk_tl_on()) totk_tl_at(17, t0, now_ns() - t0, (uint64_t)kind | (uint64_t)(t->handle & 0xffffff) << 8 | (uint64_t)waker << 32);
 }
+/* Local change (2026-10-19): guest waits that end on their own timeout (>= 10 ms asked), by wait kind, timeout, and the
+   first sdk and main return addresses on the guest stack. The job-system stalls behind the play-time hitches last a
+   near-constant ~110 ms at 80 and at 30 FPS; this found none, and the long-wait log below found the job thread they
+   waited for (it was in the GPU write-back of mtl_pool_invalidate). TOTK_WAITLOG=1; logged every 5 s as
+   "[totk] timed-out waits" / "[totk] long waits". Holding G (the table needs no lock of its own). */
+enum { TO_N = 32 };
+typedef struct { int kind; uint32_t ms; uint32_t handle; uint64_t sdk_off, main_off; uint64_t n, ns; uint32_t by, woken; } to_ent;
+static to_ent g_to[TO_N]; static int g_to_used; static uint64_t g_to_last;
+/* loader.c defines it in the game; a probe linked without the loader gets this fallback (no guest frames named) */
+__attribute__((weak)) int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off) { (void)pc; (void)name; (void)off; return 0; }
+/* woken = 1 (TOTK, 2026-10-19): a wait of >= 50 ms that ended because another thread woke it (by = that thread's handle);
+   recorded with the waker so a stalled job shows whom it waited for. ms is then the wait's own length in 10 ms steps. */
+static int waitlog_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WAITLOG"); v = e && atoi(e); } return v; }   /* TOTK_WAITLOG=1: the two logs above */
+static void timeout_note(thr_t *t, int kind, int64_t ns, uint64_t waited, int woken, uint32_t by) {
+    uint64_t sdk_off = 0, main_off = 0; uint64_t *fp = (uint64_t *)__builtin_frame_address(0);
+    for (int i = 0; i < 32 && fp && !((uintptr_t)fp & 7) && !main_off; i++) {
+        const char *nm; uint64_t off;
+        if (runtime_module_offset(fp[1], &nm, &off)) { if (!strcmp(nm, "main")) main_off = off; else if (!sdk_off) sdk_off = off | (uint64_t)(nm[0] == 's' && nm[1] == 'u') << 63; }
+        if ((uint64_t *)fp[0] <= fp) break; fp = (uint64_t *)fp[0];
+    }
+    uint32_t ms = woken ? (uint32_t)(waited / 10000000) * 10 : (uint32_t)(ns / 1000000); int k = 0;
+    for (; k < g_to_used; k++) if (g_to[k].kind == kind && g_to[k].ms == ms && g_to[k].main_off == main_off && g_to[k].sdk_off == sdk_off && g_to[k].woken == (uint32_t)woken && g_to[k].by == by && g_to[k].handle == t->handle) break;
+    if (k == g_to_used) {
+        if (g_to_used == TO_N) { int z = -1; for (int i = 0; i < TO_N; i++) if (!g_to[i].n) { z = i; break; } if (z < 0) return; k = z; }   // reuse a slot emptied by the last report
+        else k = g_to_used++;
+        g_to[k] = (to_ent){kind, ms, t->handle, sdk_off, main_off, 0, 0, by, (uint32_t)woken};
+    }
+    g_to[k].n++; g_to[k].ns += waited;
+    uint64_t now = now_ns(); if (!g_to_last) g_to_last = now;
+    if (now - g_to_last < 5000000000ull) return;
+    g_to_last = now;
+    static const char *kinds[] = {"?", "lock", "condvar", "address", "sync", "?", "?", "?"};
+    for (int r = 0; r < 12; r++) {
+        int b = -1; for (int i = 0; i < g_to_used; i++) if (g_to[i].n && (b < 0 || g_to[i].ns > g_to[b].ns)) b = i;
+        if (b < 0) break;
+        if (g_to[b].woken)
+            fprintf(stderr, "[totk] long waits (5 s): %llu x %s wait of %u-%u ms on thread %#x woken by %#x, %.1f ms each, from %s+%#llx / main+%#llx\n",
+                    (unsigned long long)g_to[b].n, kinds[g_to[b].kind & 7], g_to[b].ms, g_to[b].ms + 10, g_to[b].handle, g_to[b].by, g_to[b].ns / 1e6 / (double)g_to[b].n,
+                    g_to[b].sdk_off >> 63 ? "subsdk0" : "sdk", (unsigned long long)(g_to[b].sdk_off & ~(1ull << 63)), (unsigned long long)g_to[b].main_off);
+        else
+            fprintf(stderr, "[totk] timed-out waits (5 s): %llu x %s wait of %u ms on thread %#x, %.1f ms each, from %s+%#llx / main+%#llx\n",
+                    (unsigned long long)g_to[b].n, kinds[g_to[b].kind & 7], g_to[b].ms, g_to[b].handle, g_to[b].ns / 1e6 / (double)g_to[b].n,
+                    g_to[b].sdk_off >> 63 ? "subsdk0" : "sdk", (unsigned long long)(g_to[b].sdk_off & ~(1ull << 63)), (unsigned long long)g_to[b].main_off);
+        g_to[b].n = 0; g_to[b].ns = 0;
+    }
+}
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
+    uint64_t to0 = now_ns();
     uint64_t b0 = t == g_main_thr && kind >= 1 && kind <= 4 ? now_ns() : 0;
     uint64_t w0 = ws_watched(t->handle) ? now_ns() : 0, wa = kind == 2 ? t->wkey : t->waddr;
     t->woke_by = 0;
     uint64_t tl0 = now_ns();
-    core_put(t); int64_t r = block_inner(t, kind, ns);
+    core_put(t); __atomic_store_n(&t->wait_t0, to0, __ATOMIC_RELAXED);
+    int64_t r = block_inner(t, kind, ns); __atomic_store_n(&t->wait_t0, 0, __ATOMIC_RELAXED);
+    if (waitlog_on()) { uint64_t waited = now_ns() - to0;
+      if (r == R_TIMEOUT) { if (ns >= 10000000) timeout_note(t, kind, ns, waited, 0, 0); }
+      else if (waited >= 50000000ull) timeout_note(t, kind, ns, waited, 1, t->woke_by); }
     if (b0) __atomic_fetch_add(&g_hand[7 + kind], now_ns() - b0, __ATOMIC_RELAXED);
     if (w0) ws_note(t, kind, wa, now_ns() - w0);
     tl_gblock(t, kind, tl0, t->woke_by);
@@ -785,6 +837,22 @@ static void *list_check(void *arg) {
         }
     }
 }
+/* Local change (2026-10-19, TOTK_TIMELINE): at each frame end, every guest thread's CPU time (a, ns), and b = handle |
+   wait kind << 32 | (current core + 1) << 40, as timeline event 18 ("tcpu"). Shows whether a thread that blocks nothing
+   for 100 ms is computing or stuck in host code. */
+void runtime_threads_tl_cpu(void) {
+    if (!totk_tl_on || !totk_tl_on() || !totk_tl_at) return;
+    uint64_t now = now_ns();
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (!t->mport || t->exited) continue;
+        thread_basic_info_data_t bi; mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(t->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) != KERN_SUCCESS) continue;
+        uint64_t cpu = ((uint64_t)bi.user_time.seconds + (uint64_t)bi.system_time.seconds) * 1000000000ull + ((uint64_t)bi.user_time.microseconds + (uint64_t)bi.system_time.microseconds) * 1000ull;
+        totk_tl_at(18, now, cpu, (uint64_t)t->handle | (uint64_t)(t->wkind & 0xff) << 32 | (uint64_t)(t->cur_core + 1 & 0xff) << 40);
+    }
+    pthread_mutex_unlock(&G);
+}
 static void dump_threads(unsigned secs) {
     int locked = 0; for (int i = 0; i < 100 && !(locked = pthread_mutex_trylock(&G) == 0); i++) usleep(10000);
     fprintf(stderr, "[totk-dump] global thread lock %s\n", locked ? "acquired" : "HELD BY ANOTHER THREAD (dumping without it)");
@@ -822,7 +890,34 @@ static void dump_threads(unsigned secs) {
     }
 }
 void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
+/* Local change (2026-10-19), TOTK_STALL_DUMP=<ms>: when the main guest thread has been in one guest wait for <ms>, every
+   guest thread that is not in a guest wait (running guest code, or blocked in host code) is sampled once: its pc / lr and
+   frame chain, guest and host frames named. Once per stall; at most 40 stalls. To see what a job thread that blocks
+   nothing for ~100 ms while the game waits for it is doing. Registers are read with the thread suspended, then it is
+   resumed before anything is named (naming can allocate). */
+static void *stall_watch(void *arg) {
+    uint64_t lim = (uint64_t)(uintptr_t)arg * 1000000ull, last = 0; int dumps = 0;
+    for (;;) {
+        usleep(5000);
+        thr_t *m = g_main_thr; if (!m) continue;
+        uint64_t t0 = __atomic_load_n(&m->wait_t0, __ATOMIC_RELAXED), now = now_ns();
+        if (!t0 || t0 == last || now - t0 < lim) continue;
+        last = t0; if (++dumps > 40) return NULL;
+        fprintf(stderr, "[stall] main thread in a guest wait (kind %d) for %.1f ms; threads not in a guest wait:\n", m->wkind, (now - t0) / 1e6);
+        for (thr_t *t = g_all; t; t = t->all) {
+            if (t->exited || !t->started || !t->mport || t->wkind || __atomic_load_n(&t->wait_t0, __ATOMIC_RELAXED)) continue;
+            arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+            thread_suspend(t->mport); kern_return_t kr = thread_get_state(t->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt); thread_resume(t->mport);
+            if (kr != KERN_SUCCESS) continue;
+            char a[96], b[96]; runtime_describe_address(arm_thread_state64_get_pc(st), a, sizeof a); runtime_describe_address(arm_thread_state64_get_lr(st), b, sizeof b);
+            fprintf(stderr, "[stall]   h=%#x core=%d pc=%s lr=%s\n", t->handle, t->cur_core, a, b);
+            dump_chain(arm_thread_state64_get_lr(st), arm_thread_state64_get_fp(st));
+        }
+    }
+    return NULL;
+}
 __attribute__((constructor)) static void dump_init(void) {
+    { const char *sd = getenv("TOTK_STALL_DUMP"); if (sd && atoi(sd) > 0) { pthread_t th; pthread_create(&th, NULL, stall_watch, (void *)(uintptr_t)atoi(sd)); pthread_detach(th); } }
     const char *c = getenv("TOTK_LISTCHECK");
     if (c) { pthread_t th; pthread_create(&th, NULL, list_check, (void *)(uintptr_t)strtoull(c, NULL, 0)); pthread_detach(th); }
     const char *e = getenv("TOTK_DUMP_AFTER"); if (!e) return;
