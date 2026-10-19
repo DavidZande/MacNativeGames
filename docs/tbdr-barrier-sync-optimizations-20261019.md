@@ -98,3 +98,21 @@ python3.14 scripts/bench.py --configs 900p-unl --seconds 15 --env DM_NVN_TSV=/tm
 | **Metal Render Passes (`@passes`)** | 111 passes/frame | **101 passes/frame** | **-10 passes/frame hoisted/merged** |
 | **Full Load+Store Passes (`@pass_full_rw`)** | 78 passes/frame | **55 passes/frame** | **-29.5%** |
 | **Command Buffer Chunks (`分段提交`)** | 13.5 extra/frame | **6.6 extra/frame** | **-51.1% fewer CB splits** |
+
+---
+
+## Live Gameplay Visual Fixes (Follow-up)
+
+During live gameplay testing at 3456×1944 with MetalFX (~90–104 FPS), two visual glitches were identified from screenshots and `~/Library/Logs/MacNativeGames/totk.log` and resolved in `nvn_mtl.m`:
+
+1. **Volumetric clouds rendering superimposed on foreground terrain (`TOTK_DS_OMIT` lookahead in `ds_scan` and `draw_inner`)**:
+   - **Root Cause**: In `ds_scan`, `OP_UPDATE_UB` was listed alongside pass-ending operations (`return DS_FREE`). However, in TOTK `ub_rename_on()` is active (`TOTK_UB_RENAME=1`), so inline `OP_UPDATE_UB` renames uniform buffers in-place **without** ending the render pass (~292 times per frame). When a render pass opened with a draw that had `dt=0, dw=0` followed by `OP_UPDATE_UB` and subsequent draws in the same pass with depth testing enabled (`dt=1`, such as volumetric clouds depth-testing against the terrain depth buffer), `ds_scan` terminated early at `OP_UPDATE_UB` and returned `DS_FREE`, opening the pass without a depth attachment (`g_pass.hd = 0`). Furthermore, `draw_inner`'s safety split (`if (g_rt_merged && g_enc_mode != 0 && ...)`) only checked continued passes (`g_rt_merged == 1`), failing to split an initial unmerged pass when a subsequent draw needed depth/stencil.
+   - **Fix**:
+     - Updated `ds_scan` so `OP_UPDATE_UB` only returns `DS_FREE` when `!ub_rename_on()`.
+     - Updated `draw_inner` (`if (g_enc && g_enc_mode != 0 && ...)`) so any active render pass opened with omitted depth/stencil (`g_enc_mode != 0`) splits and reopens with depth/stencil attached whenever a draw requires an unattached depth or stencil plane.
+2. **Intermittent flickering from shared-storage texture aliasing (`stor_acquire`) and inter-pass barrier narrowing**:
+   - **Root Cause**: TOTK aliases transient render-target `NVNtexture` objects (`serial B`) and persistent sampling `NVNtexture` objects (`serial A`) at the same guest memory address (`共享存储贴图：条目 938，共用 672938 次`), sharing one underlying `MTLTexture` via `stor_acquire`. Because `sdx_walk` / `sdx_decide` (`TOTK_STORE_OPT`), `hoist_try` (`TOTK_HOIST_CLEAR`), and `bar_narrow` (`TOTK_BARRIER_NARROW`) track dependencies by `t->serial` rather than the underlying shared `MTLTexture` / `t->mem`, `sdx_decide` could set `MTLStoreActionDontCare` on `serial B` when subsequent passes sampled the same `MTLTexture` through `serial A`, and `bar_narrow` omitted `MTLStageFragment -> MTLStageVertex` barriers across render passes. Additionally, `clear_quad` and `clear_ds_quad` did not mark `g_sd[i].wrote = 1`, and `attr_read` did not check `pend_hits`.
+   - **Fix**:
+     - Restored `bar_narrow()` default to `0` (full `MTLStageAll` barriers between encoders) and made `TOTK_STORE_OPT`, `TOTK_LOAD_COVER`, and `TOTK_HOIST_CLEAR` opt-in while keeping the fixed `TOTK_DS_OMIT=1` enabled by default.
+     - Updated `clear_quad` and `clear_ds_quad` to set `g_sd[i].wrote = 1` on cleared attachments, and added `pend_hits` guards in `attr_read`.
+

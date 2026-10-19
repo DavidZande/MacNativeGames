@@ -1051,7 +1051,7 @@ static uint32_t g_bar_vs_first_write = UINT32_MAX, g_bar_vs_last_read; static in
 static uint32_t g_exec_seq;
 static int bar_narrow(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_BARRIER_NARROW"); v = e ? atoi(e) : 1;
+    if (v < 0) { const char *e = getenv("TOTK_BARRIER_NARROW"); v = e ? atoi(e) : 0;
         if (v) MLOG("【实验】TOTK_BARRIER_NARROW=%d：渲染通道之间只按片元阶段排序（顶点阶段可与上一通道的片元重叠）%s", v, v == 2 ? "，不查顶点阶段依赖，只供测量" : "，含提交内顶点阶段读附件前瞻检查"); }
     return v;
 }
@@ -3802,10 +3802,10 @@ static int udc_on(void) {
 static int tbdr_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TBDR"), *r = getenv("DM_NVN_RULER"); v = e && !strcmp(e, "1"); g_ruler_truth = r && !strcmp(r, "1"); if (!v) MLOG("TOTK: TBDR pass optimizations disabled; DM_NVN_TBDR=1 opts into experimental pass rewriting"); } return v && !g_ruler_truth; }
 int dm_nvn_ruler_truth(void) { tbdr_on(); return g_ruler_truth; }   // 视觉尺子真值阶段（宿主侧的被测设置据此让开，如 3D 渲染比例） | Visual ruler ground-truth phase (host-side settings under test yield accordingly, e.g. the 3D render scale)
 static int totk_tbdr_dis(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TBDR"); v = e && !strcmp(e, "0"); } return v || dm_nvn_ruler_truth(); }
-static int totk_store_opt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_STORE_OPT"); v = !(e && !strcmp(e, "0")); } return v && !totk_tbdr_dis(); }
-static int totk_load_cover_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_LOAD_COVER"); v = !(e && !strcmp(e, "0")); } return v && !totk_tbdr_dis(); }
+static int totk_store_opt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_STORE_OPT"); v = e && !strcmp(e, "1"); } return v && !totk_tbdr_dis(); }
+static int totk_load_cover_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_LOAD_COVER"); v = e && !strcmp(e, "1"); } return v && !totk_tbdr_dis(); }
 static int totk_ds_omit_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_DS_OMIT"); v = !(e && !strcmp(e, "0")); } return v && !totk_tbdr_dis(); }
-static int totk_hoist_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_HOIST_CLEAR"); v = !(e && !strcmp(e, "0")); } return v && !totk_tbdr_dis(); }
+static int totk_hoist_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_HOIST_CLEAR"); v = e && !strcmp(e, "1"); } return v && !totk_tbdr_dis(); }
 static int rt_range_on(void) { static int v = -1; if (v < 0) { const char *e=getenv("DM_NVN_RT_RANGE"); v=e && !strcmp(e,"1"); } return v; }   // 窄候选，缺省关 | Narrow candidate, off by default
 static uint64_t g_sd_dead_bytes, g_sd_n_dead, g_sd_n_all;
 // ---------- 跨提交附件有效性账本 ----------
@@ -7113,7 +7113,8 @@ static int ds_scan(const uint8_t *p, ds_st *ds, int depth) {
             case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
             case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (depth >= 8) return DS_USED;
                 int r = ds_scan((const uint8_t *)t, ds, depth + 1); if (r != DS_RET) return r; break; }
-            case OP_SET_RT: case OP_COPY_B2B: case OP_UPDATE_UB: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX: case OP_DISPATCH: return DS_FREE;
+            case OP_UPDATE_UB: if (!ub_rename_on()) return DS_FREE; break;
+            case OP_SET_RT: case OP_COPY_B2B: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX: case OP_DISPATCH: return DS_FREE;
             case OP_CLEAR_COLOR: case OP_CLEAR_DS: g_ds_why = h.op; return DS_USED;
             case OP_BIND_STATE: { const p_bind_state *b = a; if (b->kind == 5) memcpy(ds, b->bytes, sizeof *ds); break; }
             case OP_BIND_PROGRAM: if (prog_ps_writes_depth(((const p_bind_program *)a)->prog)) { g_ds_need |= 1; g_ds_why = 2000; if (g_ds_need == 3) return DS_USED; } break;   /* TOTK: depth-writing fragment function */
@@ -7264,13 +7265,13 @@ static int attr_read(int a, const p_draw *dw, const p_draw_idx *di, float P[64][
     MTLVertexFormat vf = vfmt(at.fmt); int nc = vf == MTLVertexFormatFloat2 ? 2 : vf == MTLVertexFormatFloat3 ? 3 : vf == MTLVertexFormatFloat4 ? 4 : 0;
     if (!nc || !sm.stride || sm.divisor || !vb.address) return 8;
     const uint8_t *ib = NULL; int isz = di ? (di->itype == 1 ? 2 : 4) : 0;
-    if (di) { void *m; uint64_t o; if (!mtl_addr(di->ibuf, (uint64_t)n * isz, &m, &o) || !(ib = [(__bridge id<MTLBuffer>)m contents])) return 10; ib += o; }
+    if (di) { void *m; uint64_t o; if (pend_hits(di->ibuf, (uint64_t)n * isz) || !mtl_addr(di->ibuf, (uint64_t)n * isz, &m, &o) || !(ib = [(__bridge id<MTLBuffer>)m contents])) return 10; ib += o; }
     for (int k = 0; k < n; k++) {
         int64_t vid = dw ? (int64_t)dw->first + k : (isz == 2 ? (int64_t)((const uint16_t *)ib)[k] : (int64_t)((const uint32_t *)ib)[k]) + di->base_vertex;
         uint64_t off = (uint64_t)vid * sm.stride + at.offset;
         if (vid < 0 || off + 4 * nc > vb.size) return 9;
         void *mb; uint64_t mo; const uint8_t *base;
-        if (!mtl_addr(vb.address + off, 4 * nc, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) return 10;
+        if (pend_hits(vb.address + off, 4 * nc) || !mtl_addr(vb.address + off, 4 * nc, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) return 10;
         float v[4] = {0, 0, 0, 1}; memcpy(v, base + mo, 4 * nc); memcpy(P[k], v, sizeof v);
     }
     return 0;
@@ -8714,6 +8715,7 @@ static void clear_quad(const p_clear_color *c) {
         if (x1 > (long)tw) x1 = (long)tw; if (y1 > (long)th) y1 = (long)th; if (x1 <= x0 || y1 <= y0) return;
         sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}; }
     if (!g_pass.cfmt[c->index]) MDIE("partial color clear: attachment %d not in the pass", c->index);
+    if (c->mask & 0xf) for (int i = 0; i < g_nsd; i++) if (g_sd[i].depth == 0 && g_sd[i].idx == c->index) g_sd[i].wrote = 1;
     clear_quad_core(en, g_pass.cfmt, g_pass.hd ? g_pass.dfmt : 0, g_pass.hs ? g_pass.sfmt : 0, g_pass.samples, tw, th, c->index, c->mask, c->rgba, sc);
 }
 /* Depth/stencil clears obey the scissor and stencil bit mask even inside an active pass. */
@@ -8760,6 +8762,10 @@ static void clear_ds_quad(const p_clear_ds *c) {
     NSUInteger tw = g_pass.tw, th = g_pass.th; MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) { int64_t x0 = MAX(R.sc.x, 0), y0 = MAX(R.sc.y, 0), x1 = MIN((int64_t)R.sc.x + R.sc.w, (int64_t)tw), y1 = MIN((int64_t)R.sc.y + R.sc.h, (int64_t)th);
         if (x1 <= x0 || y1 <= y0) return; sc = (MTLScissorRect){x0, y0, x1 - x0, y1 - y0}; }
+    for (int i = 0; i < g_nsd; i++) {
+        if (g_sd[i].depth == 1 && c->depth_mask) g_sd[i].wrote = 1;
+        if (g_sd[i].depth == 2 && (c->stencil_mask & 0xff)) g_sd[i].wrote = 1;
+    }
     clear_ds_core(en, g_pass.cfmt, g_pass.hd ? g_pass.dfmt : 0, g_pass.hs ? g_pass.sfmt : 0, g_pass.samples, tw, th, c, sc);
 }
 static void prepare_draw_textures(NvProg *pr) {
@@ -9490,11 +9496,11 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (S.render_disabled || S.raster_discard) { g_draw_skip[S.render_disabled ? 3 : 4]++; return; }   // TOTK: SetRenderEnable(false) / SetRasterizerDiscard(true)
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { g_draw_skip[5]++; return; }
     if (exp_skip_fs(pr)) return;   // TOTK_EXP_SKIP_FS (measurement only)
-    // 续用的通道可能是少挂深度 / 模板开的（开法 2 / 3 / 4）：这次绘制要的平面没挂，就在它之前切开（重开时按新前瞻挂）
-    // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
-    if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw || (pr && pr->sh[1] && pr->sh[1]->writes_depth)) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
-        static int once2; if (!once2++) MLOG("同目标续用：续用通道内绘制要的深度 / 模板平面没挂，在此切开（首例 通道 %llu）", g_stat_pass);
-        PD("M %llu 续用通道内绘制要的深度 / 模板平面没挂，在此切开", g_stat_pass); rp_end(); }
+    // 通道可能是少挂深度 / 模板开的（开法 2 / 3 / 4）：这次绘制要的平面没挂，就在它之前切开（重开时按新前瞻挂）
+    // The render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
+    if (g_enc && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw || (pr && pr->sh[1] && pr->sh[1]->writes_depth)) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
+        static int once2; if (!once2++) MLOG("按需挂深度模板：通道内绘制要的深度 / 模板平面没挂，在此切开（首例 通道 %llu）", g_stat_pass);
+        PD("M %llu 通道内绘制要的深度 / 模板平面没挂，在此切开", g_stat_pass); rp_end(); }
     if (g_rt_range_active && (!rt_range_pr_ro(pr) || !S.ds.dt || S.ds.dw || S.ds.st)) rp_end();   // 原encoder边界的外部写可见性不删 | The external write visibility at the original encoder boundary is not removed
     if (g_rt_merged && draw_samples_rt(pr)) { static int once; if (!once++) MLOG("同目标续用：续用通道内绘制要采样附件，在此切开（首例 通道 %llu）", g_stat_pass);
         PD("M %llu 续用通道内绘制要采样附件，在此切开", g_stat_pass); rp_end(); }
