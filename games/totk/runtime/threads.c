@@ -28,6 +28,9 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <time.h>
+#if defined(__APPLE__)
+#include <os/os_sync_wait_on_address.h>
+#endif
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
@@ -47,7 +50,7 @@ typedef struct thr {
     uint64_t entry, arg, stack_top; uint64_t host_context[2]; int prio, core; uint64_t mask;
     uint64_t born_ns, exit_ns; uint32_t born_tick, exit_tick;   // 建立 / 退出的时刻与当时的游戏拍（现场导出用：作业工人是不是在卡住前退的） | Time of creation / exit and the game tick at that time (for the state dump: did the job worker exit before the stall)
     int started, exited, cancel;
-    pthread_t pt; pthread_cond_t cv;
+    pthread_t pt; pthread_cond_t cv; uint32_t fx;   // fx: wake sequence for the futex-style wait (tw_wait)
     // 当前等待：kind 0=无 1=锁 2=条件 3=地址 4=同步对象
     // Current wait: kind 0=none 1=lock 2=condition 3=address 4=synchronization object
     int wkind, woke; uint64_t waddr, wkey; uint32_t wtag; int64_t wres;
@@ -127,7 +130,40 @@ static void hand_note(thr_t *t, int which, uint64_t ns) {
     if (t == g_main_thr) { __atomic_fetch_add(&g_hand[4 + which * 2], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_hand[5 + which * 2], ns, __ATOMIC_RELAXED); }
 }
 static thr_t *me_or_null(void);
-static void wake(thr_t *t, int64_t res) { { thr_t *w = me_or_null(); t->woke_by = w ? w->handle : 0; } wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; t->wake_at = now_ns(); pthread_cond_signal(&t->cv); }
+/* Local change: a guest thread's sleep while holding G. Each core hand-off and wake signalled a per-thread condition
+   variable (pthread_cond_signal / pthread_cond_wait). With TOTK_FUTEX (default on; =0: the condition variable) the
+   thread instead waits on its own 32-bit sequence word with os_sync_wait_on_address and is woken with
+   os_sync_wake_by_address_any (Apple's futex-style API, made for exactly this kind of sync emulation). The word is read
+   with G held and bumped with G held, so a wake between the unlock and the wait changes it and the wait returns at once;
+   every caller re-checks its condition under G, so spurious returns are harmless. deadline_ns: 0 = none, otherwise a
+   now_ns() (mach absolute) time. Returns ETIMEDOUT once it has passed. */
+static int futex_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FUTEX"); v = !(e && !strcmp(e, "0")); } return v; }
+static void tw_signal(thr_t *t) {   // holding G
+#if defined(__APPLE__)
+    if (futex_on()) { __atomic_fetch_add(&t->fx, 1, __ATOMIC_RELEASE); os_sync_wake_by_address_any(&t->fx, sizeof t->fx, OS_SYNC_WAKE_BY_ADDRESS_NONE); return; }
+#endif
+    pthread_cond_signal(&t->cv);
+}
+static int tw_wait(thr_t *t, uint64_t deadline_ns) {   // holding G; returns with G held
+#if defined(__APPLE__)
+    if (futex_on()) {
+        uint32_t v = __atomic_load_n(&t->fx, __ATOMIC_ACQUIRE); uint64_t now = deadline_ns ? now_ns() : 0;
+        if (deadline_ns && now >= deadline_ns) return ETIMEDOUT;
+        pthread_mutex_unlock(&G);
+        int r = deadline_ns ? os_sync_wait_on_address_with_timeout(&t->fx, v, sizeof t->fx, OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME, deadline_ns - now)
+                            : os_sync_wait_on_address(&t->fx, v, sizeof t->fx, OS_SYNC_WAIT_ON_ADDRESS_NONE);
+        int err = r < 0 ? errno : 0;
+        pthread_mutex_lock(&G);
+        return err == ETIMEDOUT ? ETIMEDOUT : 0;
+    }
+#endif
+    if (!deadline_ns) return pthread_cond_wait(&t->cv, &G);
+    uint64_t now = now_ns(); if (now >= deadline_ns) return ETIMEDOUT;
+    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); uint64_t left = deadline_ns - now;
+    dl.tv_sec += left / 1000000000; dl.tv_nsec += left % 1000000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+    return pthread_cond_timedwait(&t->cv, &G, &dl);
+}
+static void wake(thr_t *t, int64_t res) { { thr_t *w = me_or_null(); t->woke_by = w ? w->handle : 0; } wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; t->wake_at = now_ns(); tw_signal(t); }
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
@@ -148,7 +184,7 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
     if (!b) return;
-    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; pthread_cond_signal(&b->cv);
+    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; tw_signal(b);
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
@@ -165,7 +201,7 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
     uint64_t q0 = now_ns();
-    while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
+    while (t->cur_core < 0) tw_wait(t, 0);
     hand_note(t, 1, now_ns() - q0);
 }
 // Local change (TOTK_LOCKSTAT=1): which guest mutexes the guest main thread waits on, who holds them, how long.
@@ -251,19 +287,17 @@ static int64_t block(thr_t *t,int kind,int64_t ns) {
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
-    struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
-    if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
-                  if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
+    uint64_t deadline = ns > 0 && !det_wait ? now_ns() + (uint64_t)ns : 0;
     while (!t->woke) {
         int rc;
         if (det_wait) {
             uint64_t now = guest_ns();
             if (now >= guest_deadline) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
             (void)(guest_deadline - now);
-            rc = pthread_cond_wait(&t->cv, &G);
-        } else rc = ns > 0 ? pthread_cond_timedwait(&t->cv, &G, &dl) : pthread_cond_wait(&t->cv, &G);
+            rc = tw_wait(t, 0);
+        } else rc = tw_wait(t, deadline);
         if (rc == ETIMEDOUT && !t->woke && (!det_wait || guest_ns() >= guest_deadline)) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     }
     if (t->wake_at) { uint64_t n = now_ns(); hand_note(t, 0, n > t->wake_at ? n - t->wake_at : 0); t->wake_at = 0; }
@@ -315,7 +349,7 @@ static void *thread_main(void *p) {
     if (getenv("TOTK_WAITSTAT") || getenv("TOTK_LOCKSTAT")) fprintf(stderr, "[totk] guest thread %#x = host thread %llu (entry %#llx arg %#llx prio %d core %d)\n", t->handle, (unsigned long long)t->tid, (unsigned long long)t->entry, (unsigned long long)t->arg, t->prio, t->core);
 
     guest_thread_init();
-    pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); while (!t->started) tw_wait(t, 0); core_take(t); pthread_mutex_unlock(&G);
     { volatile char marker = 0; runtime_hle_stack_set((uintptr_t)&marker - 1024); }   // host services of this thread run below this frame
     dm_thread_enter(t->entry, t->arg, t->stack_top,t->host_context);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
     die("客体线程入口返回");
@@ -396,7 +430,7 @@ static int64_t now_mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOT
 void dm_guest_clock_advanced(void) {
     if (!dm_detclock_enabled()) return;
     pthread_mutex_lock(&G);
-    for (thr_t *t = g_wait; t; t = t->next) if (t->wkind) pthread_cond_signal(&t->cv);
+    for (thr_t *t = g_wait; t; t = t->next) if (t->wkind) tw_signal(t);
     pthread_mutex_unlock(&G);
 }
 
@@ -426,7 +460,7 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x09: {  // StartThread(w0)
         pthread_mutex_lock(&G);
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-        if (t) { t->started = 1; pthread_cond_signal(&t->cv); }
+        if (t) { t->started = 1; tw_signal(t); }
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
@@ -447,7 +481,12 @@ int svc_thread(int num, uint64_t *regs) {
             int give = 0; for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = me->cur_core >= 0 && core_allowed(w, me->cur_core) && w->prio <= me->prio;
             if (give) { core_put(me); core_take(me); }
             pthread_mutex_unlock(&G);
-            if (!give) sched_yield();
+            /* Local change: with no guest thread waiting for this core, Horizon's yield returns at once. sched_yield gave the
+               host CPU away instead, for up to 10 ms on macOS and possibly to an efficiency core, inside the game's
+               poll-and-yield loops (the render task graph's "wait until all done", main+0x15ee898). A spin hint keeps the
+               thread on its core; TOTK_HOST_YIELD=1 restores sched_yield. */
+            static int host_yield = -1; if (host_yield < 0) { const char *e = getenv("TOTK_HOST_YIELD"); host_yield = e && atoi(e); }
+            if (!give) { if (host_yield) sched_yield(); else __builtin_arm_yield(); }
             if (me && me->handle == 0x1001) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
         }
         if (ns > 0) { pthread_mutex_lock(&G); core_take(self); pthread_mutex_unlock(&G); tl_gblock(self, 5, sl0, 0); }
