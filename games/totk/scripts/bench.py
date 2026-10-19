@@ -198,6 +198,9 @@ def run(name, args, outdir):
            'TMPDIR': os.environ.get('TMPDIR', '/tmp'), 'TOTK_PROFILE_DIR': str(profile), 'TOTK_INPUT_FILE': str(cmd_file),
            'TOTK_SLOT_OWNER': 'codex', 'TOTK_SLOT_PURPOSE': f'benchmark {name}', 'TOTK_ASSUME_FOCUS': '1', **config_env(name)}
     if args.hidden: env['TOTK_PAUSE_HIDDEN'] = '1'
+    if args.play:   # on screen as the app's "unlimited" setting shows it (launcher.m), MetalFX upscaling on; the player drives
+        for k in ('TOTK_PRESENT_SKIP', 'DM_PRESENT_HZ', 'DM_PRESENT_LINK'): env.pop(k, None)
+        env.update(TOTK_UNCAPPED='1', TOTK_UNCAPPED_INTERVAL='1', TOTK_MFX_UPSCALE='1')
     env.update(extra_env(args.env))
     if args.cache_ab:
         env.update(TOTK_ARG_EPOCH='0', TOTK_TEXTURE_PLAN='0', TOTK_ARG_EPOCH_CHECK='0', TOTK_TEXTURE_PLAN_CHECK='0')
@@ -344,6 +347,8 @@ def main():
     ap.add_argument('--seconds', type=int, default=20, help='seconds per phase')
     ap.add_argument('--settle', type=int, default=8, help='seconds to wait before a phase')
     ap.add_argument('--title-only', action='store_true', help='no input: title screen only')
+    ap.add_argument('--play', action='store_true', help='free play: on screen with the app\'s uncapped display, no scripted input '
+                    '(implies --title-only; --seconds is the session length)')
     ap.add_argument('--quit-running', action='store_true', help='quit a running game first')
     ap.add_argument('--profile-plain', action='store_true', help='profile without host-call tracing (hletrace slows the game threads and shifts the bottleneck)')
     ap.add_argument('--env', action='append', default=[], metavar='NAME=VALUE', help='extra environment for the game (diagnostic switches)')
@@ -353,6 +358,7 @@ def main():
     ap.add_argument('--cache-ab', nargs='?', const='both', choices=CACHE_FLAGS, help='quick same-process off/on/on/off comparison; both, arguments or texture')
     ap.add_argument('--gpu-passes', type=int, default=0, choices=range(0, 121), metavar='0..120', help='profile N GPU frames after timing windows; diagnostic only')
     args = ap.parse_args()
+    if args.play: args.title_only = True
     for c in args.configs: config_env(c)
     extra_env(args.env)
     outdir = OUT / time.strftime('%Y%m%d-%H%M%S'); outdir.mkdir(parents=True)

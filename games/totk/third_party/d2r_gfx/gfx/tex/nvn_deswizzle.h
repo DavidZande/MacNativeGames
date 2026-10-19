@@ -21,6 +21,15 @@ int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void
 // Single-point address: within this level and layer, linear (x byte, y block row, z slice) → block-linear byte offset relative to the start of this level and layer (unit tests verify against hand calculation)
 uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned tileH, unsigned tileD);
 
+// TOTK: one rectangle only (x0 / w in bytes, y0 / h in block rows, z0 / nz slices for 3D, else 0 / 1); lin has pitch bytes
+// a row and img bytes a slice. Same storage rules and -1 cases as above, plus a rectangle outside the level.
+int nvn_deswizzle_rect(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t pitch, size_t img,
+                       uint32_t x0, uint32_t y0, uint32_t z0, uint32_t w, uint32_t h, uint32_t nz);
+int nvn_swizzle_rect(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t pitch, size_t img, void *dst_storage,
+                     uint32_t x0, uint32_t y0, uint32_t z0, uint32_t w, uint32_t h, uint32_t nz);
+// Storage bytes [lo, hi) from the start of the texture that hold block rows y0..y0+h-1 of slices z0..z0+nz-1 (whole block rows: a superset)
+int nvn_rect_span(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t y0, uint32_t h, uint32_t z0, uint32_t nz, uint64_t *lo, uint64_t *hi);
+
 int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
                        uint32_t *row_bytes, uint32_t *rows, uint32_t *slices,
                        uint64_t *base, unsigned *tileH, unsigned *tileD, uint32_t *bpb);

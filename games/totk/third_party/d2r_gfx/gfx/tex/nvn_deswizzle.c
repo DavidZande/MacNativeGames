@@ -76,6 +76,71 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     return 0;
 }
 
+/* TOTK: one rectangle of a level / layer instead of all of it: (x0 bytes, y0 block rows, z0 slices) + w bytes × h block
+   rows × nz slices (z only for 3D; other targets take z0 = 0, nz = 1). lin: pitch bytes a row, img bytes a slice.
+   Inside a GOB 16 aligned bytes are contiguous, so a row is copied in runs that stop at 16-byte boundaries. The game
+   writes small tiles into a 5120x5120 texture with WriteTexels; the whole-level copy each time was ~2 x 13 MB. */
+static int move_rect(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint8_t *lin, size_t pitch, size_t img,
+                     uint32_t x0, uint32_t y0, uint32_t z0, uint32_t w, uint32_t h, uint32_t nz, int to_linear) {
+    if (!w || !h || !nz) return 0;
+    if (nvn_tex_is_linear(d)) {
+        if (level || layer || z0 || nz != 1 || d->samples > 1 || (d->target != 0 && d->target != 1 && d->target != 7)) return -1;
+        int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+        if (!bpb) return -1;
+        uint32_t row = (uint32_t)((d->width + bw - 1) / bw) * bpb, rows = d->target == 0 ? 1 : (d->height + bh - 1) / bh, stride = nvn_tex_linear_stride(d);
+        if (stride < row || pitch < w || x0 + w > row || y0 + h > rows) return -1;
+        for (uint32_t y = 0; y < h; y++) {
+            uint8_t *p = bl + (size_t)(y0 + y) * stride + x0;
+            if (to_linear) memcpy(lin + y * pitch, p, w); else memcpy(p, lin + y * pitch, w);
+        }
+        return 0;
+    }
+    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
+    if (pitch < w || x0 + w > row_bytes || y0 + h > rows || z0 + nz > slices || (nz > 1 && img < pitch * h)) return -1;
+    bl += base;
+    for (uint32_t z = 0; z < nz; z++)
+        for (uint32_t y = 0; y < h; y++) {
+            uint8_t *row = lin + z * img + (size_t)y * pitch;
+            for (uint32_t x = 0; x < w;) {
+                uint32_t ax = x0 + x, n = 16 - ax % 16; if (n > w - x) n = w - x;
+                uint8_t *p = bl + nvn_bl_offset(ax, y0 + y, z0 + z, row_bytes, rows, th, td);
+                if (to_linear) memcpy(row + x, p, n); else memcpy(p, row + x, n);
+                x += n;
+            }
+        }
+    return 0;
+}
+int nvn_deswizzle_rect(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t pitch, size_t img,
+                       uint32_t x0, uint32_t y0, uint32_t z0, uint32_t w, uint32_t h, uint32_t nz) {
+    return move_rect(d, level, layer, (uint8_t *)src, (uint8_t *)dst, pitch, img, x0, y0, z0, w, h, nz, 1);
+}
+int nvn_swizzle_rect(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t pitch, size_t img, void *dst,
+                     uint32_t x0, uint32_t y0, uint32_t z0, uint32_t w, uint32_t h, uint32_t nz) {
+    return move_rect(d, level, layer, (uint8_t *)dst, (uint8_t *)src, pitch, img, x0, y0, z0, w, h, nz, 0);
+}
+/* The storage bytes [*lo, *hi) (from the start of the whole texture) that rows y0..y0+h-1 of slices z0..z0+nz-1 of this
+   level / layer lie in: whole block rows (all block columns), a superset of what move_rect touches. -1 when unsupported. */
+int nvn_rect_span(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t y0, uint32_t h, uint32_t z0, uint32_t nz, uint64_t *lo, uint64_t *hi) {
+    if (!h || !nz) return -1;
+    if (nvn_tex_is_linear(d)) {
+        if (level || layer || z0 || nz != 1) return -1;
+        int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+        if (!bpb) return -1;
+        uint32_t row = (uint32_t)((d->width + bw - 1) / bw) * bpb, stride = nvn_tex_linear_stride(d);
+        *lo = (uint64_t)y0 * stride; *hi = (uint64_t)(y0 + h - 1) * stride + row;
+        return 0;
+    }
+    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
+    if (y0 + h > rows || z0 + nz > slices) return -1;
+    uint64_t bh = 1u << th, bd = 1u << td, gobs_x = (row_bytes + 63) / 64, blocks_y = (rows + 8 * bh - 1) / (8 * bh);
+    uint64_t brow = gobs_x * 512 * bh * bd, zl = blocks_y * brow;   // one block row; one layer of blocks along depth
+    *lo = base + (z0 / bd) * zl + (y0 / (8 * bh)) * brow;
+    *hi = base + ((z0 + nz - 1) / bd) * zl + ((y0 + h - 1) / (8 * bh) + 1) * brow;
+    return 0;
+}
+
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {
     return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1);
 }

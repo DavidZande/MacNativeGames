@@ -2255,7 +2255,7 @@ static int pkg_final_cache_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_PKG_FINAL_CACHE"); v = e && atoi(e); atomic_store(&g_pkg_final_cache, v); }
     return v;
 }
-@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; } @end   // lo / hi (TOTK): the texture's memory (pkg_orphan_report)   // tracked (TOTK): result of the last nvn_dirty_tracked   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
+@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; uint64_t hot_f, hot_since; uint32_t hot_n; uint8_t hot, hot_cools; } @end   // hot_* (TOTK): pkg_hot, a big texture rewritten every frame checked by content instead of page faults   // lo / hi (TOTK): the texture's memory (pkg_orphan_report)   // tracked (TOTK): result of the last nvn_dirty_tracked   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
 /* TOTK: a mirrored texture the GPU starts rendering into is told directly (g_smu held), so tex_mtl no longer asks the owned
    set again every time any other serial joins it (a locked lookup per CPU-pool texture per new render target). */
 static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); if ([o isKindOfClass:[NvPkg class]]) ((NvPkg *)o)->owned = 1; }
@@ -2318,6 +2318,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     }
     if (!strcmp(name, "diag_env_once")) { extern void nvn_diag_env_once_set(int); nvn_diag_env_once_set(v); return; }
     if (!strcmp(name, "inline_bulk")) { extern void dm_nvn_inline_bulk_set(int); dm_nvn_inline_bulk_set(v); return; }
+    if (!strcmp(name, "rec_take")) { extern void dm_nvn_rec_take_set(int); dm_nvn_rec_take_set(v); return; }
     if (!strcmp(name, "keepalive_us")) {
         if (v && (v < 100 || v > 1000)) { MLOG("[flag] keepalive_us requires 0 or 100..1000"); return; }
         atomic_store(&g_ka_target_us, v); MLOG("[flag] keepalive_us = %d", v); return;
@@ -2378,6 +2379,21 @@ static int tilelog_match(const tex_t *t) {
     return on && t && t->d.width == w && t->d.height == h;
 }
 #define TILELOG(t, fmt, ...) do { if (tilelog_match(t)) MLOG("[tile] f%llu ser=%llu mem=%p nvnfmt=%#x lv%u " fmt, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)(t)->serial, (void *)(t)->mem, (t)->d.format, (t)->d.levels, ##__VA_ARGS__); } while (0)
+/* TOTK: the latest distinct writers of a texture's pages from the nvn_dirty.c ring (game writes: pc / lr of the faulting
+   code as module+offset; host writes: the dm_guest_write_prepare caller), newest first, up to six. Returns the record count. */
+static int dirty_writers(const tex_t *t, char *line, size_t cap) {
+    extern int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);
+    nvn_dirty_rec rec[64]; int nr = nvn_dirty_recent((uintptr_t)t->mem & ~(uintptr_t)16383, (uintptr_t)t->mem + t->L.size, rec, 64);
+    size_t o2 = 0; int shown = 0; uint64_t seen[8]; int ns = 0; line[0] = 0;
+    for (int q = nr - 1; q >= 0 && shown < 6 && o2 < cap - 120; q--) {
+        uint64_t pc = rec[q].pc; int dup = 0; for (int w = 0; w < ns; w++) if (seen[w] == pc) dup = 1; if (dup) continue; if (ns < 8) seen[ns++] = pc;
+        const char *mn = "?", *ln = "?"; uint64_t mo = 0, lo2 = 0; int okp = runtime_module_offset(pc, &mn, &mo), okl = rec[q].lr && runtime_module_offset(rec[q].lr, &ln, &lo2);
+        Dl_info di; if (!okp && dladdr((void *)(uintptr_t)pc, &di) && di.dli_fbase) { mn = di.dli_sname ? di.dli_sname : "host"; mo = pc - (uint64_t)(uintptr_t)di.dli_fbase + 0x100000000ull; okp = 1; }
+        o2 += snprintf(line + o2, cap - o2, " [%s pc=%s+%#llx lr=%s+%#llx page+%#llx]", rec[q].src ? "host" : "guest", okp ? mn : "?", (unsigned long long)(okp ? mo : pc),
+                       okl ? ln : "-", (unsigned long long)(okl ? lo2 : 0), (unsigned long long)(rec[q].page - (uintptr_t)t->mem)); shown++;
+    }
+    return nr;
+}
 static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_release((__bridge id)e->obj); CFRelease(e->obj); } free(e); }
 static void wb_note(const tex_t *t) {
     TILELOG(t, "GPU render (owned %d)", gpu_owned(t->serial));
@@ -2435,16 +2451,7 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
         if (fresh[i] == 2 || !mt) { wb_ent_free(e); continue; }   // !mt: copy evicted (pkg_evict_sweep) before the GPU rendered into it
         TILELOG(t, "invalidate %#llx+%#llx: %s", (unsigned long long)(uintptr_t)a, (unsigned long long)n, !fresh[i] ? "CPU wrote since the render, skip" : "write back");
         if (tilelog_match(t) && !fresh[i]) {   // who wrote it
-            extern int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);
-            nvn_dirty_rec rec[64]; int nr = nvn_dirty_recent((uintptr_t)t->mem & ~(uintptr_t)16383, (uintptr_t)t->mem + t->L.size, rec, 64);
-            char line[900]; size_t o2 = 0; int shown = 0; uint64_t seen[8]; int ns = 0;
-            for (int q = nr - 1; q >= 0 && shown < 6 && o2 < sizeof line - 120; q--) {
-                uint64_t pc = rec[q].pc; int dup = 0; for (int w = 0; w < ns; w++) if (seen[w] == pc) dup = 1; if (dup) continue; if (ns < 8) seen[ns++] = pc;
-                const char *mn = "?", *ln = "?"; uint64_t mo = 0, lo2 = 0; int okp = runtime_module_offset(pc, &mn, &mo), okl = rec[q].lr && runtime_module_offset(rec[q].lr, &ln, &lo2);
-                Dl_info di; if (!okp && dladdr((void *)(uintptr_t)pc, &di) && di.dli_fbase) { mn = di.dli_sname ? di.dli_sname : "host"; mo = pc - (uint64_t)(uintptr_t)di.dli_fbase + 0x100000000ull; okp = 1; }
-                o2 += snprintf(line + o2, sizeof line - o2, " [%s pc=%s+%#llx lr=%s+%#llx page+%#llx]", rec[q].src ? "host" : "guest", okp ? mn : "?", (unsigned long long)(okp ? mo : pc),
-                               okl ? ln : "-", (unsigned long long)(okl ? lo2 : 0), (unsigned long long)(rec[q].page - (uintptr_t)t->mem)); shown++;
-            }
+            char line[900]; int nr = dirty_writers(t, line, sizeof line);
             TILELOG(t, "writers since the render (%d records):%s", nr, line);
         }
         if (!fresh[i]) { g_wb_skip_cpu++; wb_ent_free(e); continue; }   // the CPU wrote it since: its bytes are newer
@@ -2452,7 +2459,7 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
         /* the GPU's bytes landing in memory: not a CPU write (with dm_guest_write_prepare the page this texture shares
            with a neighbour counted as written, and the neighbour's own write-back was skipped as "CPU wrote since") */
         void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
-        if (!tok) dm_guest_write_prepare(t->mem, t->L.size);
+        if (!tok) { nvn_dirty_barrier_suppress(1); dm_guest_write_prepare(t->mem, t->L.size); nvn_dirty_barrier_suppress(-1); }   // graphics-layer write: no write barrier
         unsigned layers = t->L.layers ? t->L.layers : 1, ok = 1;
         for (unsigned l = 0; l < t->d.levels && ok; l++) for (unsigned y = 0; y < layers && ok; y++) ok = wb_level_back(t, mt, l, y);
         nvn_dirty_gpu_write_end(tok);
@@ -3098,6 +3105,7 @@ static uint64_t pkg_hash(const void *p, uint64_t n) {
     h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ull; return h ^ (h >> 33);
 }
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key);
+static int g_pkg_noprot;   // set while uploading a hot texture (pkg_hot): its pages are left writable
 static id<MTLTexture> pkg_upload(const tex_t *t, uint64_t *stamp, reup_key *key) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
     id<MTLTexture> r = pkg_upload_(t, stamp, key);
@@ -3189,7 +3197,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key
         if (ul && (!ulw || (t->d.width == ulw && t->d.height == ulh))) { uint64_t nz = 0, n = t->L.size; const uint8_t *m = t->mem; for (uint64_t i = 0; i < n; i += 8) if (*(const uint64_t *)(m + i)) nz++;
             MLOG("[uplog] ser=%llu fmt=%#x %ux%u lv=%u tgt=%d size=%llu nz8=%llu/%llu pool=%p flags=%#x host=%p off=%lld frame=%llu", (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height, t->d.levels, t->d.target,
                  (unsigned long long)n, (unsigned long long)nz, (unsigned long long)(n / 8), (void *)t->pool, t->pool ? t->pool->flags : 0, t->pool ? (void *)t->pool->host : NULL, (long long)t->off, (unsigned long long)atomic_load(&g_cur_frame)); } }
-    if (!pkg_hashed(t)) nvn_dirty_protect(t->mem, t->L.size);
+    if (!pkg_hashed(t) && !g_pkg_noprot) nvn_dirty_protect(t->mem, t->L.size);   // g_pkg_noprot (TOTK): a hot texture, checked by content (pkg_hot)
     *stamp = nvn_dirty_now();
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;
@@ -3356,6 +3364,55 @@ static int tex_mirrored(const tex_t *t) {
     return 1;
 }
 static int tex_check_once(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_TEX_CHECK_ONCE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_TEX_CHECK_ONCE=0：CPU 池贴图每次取用都查是否被改写（旧行为）"); } return v; }
+/* TOTK: hot textures. In some places the game rewrites a few big CPU-pool textures on the CPU every frame for 0.3-1 s
+   (2026-10-19 play log: ~800 write-protect faults a frame, 3-5 re-uploads / ~18 MB a frame, frames of 35-90 ms with the
+   GPU and the submit normal). Each frame the copy was uploaded, its pages protected, and every page faulted again. A
+   texture re-uploaded in PKG_HOT_AFTER frames in a row is checked by a content hash once per submission instead (as the
+   small pkg_hashed ones), with its pages left writable; after PKG_HOT_COOL frames without a change it is protected again,
+   and each time it comes back the quiet time doubles (up to 128x, ~4 min at 90 FPS). A texture in an untracked pool (one
+   overlapping another pool's range is left untracked and was re-uploaded on every use) stays hot: the hash is all there is.
+   Needs TOTK_TEX_CHECK_ONCE (texture-ID views then revalidate once per submission whatever the kind). TOTK_PKG_HOT=0 off. */
+enum { PKG_HOT_AFTER = 3, PKG_HOT_COOL = 180, PKG_HOT_MIN_BARRIER = 1u << 20 };
+static uint64_t g_pkg_hot_in, g_pkg_hot_out, g_pkg_hot_checks, g_pkg_hot_hash_ns;   // content hashes of hot textures: count and time
+void mtl_hot_stats(uint64_t *checks, uint64_t *hash_ns) { *checks = g_pkg_hot_checks; *hash_ns = g_pkg_hot_hash_ns; }   // for the long-frame log (hle_nvn.c)
+static uint64_t pkg_hot_hash(const tex_t *t) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), h = pkg_hash(t->mem, t->L.size); g_pkg_hot_hash_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; g_pkg_hot_checks++; return h; }
+static int pkg_hot_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PKG_HOT"); v = !(e && !strcmp(e, "0")) && tex_check_once(); MLOG("hot textures (rewritten every frame: checked by content, no page faults): %s", v ? "on (TOTK_PKG_HOT=0 off)" : "off"); } return v; }
+/* Called before a re-upload of a protected texture: counts the frames in a row with a re-upload, and on the
+   PKG_HOT_AFTER-th switches the texture to hot. *h gets the hash of the bytes before the copy (the copy is never older). */
+static void pkg_hot_note(NvPkg *pk, const tex_t *t, uint64_t *h) {
+    if (!pkg_hot_on()) return;
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (f == pk->hot_f) return;
+    pk->hot_n = f - pk->hot_f <= 2 ? pk->hot_n + 1 : 1; pk->hot_f = f;
+    if (pk->hot_n < PKG_HOT_AFTER) return;
+    /* With the write barrier (TOTK_FENCE_LAG) a hot texture's writes are not ordered against pending replays (its pages
+       are writable): small ones, where faults are cheap, stay protected. The 320x64 UI text texture the game writes
+       every frame (main+0x98f9bc) flickered while hot (2026-10-19). */
+    if (nvn_dirty_barrier_active() && t->L.size < PKG_HOT_MIN_BARRIER) { pk->hot_n = 0; return; }
+    pk->hot = 1; pk->hashed = 1; pk->hot_since = f; *h = pkg_hot_hash(t);
+    uint64_t n = ++g_pkg_hot_in;
+    if (n <= 30 || n % 200 == 0) {
+        char line[900]; int nr = dirty_writers(t, line, sizeof line);
+        MLOG("[hot] f%llu texture ser=%llu %ux%ux%u fmt %#x lv%u %.1f MB mem=%p re-uploaded %u frames in a row: checked by content now, no page faults (%llu so far); writers (%d records):%s",
+             (unsigned long long)f, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.levels, t->L.size / 1048576.0, (void *)t->mem, pk->hot_n, (unsigned long long)n, nr, line);
+    }
+}
+/* A hot texture after its content check (clean = unchanged since the copy): after PKG_HOT_COOL quiet frames it goes back
+   to page protection. Order: stamp, protect, hash again. A write before the protection shows in the hash; one after it
+   faults and gets a generation above the stamp. Returns the clean answer; *h is the latest hash. */
+static int pkg_hot_cool(NvPkg *pk, const tex_t *t, uint64_t *h, int clean) {
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (!clean) { pk->hot_since = f; return 0; }
+    if (f - pk->hot_since < (uint64_t)PKG_HOT_COOL << pk->hot_cools) return 1;
+    if (!nvn_dirty_tracked(t->mem, t->L.size)) { pk->hot_since = f; return 1; }   // nothing to protect: stay hot
+    uint64_t st = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);
+    *h = pkg_hot_hash(t);
+    if (*h != pk->chash) { pk->hot_since = f; return 0; }
+    pk->hot = 0; pk->hashed = 0; pk->hot_n = 0; if (pk->hot_cools < 7) pk->hot_cools++; pk->stamp = st; pk->seen = st; pk->tracked = 0;
+    uint64_t n = ++g_pkg_hot_out;
+    if (n <= 30 || n % 200 == 0) MLOG("[hot] f%llu texture ser=%llu %ux%u quiet for %llu frames: page protection again (%llu so far)", (unsigned long long)f, (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned long long)(f - pk->hot_since), (unsigned long long)n);
+    return 1;
+}
 static id<MTLTexture> tex_mtl(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
     if (!t || !t->serial) return nil;
@@ -3376,7 +3433,8 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
             } else
             if (pk->hashed) {   // TOTK: small texture, content hash once per submission (see pkg_hashed)
                 if (pk->csub == g_sub_serial) return pk->tex;
-                pk->csub = g_sub_serial; h = pkg_hash(t->mem, t->L.size); clean = h == pk->chash;
+                pk->csub = g_sub_serial; h = pk->hot ? pkg_hot_hash(t) : pkg_hash(t->mem, t->L.size); clean = h == pk->chash;
+                if (pk->hot) clean = pkg_hot_cool(pk, t, &h, clean);
             } else {
             /* TOTK: once per submission, as for the small hashed ones: the contents are those of the submit call (the rule
                of the uniform snapshot). Re-checking on every use, whenever any game thread had written any page since,
@@ -3399,7 +3457,8 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
                 if (clean) return pk->tex;
             }
             TILELOG(t, "re-upload from the pool bytes");
-            uint64_t st; reup_key nk; g_mip_nodrop = pk->owned; id<MTLTexture> nt = pkg_upload(t, &st, &nk); g_mip_nodrop = 0;   // 池内容变了（流式素材写进同一存储）：换新贴图，在途绘制仍读旧的 | Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
+            if (pk->tex && !pk->owned && !pk->hashed) pkg_hot_note(pk, t, &h);   // TOTK: rewritten every frame -> hot (pkg_hot_note)
+            uint64_t st; reup_key nk; g_mip_nodrop = pk->owned; g_pkg_noprot = pk->hot; id<MTLTexture> nt = pkg_upload(t, &st, &nk); g_mip_nodrop = 0; g_pkg_noprot = 0;   // 池内容变了（流式素材写进同一存储）：换新贴图，在途绘制仍读旧的 | Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
             if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt; reup_retire(old, &pk->key); pk->key = nk; if (pk->hashed) pk->chash = h; ser_bump(t->serial); pk->stamp = st; pk->seen = nvn_dirty_now(); g_pkg_reuploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size); }
             return pk->tex;
         }
@@ -5916,7 +5975,7 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
 // ---- Parallel precompile: pipelines met for the first time used to be compiled synchronously one by one on the submit thread; 9 misses in a row in one frame = 284 ms (heavy scene on a real device).
 // Now: on the first pipeline miss in a submission, scan ahead once along the remaining commands (replaying state only, no drawing) and kick all the normal-pass pipelines that will also miss later to the background to compile in parallel;
 // when the submit thread reaches that draw it only waits for 'the remaining time not yet compiled'. The compiled pipelines are identical to synchronously compiled ones (same descriptor). Pipeline keys of merged passes / specialized fragments depend on the planning result at replay time, are not predicted, and are compiled synchronously as before.
-#define PSO_PEND_MAX 384
+#define PSO_PEND_MAX 1024   // TOTK: was 384; it filled during play (2026-10-19: in-place builds of up to 126 ms on the submit thread)
 static struct { pso_key k; id<MTLRenderPipelineState> ps; int used, done; } g_pp[PSO_PEND_MAX];
 static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
@@ -6010,7 +6069,11 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
             if (pso_pend_find(&k) >= 0) { g_async_pso_kicked++; g_async_pso_skipped++;
                 static unsigned said; if (said++ < 5 || said % 500 == 0) MLOG("[async-pso] queued %llu, draws skipped %llu, ready %llu", g_async_pso_kicked, g_async_pso_skipped, g_async_pso_ready);
                 return nil; }
-            /* the table is full: build it here as before */
+            /* TOTK: the table is full (every slot still compiling): skip the draw this frame and ask again next frame, as
+               for a pipeline still compiling, instead of building it here (a 126 ms stall in play, 2026-10-19).
+               TOTK_PSO_FULL_SYNC=1: build it here as before. */
+            { static int sync_full = -1; if (sync_full < 0) { const char *e = getenv("TOTK_PSO_FULL_SYNC"); sync_full = e && atoi(e); }
+              if (!sync_full) { g_async_pso_skipped++; static unsigned said; if (said++ < 5 || said % 500 == 0) MLOG("[async-pso] pending table full: draw skipped, retried next frame (%u so far)", said); return nil; } }
         } else if (ps) g_async_pso_ready++;
     }
     if (!ps && !g_pso_lmap) ps = pso_pend_take(&k);
@@ -9944,6 +10007,12 @@ static void copy_t2b(const p_copy_b2t *c) {
 }
 // CPU 读贴图（ReadTexels）：预排布贴图以池内存为真值，解排布直读；其余从 MTLTexture blit 读回（调用方已按 NVN 规矩等过 GPU）
 // CPU texture read (ReadTexels): for packaged textures the pool memory is the ground truth, de-layout and read directly; the rest are read back from the MTLTexture by blit (the caller has already waited for the GPU per NVN rules)
+/* TOTK: ReadTexels / WriteTexels on CPU-pool textures copy just the rectangle (nvn_deswizzle_rect / nvn_swizzle_rect) and
+   unprotect just its block rows. They used to convert the whole level both ways for every call: the game writes small
+   tiles into a 5120x5120 texture several times a frame while moving (2026-10-19 play: 6-29 calls a frame in the slow
+   frames, each ~2 x 13 MB on a game thread, and the whole 17 MB unprotected and re-uploaded). TOTK_TEXELS_RECT=0: the
+   whole-level copies as before. */
+static int texels_rect(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_TEXELS_RECT"); v = !(e && !strcmp(e, "0")); MLOG("ReadTexels / WriteTexels on CPU-pool textures: %s", v ? "rectangle only (TOTK_TEXELS_RECT=0: whole level)" : "whole level (TOTK_TEXELS_RECT=0)"); } return v; }
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     xv_check(t->serial, level, layer0, "CPU读回");
     PD("U cpu_read ser=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d dst=%p row=%lu img=%lu", t->serial, level, layer0, r->xoffset, r->yoffset, r->zoffset, r->width, r->height, r->depth, dst, (unsigned long)row, (unsigned long)img);
@@ -9958,6 +10027,12 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     int gpu_content = tex_mirrored(t) && gpu_owned(t->serial) && !bc_unpack(t->d.format, &upf_, &ubpp_);
     TILELOG(t, "ReadTexels lv%u xy=%d,%d %dx%d (%s)", level, r->xoffset, r->yoffset, r->width, r->height, gpu_content ? "from the GPU texture" : tex_mirrored(t) ? "from the pool bytes" : "GPU texture");
     if (gpu_content) { static int n; if (++n <= 8) MLOG("[texels] ReadTexels ser=%llu %ux%u nvnfmt=%#x lv%u: rendered by the GPU, read back from the Metal texture (%d so far)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, level, n); }
+    if (tex_mirrored(t) && !gpu_content && texels_rect()) {   // TOTK: the rectangle only (nvn_deswizzle_rect), not the whole level each call
+        int ok = 1;
+        if (is3d) ok = !nvn_deswizzle_rect(&t->d, level, 0, t->mem, dst, row, img, (uint32_t)x0, (uint32_t)y0, (uint32_t)r->zoffset, (uint32_t)wb, (uint32_t)hb, (uint32_t)nz);
+        else for (int z = 0; z < nz && ok; z++) ok = !nvn_deswizzle_rect(&t->d, level, layer0 + r->zoffset + z, t->mem, dst + z * img, row, img, (uint32_t)x0, (uint32_t)y0, 0, (uint32_t)wb, (uint32_t)hb, 1);
+        if (ok) return;   // refused (unsupported layout): the whole-level path below reports it as before
+    }
     if (tex_mirrored(t) && !gpu_content) {
         uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u), lz = is3d ? MAX(t->d.depth >> level, 1u) : 1;
         size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
@@ -9994,11 +10069,21 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
     uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u), lz = is3d ? MAX(t->d.depth >> level, 1u) : 1;
     if ((uint32_t)(r->xoffset + r->width) > lw || (uint32_t)(r->yoffset + r->height) > lh || (is3d && (uint32_t)(r->zoffset + nz) > lz)) die("WriteTexels: region outside level %u", level);
     TILELOG(t, "WriteTexels lv%u xy=%d,%d %dx%d owned %d mirrored %d flags=%#x pbh=%d tileH=%u size=%llu", level, r->xoffset, r->yoffset, r->width, r->height, gpu_owned(t->serial), tex_mirrored(t), t->d.flags, t->d.pkg_block_h, t->L.tileH, (unsigned long long)t->L.size);
+    uint64_t slo, shi, slo2, shi2;   // TOTK: the rectangle only (nvn_swizzle_rect), unprotecting just the block rows it lies in
+    if (tex_mirrored(t) && texels_rect() &&
+        !nvn_rect_span(&t->d, level, is3d ? 0 : layer0 + r->zoffset, (uint32_t)y0, (uint32_t)hb, is3d ? (uint32_t)r->zoffset : 0, is3d ? (uint32_t)nz : 1, &slo, &shi) &&
+        !nvn_rect_span(&t->d, level, is3d ? 0 : layer0 + r->zoffset + nz - 1, (uint32_t)y0, (uint32_t)hb, is3d ? (uint32_t)r->zoffset : 0, is3d ? (uint32_t)nz : 1, &slo2, &shi2)) {
+        if (shi2 > shi) shi = shi2;
+        nvn_dirty_barrier_suppress(1); dm_guest_write_prepare((uint8_t *)t->mem + slo, shi - slo); nvn_dirty_barrier_suppress(-1);   // drained already (write_texels)
+        if (is3d) { if (nvn_swizzle_rect(&t->d, level, 0, src, row, img, t->mem, (uint32_t)x0, (uint32_t)y0, (uint32_t)r->zoffset, (uint32_t)wb, (uint32_t)hb, (uint32_t)nz)) die("WriteTexels: unsupported layout"); }
+        else for (int z = 0; z < nz; z++) if (nvn_swizzle_rect(&t->d, level, layer0 + r->zoffset + z, src + z * img, row, img, t->mem, (uint32_t)x0, (uint32_t)y0, 0, (uint32_t)wb, (uint32_t)hb, 1)) die("WriteTexels: unsupported layout");
+        if (!gpu_owned(t->serial)) return;
+    } else
     if (tex_mirrored(t)) {
         size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
         uint8_t *lin = malloc(lp * lr * lz);
         if (!lin) die("WriteTexels: out of memory");
-        dm_guest_write_prepare(t->mem, t->L.size);
+        nvn_dirty_barrier_suppress(1); dm_guest_write_prepare(t->mem, t->L.size); nvn_dirty_barrier_suppress(-1);
         for (int z = 0; z < nz; z++) {
             unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
             if ((is3d && z == 0) || !is3d) if (nvn_deswizzle(&t->d, level, layer, t->mem, lin, lp)) die("WriteTexels: unsupported layout");

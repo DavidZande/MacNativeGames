@@ -53,9 +53,27 @@ def name_guest(addr, mods, syms):
     return None
 
 
-def self_times(sample_text):
+def thread_map(log_text):
+    """guest thread handle -> host thread id, from the "[totk] guest thread 0x1037 = host thread N" lines (TOTK_WAITSTAT / TOTK_LOCKSTAT)."""
+    m = {int(h, 16): t for h, t in re.findall(r'\[totk\] waits of (0x[0-9a-f]+) \(host thread (\d+)\)', log_text)}   # the main thread has no creation line
+    m.update({int(h, 16): t for h, t in re.findall(r'\[totk\] guest thread (0x[0-9a-f]+) = host thread (\d+)', log_text)})
+    return m
+
+
+def only_threads(graph, tids):
+    """The call-graph lines of the given host threads only (`sample` starts each thread's tree with "N Thread_<id>")."""
+    out, keep = [], False
+    for line in graph.splitlines():
+        m = re.match(r'^\s*\d+\s+Thread_(\d+)', line)
+        if m: keep = m.group(1) in tids
+        if keep: out.append(line)
+    return '\n'.join(out)
+
+
+def self_times(sample_text, tids=None):
     """Self samples per frame label from `sample`'s call graph (a node's count minus its children's)."""
     graph = sample_text.split('Call graph:', 1)[-1].split('Total number in stack', 1)[0]
+    if tids is not None: graph = only_threads(graph, tids)
     nodes = []   # (depth, count, what, addr)
     for line in graph.splitlines():
         m = LINE.match(line)
@@ -73,9 +91,9 @@ def self_times(sample_text):
     return selfc, total
 
 
-def report(sample_text, mods, syms, top):
+def report(sample_text, mods, syms, top, tids=None):
     """Top functions by self time among busy samples (threads waiting in the kernel are left out)."""
-    selfc, total = self_times(sample_text)
+    selfc, total = self_times(sample_text, tids)
     named = collections.Counter(); guest = busy = 0
     for (what, addr), n in selfc.items():
         if WAITS.search(what): continue
@@ -103,8 +121,19 @@ def main():
     ap.add_argument('--input-file'); ap.add_argument('--perf'); ap.add_argument('--seconds', type=int, default=20)
     ap.add_argument('--top', type=int, default=15); ap.add_argument('--out')
     ap.add_argument('--from-sample', help='analyze an existing sample file instead of sampling')
+    ap.add_argument('--threads', help='guest thread handles to report on, comma separated (0x1001,0x1037); needs the '
+                    '"guest thread ... = host thread" log lines (run with TOTK_WAITSTAT=0x1001); one report per handle')
     a = ap.parse_args()
-    if a.from_sample: return report(open(a.from_sample, errors='replace').read(), *(lambda t: (modules_from(t), symbols_from(a.symbols)))(open(a.log, errors='replace').read()), a.top)
+    if a.from_sample:
+        text, log_text = open(a.from_sample, errors='replace').read(), open(a.log, errors='replace').read()
+        mods, syms = modules_from(log_text), symbols_from(a.symbols)
+        if not a.threads: return report(text, mods, syms, a.top)
+        tmap = thread_map(log_text)
+        for h in a.threads.split(','):
+            tid = tmap.get(int(h, 16))
+            print(f'=== guest thread {h} (host thread {tid})')
+            if tid: report(text, mods, syms, a.top, {tid})
+        return
     pid = a.pid or int(subprocess.run(['pgrep', '-f', r'totk-native(-[0-9]+)? rewritten'], capture_output=True, text=True).stdout.split()[0])
     log_text = open(a.log, errors='replace').read()
     mods, syms = modules_from(log_text), symbols_from(a.symbols)

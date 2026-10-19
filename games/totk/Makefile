@@ -300,6 +300,13 @@ probe-dirty-race:
 	xcrun clang -std=gnu11 -O1 -Wall -Wextra -Werror -Wno-unused-function -Ithird_party/d2r_gfx/gfx/nvn tests/dirty_race/probe.c -o build/dirty-race-probe
 	build/dirty-race-probe | tee analysis/dirty-race-probe.log
 
+.PHONY: probe-texels-rect
+# CPU only: rectangle block-linear copies for ReadTexels / WriteTexels against the whole-level copies (random storage), with negative controls.
+probe-texels-rect:
+	@mkdir -p build analysis
+	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn -Ithird_party/d2r_gfx/gfx/tex tests/texels_rect/probe.c third_party/d2r_gfx/gfx/nvn/nvn_tex.c third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c -o build/texels-rect-probe
+	build/texels-rect-probe | tee analysis/texels-rect-probe.log
+
 .PHONY: probe-pool-index
 # CPU only: memory pool address index vs the old linear scan, with two negative controls and a timing line.
 probe-pool-index:

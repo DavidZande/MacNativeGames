@@ -80,7 +80,7 @@ static range_t *find(uintptr_t a) {
     for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) { recent[next++ & 7] = &g_r[i]; return &g_r[i]; }
     return NULL;
 }
-/* TOTK diagnostic (on with DM_NVN_TILELOG): a ring of the latest page unprotections with the writer, read by
+/* TOTK diagnostic (on by default, DM_NVN_DIRTYREC=0 off): a ring of the latest page unprotections with the writer, read by
    nvn_dirty_recent: game writes (fault: pc / lr of the faulting code) and host writes (dm_guest_write_prepare caller). */
 #include <sys/ucontext.h>
 static nvn_dirty_rec g_drec[4096]; static _Atomic uint64_t g_drec_n; static int g_drec_on;
@@ -94,6 +94,16 @@ int nvn_dirty_recent(uintptr_t lo, uintptr_t hi, nvn_dirty_rec *out, int max) {
     for (uint64_t j = n > 4096 ? n - 4096 : 0; j < n && k < max; j++) { nvn_dirty_rec r = g_drec[j % 4096]; if (r.page >= lo && r.page < hi) out[k++] = r; }
     return k;
 }
+/* TOTK write barrier (hle_nvn.c write_barrier, registered with TOTK_FENCE_LAG): with the frame fence answered one frame
+   late, the game rewrites texture memory (UI text) while the previous frame's replay has still to read it, and that frame
+   showed the new bytes. Before a game write or a host write on the game's behalf takes a protected page, the barrier
+   waits for the queued replays. It runs before the page goes BUSY (the replay never waits for it). src 0: guest write
+   fault at pc; 1: host write (dm_guest_write_prepare). Graphics-layer writers suppress it (nvn_dirty_barrier_suppress). */
+static void (*g_barrier)(int src, uint64_t pc);
+static __thread int t_nobar;
+void nvn_dirty_set_barrier(void (*fn)(int src, uint64_t pc)) { g_barrier = fn; }
+void nvn_dirty_barrier_suppress(int d) { t_nobar += d; }
+int nvn_dirty_barrier_active(void) { return g_barrier != NULL; }
 static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态从 PROT 改成 BUSY | The caller has already changed the state from PROT to BUSY
     mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
     uint64_t g = atomic_fetch_add(&g_now, 1) + 1, l = atomic_load(&r->latest);
@@ -106,6 +116,7 @@ static int on_fault(void *addr, int is_write, void *uc) {
     range_t *r = is_write ? find((uintptr_t)addr) : NULL;
     if (!r) return 0;
     uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift;
+    if (g_barrier && uc && atomic_load(&r->state[p]) == PG_PROT) g_barrier(0, ((ucontext_t *)uc)->uc_mcontext->__ss.__pc);
     uint8_t st = PG_PROT;
     if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_faults, 1);
         if (g_drec_on && uc) { _STRUCT_MCONTEXT64 *mc = ((ucontext_t *)uc)->uc_mcontext; drec_add(r->base + (p << g_shift), mc->__ss.__pc, mc->__ss.__lr, 0); }
@@ -113,8 +124,19 @@ static int on_fault(void *addr, int is_write, void *uc) {
     if (st == PG_BUSY) return busy_wait(r, p);   // 别的线程正在改这页的保护：等它改完重执行（改成了只读就再缺页一次、走上面那一支） | Another thread is changing this page's protection: wait for it to finish and re-execute (if it became read-only, it faults once more and takes the branch above)
     return atomic_load(&r->gen[p]) != 0;   // 刚被别的线程解掉（本次缺页发生在解之前）：重执行；从未保护过的页不是我们的 | Just unprotected by another thread (this fault happened before the unprotect): re-execute; pages that were never protected are not ours
 }
+static int any_prot(uintptr_t a, uintptr_t e) {   // a protected page in [a, e)
+    while (a < e) {
+        range_t *r = find(a);
+        if (!r) { a = (a + g_pg) & ~(g_pg - 1); continue; }
+        uintptr_t stop = e < r->end ? e : r->end;
+        for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q; p++) if (atomic_load(&r->state[p]) == PG_PROT) return 1;
+        a = stop;
+    }
+    return 0;
+}
 static void prep_write(void *addr, size_t len) {
     uintptr_t a = (uintptr_t)addr, e = a + len;
+    if (g_barrier && !t_nobar && len && any_prot(a, e)) g_barrier(1, dm_host_write_pc);
     while (len && a < e) {
         range_t *r = find(a);
         if (!r) { a = (a + g_pg) & ~(g_pg - 1); continue; }
@@ -154,7 +176,7 @@ void nvn_dirty_gpu_write_end(void *tok) {
 
 void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;
-    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); g_drec_on = getenv("DM_NVN_TILELOG") != NULL; }
+    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); { const char *e = getenv("DM_NVN_DIRTYREC"); g_drec_on = !(e && !strcmp(e, "0")) || getenv("DM_NVN_TILELOG"); } }   // TOTK: on by default (the hot-texture log in nvn_mtl.m names the writers); DM_NVN_DIRTYREC=0 off
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);

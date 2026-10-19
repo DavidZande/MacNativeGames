@@ -38,6 +38,11 @@ static void *thread_b(void *arg) {
     if (!g_negative) g_prep(g_page, 16);
     atomic_store(&g_b_done, 1); return NULL;
 }
+static int g_bar_n, g_bar_src, g_bar_state; static uint8_t *g_bar_base;
+static void probe_barrier(int src, uint64_t pc) {   // records the call and the state of the first page of the probe range
+    (void)pc; g_bar_n++; g_bar_src = src;
+    range_t *r = find((uintptr_t)g_bar_base); g_bar_state = r ? atomic_load(&r->state[0]) : -1;
+}
 int t_mprotect(void *a, size_t n, int prot) {   // A's read-only mprotect lands only after B had 100 ms to run
     if (prot == PROT_READ && atomic_exchange(&g_armed, 0)) { atomic_store(&g_go, 1); usleep(100000); }
     return mprotect(a, n, prot);
@@ -85,6 +90,28 @@ int main(void) {
     EXPECT("a write into the last of them is seen", 1, nvn_dirty_since(many + (size_t)(MANY - 1) * pg, 16, s2));
     EXPECT("a write into the first of them is seen", 1, nvn_dirty_since(many, 16, s2));
     EXPECT("an untouched one in between is clean", 0, nvn_dirty_since(many + (size_t)(MANY / 2) * pg, 16, s2));
+    /* TOTK write barrier: called once before a write takes a protected page, with the page still PROT (not BUSY, so the
+       replay never waits for the writer), src 0 for a fault and 1 for a host write; not for writable pages or when
+       suppressed (graphics-layer writes). */
+    uint8_t *wb = mmap(NULL, 4 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (wb == MAP_FAILED) { perror("mmap"); return 2; }
+    nvn_dirty_add_range(wb, 4 * pg);
+    g_bar_base = wb; nvn_dirty_set_barrier(probe_barrier);
+    nvn_dirty_protect(wb, 4 * pg);
+    wb[5] = 1;
+    EXPECT("barrier: one call for a write fault on a protected page", 1, g_bar_n);
+    EXPECT("barrier: source of that call is a fault (0)", 0, g_bar_src);
+    EXPECT("barrier: the page was still protected (not busy) then", PG_PROT, g_bar_state);
+    wb[6] = 2;
+    EXPECT("barrier: none for a second write to the now writable page", 1, g_bar_n);
+    g_prep(wb + pg, 16);
+    EXPECT("barrier: one call for a host write into a protected page", 2, g_bar_n);
+    EXPECT("barrier: source of that call is a host write (1)", 1, g_bar_src);
+    nvn_dirty_barrier_suppress(1); g_prep(wb + 2 * pg, 16); nvn_dirty_barrier_suppress(-1);
+    EXPECT("barrier: none for a suppressed (graphics-layer) host write", 2, g_bar_n);
+    g_prep(wb + pg, 16);
+    EXPECT("barrier: none for a host write into writable pages", 2, g_bar_n);
+    nvn_dirty_set_barrier(NULL);
     printf("{\"status\":\"%s\",\"checks\":%d,\"failed\":%d}\n", g_fail ? "fail" : "pass", g_checks, g_fail);
     return g_fail != 0;
 }

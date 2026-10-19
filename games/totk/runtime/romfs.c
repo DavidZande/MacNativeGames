@@ -39,6 +39,10 @@ static const uint8_t *image_map;
 static char mount_name[32];
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t read_calls,read_bytes,read_ns,read_prepare_ns,read_report_ns;
+/* Local change: always-on read totals for the per-frame timeline (hle_nvn.c, DM_NVN_TSV): calls, bytes, wall ns, and wall ns
+   on the main guest thread (0x1001). The image is memory-mapped: a first touch of its pages is a disk read inside the copy. */
+static _Atomic uint64_t rd_calls,rd_bytes,rd_ns,rd_main_ns;
+void runtime_romfs_read_stats(uint64_t out[4]){out[0]=atomic_load(&rd_calls);out[1]=atomic_load(&rd_bytes);out[2]=atomic_load(&rd_ns);out[3]=atomic_load(&rd_main_ns);}
 static uint64_t handles[NH]; /* file index + 1; 0 is free */
 /* Overlay (scripts/make_romfs_patches.py): files listed in <TOTK_ROMFS_PATCHES, default extracted/v0/romfs-patches>/manifest.tsv
    are served in place of the originals. Each line names a RomFS path, the overlay's size and SHA-256 and the original's
@@ -219,9 +223,10 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
  uint64_t n=size;if(n>fsize-(uint64_t)offset)n=fsize-(uint64_t)offset;uint64_t done=0;
  static _Atomic int profile_mode=-1;int profile=atomic_load(&profile_mode);if(profile<0){profile=getenv("TOTK_FS_TIMING")!=NULL;atomic_store(&profile_mode,profile);}uint64_t prep_start=profile?runtime_now_ns():0;
  dm_guest_write_prepare(buffer,(size_t)n);
- uint64_t t0=profile?runtime_now_ns():0;
+ uint64_t t0=runtime_now_ns();
  if(fd==image_fd&&image_map){memcpy(buffer,image_map+base+(uint64_t)offset,(size_t)n);done=n;}
  else while(done<n){size_t chunk=(size_t)(n-done);if(chunk>8<<20)chunk=8<<20;ssize_t r=src_pread(fd,(uint8_t *)buffer+done,chunk,(off_t)(base+(uint64_t)offset+done));if(r<=0)runtime_fail("RomFS read failure");done+=(uint64_t)r;}
+ {uint64_t d=runtime_now_ns()-t0;atomic_fetch_add(&rd_calls,1);atomic_fetch_add(&rd_bytes,done);atomic_fetch_add(&rd_ns,d);if(runtime_thread_current_handle()==0x1001)atomic_fetch_add(&rd_main_ns,d);}
  if(profile){uint64_t now=runtime_now_ns();atomic_fetch_add(&read_calls,1);atomic_fetch_add(&read_bytes,done);atomic_fetch_add(&read_ns,now-t0);atomic_fetch_add(&read_prepare_ns,t0-prep_start);
   uint64_t last=atomic_load(&read_report_ns);
   if(now-last>1000000000ULL&&atomic_compare_exchange_strong(&read_report_ns,&last,now))
