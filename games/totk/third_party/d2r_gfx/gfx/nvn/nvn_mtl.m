@@ -388,8 +388,11 @@ static uint64_t g_pool_query_checked;
 static int pool_query_on(void) {
     int value = atomic_load_explicit(&g_pool_query_on, memory_order_relaxed);
     if (value < 0) {
-        const char *env = getenv("TOTK_POOL_QUERY_CACHE");
-        int initial = env && atoi(env), expected = -1;
+        /* Local change: on by default (=0 off). It saves the pool table search on every uniform / vertex binding of the
+           replay (pool_query was ~4% of it in the busy area). TOTK_POOL_QUERY_CHECK=1 compares every hit with the full search. */
+        const char *env = getenv("TOTK_POOL_QUERY_CACHE"), *chk = getenv("TOTK_POOL_QUERY_CHECK");
+        int initial = !(env && !atoi(env)), expected = -1;
+        if (chk && atoi(chk)) atomic_store(&g_pool_query_check, 1);
         atomic_compare_exchange_strong(&g_pool_query_on, &expected, initial);
         value = atomic_load_explicit(&g_pool_query_on, memory_order_relaxed);
     }
@@ -820,7 +823,9 @@ static uint64_t g_usnap_index_hits, g_usnap_index_misses, g_usnap_index_verified
 static int g_usnap_index_negative;
 static int usnap_index_on(void) {
     int v=atomic_load(&g_usnap_index_on);
-    if(v<0){const char *e=getenv("TOTK_USNAP_INDEX");v=e && atoi(e);atomic_store(&g_usnap_index_on,v);}
+    /* Local change: on by default (=0 off): a hint per address bucket instead of a binary search of the snapshot list for
+       every uniform binding (usnap_find_slow was ~3% of the replay). TOTK_USNAP_INDEX_CHECK=1 checks every hit. */
+    if(v<0){const char *e=getenv("TOTK_USNAP_INDEX"),*c=getenv("TOTK_USNAP_INDEX_CHECK");v=!(e && !atoi(e));if(c && atoi(c))atomic_store(&g_usnap_index_check,1);atomic_store(&g_usnap_index_on,v);}
     return v;
 }
 static void usnap_copy_one(usnap_t *c);
@@ -1141,8 +1146,8 @@ static uint64_t g_arg_bind_sets, g_arg_bind_skips;
 static int arg_bind_cache_on(void) {
     int value = atomic_load_explicit(&g_arg_bind_cache_on, memory_order_relaxed);
     if (value < 0) {
-        const char *env = getenv("TOTK_ARG_BIND_CACHE");
-        int initial = env && atoi(env), expected = -1;
+        const char *env = getenv("TOTK_ARG_BIND_CACHE");   // local change: on by default (=0 off), see the replay profile in TOTK_TEX_SLOTS
+        int initial = !(env && !atoi(env)), expected = -1;
         atomic_compare_exchange_strong(&g_arg_bind_cache_on, &expected, initial);
         value = atomic_load_explicit(&g_arg_bind_cache_on, memory_order_relaxed);
     }
@@ -1547,7 +1552,9 @@ static uint64_t g_shadow_index_hits, g_shadow_index_misses, g_shadow_index_verif
 static int g_shadow_index_stale_probe;
 static int shadow_index_on(void) {
     int v = atomic_load(&g_shadow_index_on);
-    if (v < 0) { const char *e=getenv("TOTK_SHADOW_INDEX"); v=e && atoi(e); atomic_store(&g_shadow_index_on,v); }
+    /* Local change: on by default (=0 off): an index instead of a linear search of up to 512 renamed-uniform copies for
+       every uniform binding (upd_shadow was ~7% of the replay in the busy area). TOTK_SHADOW_INDEX_CHECK=1 checks every hit. */
+    if (v < 0) { const char *e=getenv("TOTK_SHADOW_INDEX"),*c=getenv("TOTK_SHADOW_INDEX_CHECK"); v=!(e && !atoi(e)); if (c && atoi(c)) atomic_store(&g_shadow_index_check,1); atomic_store(&g_shadow_index_on,v); }
     return v;
 }
 static unsigned shadow_index_slot(uint64_t lo, uint64_t size) {
@@ -2185,7 +2192,11 @@ typedef struct {
     uint64_t pass, arena, bindings, registry, serial, dirty, snapshot_drops, config;
 } arg_epoch_key;
 /* Texture/sampler slots can remain identical when only uniform bindings change.
-   Keep the publication lock, resource generations and pass lifetime. Default off. */
+   Keep the publication lock, resource generations and pass lifetime.
+   Local change (2026-10-19): on by default (=0 off), with the pool query cache, the uniform snapshot and shadow indexes,
+   the argument-bind cache and the driver-constant cache. The replay of the game's ~4,900 draws per frame runs on the game's
+   main thread and was ~55% of its time in the busy area, spread over these per-binding lookups.
+   TOTK_TEX_SLOTS_CHECK=1 checks every hit. */
 typedef struct { uint64_t pass, arena, registry, serial, dirty, owned, stage; } tex_slot_key;
 typedef struct {
     tex_slot_key key;
@@ -2198,7 +2209,7 @@ static int g_tex_slots_negative;
 static int tex_slots_on(void) {
     int v = atomic_load_explicit(&g_tex_slots_on, memory_order_relaxed);
     if (v < 0) {
-        const char *e = getenv("TOTK_TEX_SLOTS"); v = e && atoi(e); atomic_store(&g_tex_slots_on, v);
+        const char *e = getenv("TOTK_TEX_SLOTS"); v = !(e && !atoi(e)); atomic_store(&g_tex_slots_on, v);
         e = getenv("TOTK_TEX_SLOTS_CHECK"); atomic_store(&g_tex_slots_check, e && atoi(e));
     }
     return v;
@@ -4879,14 +4890,17 @@ static __unsafe_unretained NvProg *prog_get_cached(const prog_t *cp) {   // subm
     if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; }
     return have;
 }
-static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
+/* Returns a bridged pointer, not an object: ARC ignores __unsafe_unretained on a return type, so returning NvProg * cost a
+   retain + autorelease + claim on every draw even on the cached path (~4% of the replay in the busy area, 2026-10-19).
+   prog_get() below casts it back for __unsafe_unretained locals; the program is owned by the serial table. */
+static void *prog_get_raw(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
     uint64_t gen = g_ser_gen;
     uint64_t xg = prog_gen();
-    if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser)) && !(lpr->missing && lpr->xgen != xg)) { lgen = gen; return lpr; }
+    if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser)) && !(lpr->missing && lpr->xgen != xg)) { lgen = gen; return (__bridge void *)lpr; }
     __unsafe_unretained NvProg *have = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
-    if (have && !(have->missing && have->xgen != xg)) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
+    if (have && !(have->missing && have->xgen != xg)) { lp = p; lser = p->serial; lgen = gen; lpr = have; return (__bridge void *)have; }
     if (have) { lp = NULL; lpr = nil; }   /* a background translation landed: build this program again (local change) */
     shmap_load();
     NvProg *o = [NvProg new]; o->xgen = xg;
@@ -4913,9 +4927,10 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
         o->sh[st]=sh; o->ctl[st]=control; o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data; o->key[st]=@(key);
         o->sig[st]=stage_sig(st); o->alt[st]=[NSMutableDictionary dictionaryWithObject:sh forKey:@(o->sig[st])];
     }
-    if (p->serial) serial_put(p->serial, o);
-    return o;
+    if (p->serial) { serial_put(p->serial, o); return (__bridge void *)o; }   // the serial table holds it
+    return (void *)CFAutorelease((__bridge_retained CFTypeRef)o);   // no serial: alive until the pool drains, as the autoreleased return was
 }
+#define prog_get(cp) ((__bridge NvProg *)prog_get_raw(cp))
 void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
 
 // ---------- 描述符池：贴图号 / 采样器号 → 对象 ----------
@@ -6592,7 +6607,7 @@ static void driver_cache_check_set(int v) { atomic_store(&g_driver_cache_check, 
 static void driver_cache_set(int v) { atomic_store(&g_driver_cache_on, v != 0); MLOG("[flag] drv_cache = %d", v != 0); }
 static int driver_cache_on(void) {
     int v = atomic_load(&g_driver_cache_on);
-    if (v < 0) { const char *e = getenv("TOTK_DRV_CACHE"); v = e && !strcmp(e, "1"); atomic_store(&g_driver_cache_on, v); }
+    if (v < 0) { const char *e = getenv("TOTK_DRV_CACHE"); v = !(e && !strcmp(e, "0")); atomic_store(&g_driver_cache_on, v); }   // local change: on by default (=0 off); TOTK_DRV_CACHE_CHECK checks it
     return v;
 }
 static void driver_bank_fill(uint8_t *d, int bank, int stage) {
