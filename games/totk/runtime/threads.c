@@ -248,18 +248,34 @@ int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_cor
 
 // Local change (TOTK_WAITSTAT=<thread handle>, e.g. 0x1004): what one guest thread waits on (kind, address, the thread
 // that woke it, the guest caller) and for how long. Holding G. Logged every 5 s as "[totk] waits of".
-static uint32_t ws_handle(void) { static int r; static uint32_t h; if (!r) { const char *e = getenv("TOTK_WAITSTAT"); h = e ? (uint32_t)strtoul(e, NULL, 0) : 0; r = 1; } return h; }
+/* TOTK_WAITSTAT: a thread handle (0x1004), a comma list of handles, or "all" (every guest thread). Each watched thread
+   keeps its own table (local change, 2026-10-19: it was one thread with one shared table). Holding G. */
+enum { WS_THREADS = 48, WS_N = 24 };
+typedef struct { uint64_t addr, lr, ns, n; uint32_t by; int kind; } ws_ent;
+static struct { uint32_t handle; uint64_t last; ws_ent e[WS_N]; } g_ws[WS_THREADS];
+static int g_ws_all; static uint32_t g_ws_list[8]; static int g_ws_nlist = -1;
+static int ws_watched(uint32_t h) {
+    if (g_ws_nlist < 0) {
+        const char *e = getenv("TOTK_WAITSTAT"); g_ws_nlist = 0;
+        if (e && !strcmp(e, "all")) g_ws_all = 1;
+        else for (const char *p = e; p && *p && g_ws_nlist < 8; ) { char *q; uint32_t v = (uint32_t)strtoul(p, &q, 0); if (q == p) break; if (v) g_ws_list[g_ws_nlist++] = v; p = *q == ',' ? q + 1 : q; }
+    }
+    if (g_ws_all) return 1;
+    for (int i = 0; i < g_ws_nlist; i++) if (g_ws_list[i] == h) return 1;
+    return 0;
+}
 static void ws_note(thr_t *t, int kind, uint64_t addr, uint64_t ns) {
-    enum { N = 24 };
-    static struct { uint64_t addr, lr, ns, n; uint32_t by; int kind; } e[N]; static uint64_t last;
+    int w = 0; while (w < WS_THREADS && g_ws[w].handle && g_ws[w].handle != t->handle) w++;
+    if (w == WS_THREADS) return;
+    g_ws[w].handle = t->handle; ws_ent *e = g_ws[w].e;
     uint32_t by = t->woke_by; int i = 0;
-    while (i < N && e[i].n && (e[i].addr != addr || e[i].by != by || e[i].kind != kind)) i++;
-    if (i == N) i = N - 1;
+    while (i < WS_N && e[i].n && (e[i].addr != addr || e[i].by != by || e[i].kind != kind)) i++;
+    if (i == WS_N) i = WS_N - 1;
     if (e[i].addr != addr || e[i].by != by || e[i].kind != kind) { e[i].addr = addr; e[i].by = by; e[i].kind = kind; e[i].ns = e[i].n = 0; }
     e[i].lr = t->last_lr; e[i].ns += ns; e[i].n++;
-    uint64_t now = now_ns(); if (!last) last = now; if (now - last < 5000000000ull) return;
-    double secs = (now - last) / 1e9; last = now;
-    for (int k = 0; k < N && e[k].n; k++) {
+    uint64_t now = now_ns(); if (!g_ws[w].last) g_ws[w].last = now; if (now - g_ws[w].last < 5000000000ull) return;
+    double secs = (now - g_ws[w].last) / 1e9; g_ws[w].last = now;
+    for (int k = 0; k < WS_N && e[k].n; k++) {
         if (e[k].ns / secs > 1e6)
             fprintf(stderr, "[totk] waits of %#x (host thread %llu): kind %d addr %#llx woken by %#x %.1f ms/s %.0f waits/s, caller lr %#llx\n", t->handle, (unsigned long long)t->tid, e[k].kind,
                     (unsigned long long)e[k].addr, e[k].by, e[k].ns / 1e6 / secs, e[k].n / secs, (unsigned long long)e[k].lr);
@@ -274,7 +290,7 @@ static void tl_gblock(thr_t *t, int kind, uint64_t t0, uint32_t waker) {
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
     uint64_t b0 = t == g_main_thr && kind >= 1 && kind <= 4 ? now_ns() : 0;
-    uint64_t w0 = ws_handle() && t->handle == ws_handle() ? now_ns() : 0, wa = kind == 2 ? t->wkey : t->waddr;
+    uint64_t w0 = ws_watched(t->handle) ? now_ns() : 0, wa = kind == 2 ? t->wkey : t->waddr;
     t->woke_by = 0;
     uint64_t tl0 = now_ns();
     core_put(t); int64_t r = block_inner(t, kind, ns);
