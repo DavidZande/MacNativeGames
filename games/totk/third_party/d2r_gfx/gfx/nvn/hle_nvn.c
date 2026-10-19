@@ -554,7 +554,13 @@ static int sync_chain_left(int k) {
     if (lim == -2) { const char *e = getenv("TOTK_SYNC_CHAIN"); lim = e ? atoi(e) : 0; from = e && strchr(e, ':') ? strtoull(strchr(e, ':') + 1, NULL, 10) : 0; }
     return lim > 0 && g_frame >= from && atomic_fetch_add(&used[k], 1) < lim;
 }
-NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; int tok; uint64_t v = fence_now(&tok); ((sync_t *)s)->fenced = tok ? 5 : 1; ((sync_t *)s)->fence = v;
+static int fence_lag_on(void);
+static struct { int fenced; uint64_t fence; } g_lag_prev;   /* TOTK_FENCE_LAG: the frame fence's previous placement */
+static uint64_t g_lag_waits, g_lag_early;
+static int is_frame_fence(const NVNsync *s) { return g_game_sys && (uintptr_t)s == *(const uintptr_t *)(uintptr_t)(g_game_sys + 0x1d8); }
+NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; int tok; uint64_t v = fence_now(&tok);
+    if (fence_lag_on() && is_frame_fence(s)) { g_lag_prev.fenced = ((sync_t *)s)->fenced; g_lag_prev.fence = ((sync_t *)s)->fence; }
+    ((sync_t *)s)->fenced = tok ? 5 : 1; ((sync_t *)s)->fence = v;
     if (sync_chain_left(0)) { char w[96]; snprintf(w, sizeof w, "FenceSync sync=%p fence=%llu cond=%d flags=%d", (void *)s, (unsigned long long)v, (int)c, f); guest_chain(w); } }
 // 没围栏过的同步对象按真机行为等到超时；已围栏的只在 GPU 真正完成到该栅栏值后放行
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
@@ -566,6 +572,12 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    sync_t lag;   /* TOTK_FENCE_LAG: the frame fence waits for the previous frame's placement instead */
+    if (fence_lag_on() && is_frame_fence(s) && g_lag_prev.fenced) {
+        lag = (sync_t){o->magic, g_lag_prev.fenced, g_lag_prev.fence}; o = &lag; g_lag_waits++;
+        if ((g_lag_waits & 1023) == 1) LOG("[nvn] fence lag: %llu frame-fence waits answered one frame late, %llu of them before the current frame's fence", (unsigned long long)g_lag_waits, (unsigned long long)g_lag_early);
+        int ctok = (((const sync_t *)s)->fenced & 4) != 0; if (!(ctok ? fence_wait(((const sync_t *)s)->fence, 0) : mtl_wait(((const sync_t *)s)->fence, 0))) g_lag_early++;
+    }
     int k = (o->fenced & 2) != 0, lg = synclog_env();
     if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
@@ -804,13 +816,33 @@ static void copy_touch(NVNcommandHandle h, uint64_t now) {
 }
 
 static uint64_t g_copy_drop_readd, g_copy_drop_token, g_copy_mark_faults;   /* why copies were released: their control memory was added again / their mark there is gone (of those: unmapped) */
+/* Local change (TOTK_FENCE_LAG, 2026-10-19): with the frame fence answered one frame late the game re-adds a command
+   buffer's control memory, and so retires its copies, while the translation thread may still replay the previous frame
+   from them. Such copies are retired (magic cleared: a later submit of the handle still stops) but their memory is kept
+   until the translation thread has run every submission queued at that moment. g_copy_mu held. */
+static int fence_lag_on(void);
+static uint64_t x_sub_queued(void), x_sub_ran(void);
+typedef struct { copy_prefix *pf; uint64_t after; } copy_grave;
+static copy_grave *g_grave; static size_t g_ngrave, g_capgrave;
+static void grave_reap(void) {
+    if (!g_ngrave) return;
+    uint64_t ran = x_sub_ran(); size_t k = 0;
+    for (size_t i = 0; i < g_ngrave; i++) { if (g_grave[i].after <= ran) free(g_grave[i].pf); else g_grave[k++] = g_grave[i]; }
+    g_ngrave = k;
+}
+static void copy_free(copy_prefix *pf) {
+    if (!fence_lag_on()) { free(pf); return; }
+    grave_reap();
+    if (g_ngrave == g_capgrave) { g_capgrave = g_capgrave ? g_capgrave * 2 : 1024; g_grave = realloc(g_grave, g_capgrave * sizeof *g_grave); if (!g_grave) die("retired command copies"); }
+    g_grave[g_ngrave++] = (copy_grave){pf, x_sub_queued()};
+}
 static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu held: release copy i of bucket b */
     cmd_copy *c = &b->v[i];
     c->stale_at = g_submits + 1;
     copy_prefix *pf = (copy_prefix *)(c->copy - sizeof(copy_prefix));
     if (cmdlog_env()) LOG("[cmd] free copy=%p%s", (void *)c->copy, by_token ? " (its mark in the control memory is gone)" : "");
     g_freed[g_nfreed++ % FREED_RING] = (typeof(g_freed[0])){(uintptr_t)c->copy, g_submits, c->stale_at, pf->used_at, pf->made_at, c->ctl_lo};
-    pf->magic = 0; g_copy_bytes -= malloc_size(pf); free(pf); b->v[i] = b->v[--b->n]; g_ncopies--;
+    pf->magic = 0; g_copy_bytes -= malloc_size(pf); copy_free(pf); b->v[i] = b->v[--b->n]; g_ncopies--;
     if (by_token) g_copy_drop_token++; else g_copy_drop_readd++;
     if (!b->n && !b->empty) { b->empty = 1; g_cbk_empty++; }
 }
@@ -1926,7 +1958,20 @@ static void x_drain(void) {   // everything queued so far has run (no-op when sy
     uint64_t t0 = now_ns(); x_wait_job(want);
     atomic_fetch_add(&g_x_drains, 1); atomic_fetch_add(&g_x_drain_ns, now_ns() - t0);
 }
-void nvn_x_drain(void) { x_drain(); }   // for the graphics layer (pool invalidate write-back)
+void nvn_x_drain(void) { x_drain(); }
+static uint64_t x_sub_queued(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); return v; }
+static uint64_t x_sub_ran(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_done; pthread_mutex_unlock(&g_xq_mu); return v; }
+/* Local change (TOTK_FENCE_LAG=1, experiment, needs TOTK_ASYNC_REPLAY=1): the game keeps one frame in flight. Its main
+   thread waits on the frame fence (game system +0x1d8, fenced by the render thread right after the frame's submit,
+   main+0x87ff24) with no timeout (main+0xa91f98), so the frame's whole replay plus its GPU work sat on the main thread's
+   path. Answered one frame late, that wait returns when the PREVIOUS frame's fence is reached, and the replay of the
+   frame just submitted overlaps the game's next frame. Uniform contents are copied at submit in this mode; other memory
+   the game rewrites after the wait is not (the experiment is to see whether that shows). */
+static int fence_lag_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_FENCE_LAG"); v = e && atoi(e) && async_replay(); if (e && atoi(e)) LOG("[nvn] frame fence one frame late (TOTK_FENCE_LAG): %s", v ? "on" : "off (needs TOTK_ASYNC_REPLAY=1)"); }
+    return v;
+}   // for the graphics layer (pool invalidate write-back)
 // Fence token for FenceSync: submits enqueued so far (async) or the Metal fence (synchronous).
 static uint64_t fence_now(int *token) {
     if (!async_replay()) { *token = 0; return mtl_last_fence(); }
@@ -1967,6 +2012,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         g_def_ns += now_ns() - r0;
         if (((queue_t *)q)->submits % 600 == 0) LOG("[nvn] 延迟绑定 至提交 %llu：提交时读句柄 %llu 次，其中与录制时不同 %llu 次；每次提交读句柄平均 %.3f ms", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
     }
+    if (fence_lag_on()) { pthread_mutex_lock(&g_copy_mu); grave_reap(); pthread_mutex_unlock(&g_copy_mu); }   /* retired copies the replay has passed */
     if (async_replay()) {
         xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1))};
         if (!j.h) die("submit job");

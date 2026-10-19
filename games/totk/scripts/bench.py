@@ -63,6 +63,7 @@ def config_env(name):
         elif p == 'freecores': env['TOTK_FREE_CORES'] = '1'   # no Switch core arbitration between guest threads
         elif p == 'fine': env.update(DM_PRESENT_HZ='120', TOTK_INTERVAL_SCALE='2')   # 60 FPS cap paced on 120 Hz ticks
         elif p == 'replay': env['TOTK_ASYNC_REPLAY'] = '1'   # submit replay and Metal encoding on the translation thread
+        elif p == 'lag': env.update(TOTK_ASYNC_REPLAY='1', TOTK_FENCE_LAG='1')   # translation thread + the frame fence answered one frame late (experiment)
         elif p == 'check': env.update(TOTK_POOL_QUERY_CHECK='1', TOTK_USNAP_INDEX_CHECK='1', TOTK_SHADOW_INDEX_CHECK='1', TOTK_TEX_SLOTS_CHECK='1', TOTK_DRV_CACHE_CHECK='1')   # replay caches compare every hit with the full lookup (stops on a mismatch)
         elif p == 'noprime': env['TOTK_XLATE_PRIME'] = '0'   # translated libraries compiled on the render thread (before this fix)
         elif p in ('qosutil', 'qosdef', 'qosinit'): env['TOTK_COMPILE_QOS'] = {'qosutil': 'utility', 'qosdef': 'default', 'qosinit': 'initiated'}[p]
