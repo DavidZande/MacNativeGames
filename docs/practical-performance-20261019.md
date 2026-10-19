@@ -5,6 +5,9 @@ in this save. They do not demonstrate a new same-quality FPS improvement from
 the runtime cleanup. These are offscreen rendering measurements, not visible
 presentation FPS or a guarantee for other areas of the game.
 
+Single slow frames during play (the evening's hitch investigation and fixes) are recorded separately in
+[play-hitches-20261019.md](play-hitches-20261019.md).
+
 This is the consolidated record for David's M1 Pro / 16 GB, TOTK 1.0.0
 workspace. It includes the later binding-cache experiments. Earlier M3/M4 and
 1.4.3 records remain separate; their results are not acceptance for this build.
