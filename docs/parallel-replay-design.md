@@ -1,5 +1,12 @@
 # Parallel replay: design notes (2026-10-19)
 
+**Outcome (later the same day):** a cheaper route made the parallel replay unnecessary for the busy area. Decompiling
+the frame-sync class showed the game keeps one frame in flight and waits on the frame fence with no timeout, under its
+graphics mutex. With the translation thread on, that wait is now answered when the previous frame's fence is reached
+(`TOTK_FENCE_LAG`, on by default with `TOTK_ASYNC_REPLAY`), so the replay overlaps the game's next frame: 54.0 -> 59.7
+FPS standing, 58.9 -> 60.2 panning, no single-frame anomalies in ~7,700 frames. The staged plan below remains the route
+if a heavier scene keeps the replay longer than a frame.
+
 ## Why the replay matters
 
 Busy area (David's save, ~4,900 draws, ~104 render passes and ~365 inline uniform updates per frame; 60 cap with fine

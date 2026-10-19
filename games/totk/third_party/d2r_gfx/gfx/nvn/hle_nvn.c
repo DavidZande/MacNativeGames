@@ -816,11 +816,12 @@ static void copy_touch(NVNcommandHandle h, uint64_t now) {
 }
 
 static uint64_t g_copy_drop_readd, g_copy_drop_token, g_copy_mark_faults;   /* why copies were released: their control memory was added again / their mark there is gone (of those: unmapped) */
-/* Local change (TOTK_FENCE_LAG, 2026-10-19): with the frame fence answered one frame late the game re-adds a command
-   buffer's control memory, and so retires its copies, while the translation thread may still replay the previous frame
-   from them. Such copies are retired (magic cleared: a later submit of the handle still stops) but their memory is kept
-   until the translation thread has run every submission queued at that moment. g_copy_mu held. */
-static int fence_lag_on(void);
+/* Local change (2026-10-19): with the translation thread (TOTK_ASYNC_REPLAY) a copy can be retired -- its control memory
+   added again, or its mark there gone -- while a submission already queued still replays from it (more so with the frame
+   fence answered one frame late, TOTK_FENCE_LAG). Such copies are retired (magic cleared: a later submit of the handle
+   still stops) but their memory is kept until the translation thread has run every submission queued at that moment.
+   This also lets the copy marks work with the translation thread. g_copy_mu held. */
+static int async_replay(void);
 static uint64_t x_sub_queued(void), x_sub_ran(void);
 typedef struct { copy_prefix *pf; uint64_t after; } copy_grave;
 static copy_grave *g_grave; static size_t g_ngrave, g_capgrave;
@@ -831,7 +832,7 @@ static void grave_reap(void) {
     g_ngrave = k;
 }
 static void copy_free(copy_prefix *pf) {
-    if (!fence_lag_on()) { free(pf); return; }
+    if (!async_replay()) { free(pf); return; }
     grave_reap();
     if (g_ngrave == g_capgrave) { g_capgrave = g_capgrave ? g_capgrave * 2 : 1024; g_grave = realloc(g_grave, g_capgrave * sizeof *g_grave); if (!g_grave) die("retired command copies"); }
     g_grave[g_ngrave++] = (copy_grave){pf, x_sub_queued()};
@@ -870,10 +871,10 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
 #define COPY_TOKEN_MAGIC 0x4e454b4f54594d43ull
 extern __thread sigjmp_buf *runtime_fault_guard;   // runtime/loader.c: a guarded read of guest memory survives a fault
 static int async_replay(void);   /* below: TOTK_ASYNC_REPLAY */
-/* With the translation thread (TOTK_ASYNC_REPLAY=1, iPhone default) the game may reuse a submitted command buffer's control
-   memory as soon as the submit call returns, before the queued replay used the copy: marks are not used there yet (a copy
-   last submitted at or after the submission being replayed would have to be kept). */
-static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0")) && !async_replay();
+/* With the translation thread the game may reuse a submitted command buffer's control memory as soon as the submit call
+   returns, before the queued replay used the copy: a copy retired then is kept until the queued submissions have run
+   (copy_free), so the marks work in both modes (local change, 2026-10-19; before, they were off with the translation thread). */
+static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0"));
     if (!v) LOG("[cmd] 录制副本记号：关（%s）：副本只在控制内存被重新加入时释放", e && !strcmp(e, "0") ? "TOTK_COPY_TOKEN=0" : "翻译线程模式还不支持"); } return v; }
 static void copy_token_write(uintptr_t at, const uint8_t *copy) { uint64_t v[2] = {COPY_TOKEN_MAGIC, (uint64_t)(uintptr_t)copy}; memcpy((void *)at, v, sizeof v); }
 static int copy_token_negative(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); v = e && atoi(e) == 22; } return v; }   /* probe negative 22: marks never checked */
@@ -1884,7 +1885,8 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 //    job of that image's last present, then for its present ticket as before. The replay frame number travels in the job.
 //  - Operations that destroy or read Metal state (pool / texture / program finalize, ReadTexels / WriteTexels, QueueFinish,
 //    suspend) wait until the queue is empty first (x_drain), so they never overtake a queued replay that still uses them.
-// TOTK_ASYNC_REPLAY=0 (default for now) runs everything on the calling thread as before.
+// TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. Local change (2026-10-19): on by default, together with
+// TOTK_FENCE_LAG (see fence_lag_on): alone it only moved the wait from the graphics mutex to the frame fence.
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
 typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
 #define XQ 64
@@ -1897,7 +1899,7 @@ static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swa
 static _Atomic uint64_t g_x_drains, g_x_drain_ns;
 static int async_replay(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e && atoi(e) > 0; if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
+    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = !(e && atoi(e) <= 0); if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
@@ -1961,7 +1963,7 @@ static void x_drain(void) {   // everything queued so far has run (no-op when sy
 void nvn_x_drain(void) { x_drain(); }
 static uint64_t x_sub_queued(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); return v; }
 static uint64_t x_sub_ran(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_done; pthread_mutex_unlock(&g_xq_mu); return v; }
-/* Local change (TOTK_FENCE_LAG=1, experiment, needs TOTK_ASYNC_REPLAY=1): the game keeps one frame in flight. Its main
+/* Local change (TOTK_FENCE_LAG, default on; needs the translation thread, TOTK_ASYNC_REPLAY): the game keeps one frame in flight. Its main
    thread waits on the frame fence (game system +0x1d8, fenced by the render thread right after the frame's submit,
    main+0x87ff24) with no timeout (main+0xa91f98), so the frame's whole replay plus its GPU work sat on the main thread's
    path. Answered one frame late, that wait returns when the PREVIOUS frame's fence is reached, and the replay of the
@@ -1969,7 +1971,8 @@ static uint64_t x_sub_ran(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_x
    the game rewrites after the wait is not (the experiment is to see whether that shows). */
 static int fence_lag_on(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_FENCE_LAG"); v = e && atoi(e) && async_replay(); if (e && atoi(e)) LOG("[nvn] frame fence one frame late (TOTK_FENCE_LAG): %s", v ? "on" : "off (needs TOTK_ASYNC_REPLAY=1)"); }
+    /* On by default since 2026-10-19 (busy area 54.0 -> 59.7 FPS standing, no single-frame anomalies); =0 turns it off. */
+    if (v < 0) { const char *e = getenv("TOTK_FENCE_LAG"); int want = !(e && !atoi(e)); v = want && async_replay(); LOG("[nvn] frame fence one frame late (TOTK_FENCE_LAG, =0 off): %s", v ? "on" : want ? "off (needs TOTK_ASYNC_REPLAY)" : "off"); }
     return v;
 }   // for the graphics layer (pool invalidate write-back)
 // Fence token for FenceSync: submits enqueued so far (async) or the Metal fence (synchronous).
@@ -2012,7 +2015,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         g_def_ns += now_ns() - r0;
         if (((queue_t *)q)->submits % 600 == 0) LOG("[nvn] 延迟绑定 至提交 %llu：提交时读句柄 %llu 次，其中与录制时不同 %llu 次；每次提交读句柄平均 %.3f ms", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
     }
-    if (fence_lag_on()) { pthread_mutex_lock(&g_copy_mu); grave_reap(); pthread_mutex_unlock(&g_copy_mu); }   /* retired copies the replay has passed */
+    if (async_replay()) { pthread_mutex_lock(&g_copy_mu); grave_reap(); pthread_mutex_unlock(&g_copy_mu); }   /* retired copies the replay has passed */
     if (async_replay()) {
         xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1))};
         if (!j.h) die("submit job");
