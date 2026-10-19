@@ -134,13 +134,21 @@ Native 2K changes the game's composition canvas and UI to 2560×1440. The 3D sce
 - Supports base 1.0.0, or base plus the separate 1.1.2 or 1.4.3 update NSP/NSZ. Other versions, DLC, combined packages, compressed base games (NSZ/XCZ) and personalized tickets remain unsupported. Mac only.
 - No online features, no amiibo.
 - New shaders can cause compilation stutters. Cache reuse reduces these, but does not guarantee stutter-free gameplay.
-- The 38 automated tests cover generated container/update fixtures, relocation formats, work-folder isolation, packaging, desktop migration, shader extraction, first-import cache preservation and 27 native RomFS path cases. GitHub Actions is configured to run the source tests and native path-parser sanitizers without game data or keys. A complete Mac build also passed with a local XCI-derived NSP fixture and generated common ticket. An independent retail base NSP and gameplay from that input have not yet been tested.
+- The local source suite now passes 45 tests covering generated container/update fixtures, relocation formats, work-folder isolation, packaging, desktop migration, shader extraction/import, compute warm-up discovery, uncapped benchmark controls, native frame logging and 27 native RomFS path cases. GitHub Actions is configured to run the source tests and native path-parser sanitizers without game data or keys. A complete Mac build also passed with a local XCI-derived NSP fixture and generated common ticket. That fixture validation is separate from the later local 1.0.0 NSP build; no new claim about independent retail-container coverage follows from its FPS tests.
 
 ## How it works
 
 See [docs/how-it-works.md](docs/how-it-works.md).
 
 Recorded performance experiments, remaining work and comparison methods: [Mac performance follow-ups](docs/performance-followups.md).
+
+The [2026-10-19 local performance findings](docs/practical-performance-20261019.md)
+cover the M1 Pro / 1.0.0 uncapped tests, tested changes, current app identity and
+next priorities. Compute warm-up and binding-cache experiments remain opt-in
+after showing no reliable steady FPS gain on that route. The
+[benchmark guide](docs/uncapped-benchmarks.md) documents uncapped measurements,
+phase previews, A/B windows and separate GPU capture; these results do not
+replace the M4 / 1.4.3 validation records.
 
 ## Acknowledgements
 
@@ -291,13 +299,15 @@ macOS 能识别的手柄（如 DualSense、Xbox 手柄）会映射为 Switch Pro
 - 支持本体 1.0.0，或本体加单独的 1.1.2 / 1.4.3 更新（NSP/NSZ）。其他版本、DLC、合并包、压缩本体（NSZ/XCZ）和个性化票据仍不支持。平台仅限 Mac。
 - 没有联网功能，没有 amiibo。
 - 首次遇到新着色器可能出现编译卡顿，缓存能减少重复编译，但不保证完全没有卡顿。
-- 38 项自动测试覆盖生成的容器 / 更新样本、重定位格式、工作目录隔离、打包、桌面入口迁移、着色器提取、首次导入的缓存保留及 27 个原生 RomFS 路径用例。GitHub Actions 已配置为运行源码测试和路径解析器内存检查，不需要游戏数据或密钥；另使用本地 XCI 构造、附带生成通用票据的 NSP 测试副本完成完整 Mac 打包。尚未验证独立的零售本体 NSP，也未测试从该类输入构建后的实际游玩。
+- 本地源码套件现有 45 项测试通过，覆盖生成的容器 / 更新样本、重定位格式、工作目录隔离、打包、桌面迁移、shader 提取/导入、compute 预热发现、无上限 benchmark 控制、原生逐帧日志及 27 个原生 RomFS 路径用例。GitHub Actions 已配置为运行源码测试和路径解析器内存检查，不需要游戏数据或密钥；此前使用本地 XCI 构造、附带生成通用票据的 NSP 副本完成完整 Mac 打包。该 fixture 验证与后来的本地 1.0.0 NSP 构建分开；本次 FPS 测试不新增独立零售容器覆盖的结论。
 
 ## 工作原理
 
 见 [docs/how-it-works.md](docs/how-it-works.md)。
 
 已做的性能实验、待办与对比方法见 [Mac 性能待做](docs/performance-followups.md)。
+
+[2026-10-19 本地性能结论](docs/practical-performance-20261019.md) 汇总 M1 Pro / 1.0.0 的无帧率上限测试、已验证改动、当前 App 身份及下一步。compute 预热和 binding cache 实验在该路线未证实稳定 FPS 收益，仍默认关闭。[benchmark 用法](docs/uncapped-benchmarks.md) 说明无上限测量、阶段预览、A/B 窗口和独立 GPU 采样；这些结果不替代 M4 / 1.4.3 的验证记录。
 
 ## 致谢
 

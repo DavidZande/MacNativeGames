@@ -204,6 +204,7 @@ int main(int argc, char **argv) {
               else setenv("DM_PRESENT_HZ", "60", 0);
           }
           else if ([fps isEqualToString:@"30"]) { setenv("TOTK_FPS60", "0", 0); setenv("DM_PRESENT_HZ", "60", 0); }
+          else { setenv("TOTK_UNCAPPED", "1", 0); setenv("TOTK_UNCAPPED_INTERVAL", "1", 0); }
           if ([d objectForKey:@"fpsCounter"] && ![d boolForKey:@"fpsCounter"]) setenv("TOTK_FPS_OVERLAY", "0", 0);
           if ([d objectForKey:@"shaderCounter"] && ![d boolForKey:@"shaderCounter"]) setenv("TOTK_SHADER_OVERLAY", "0", 0);
           if ([d objectForKey:@"loadCounter"] && ![d boolForKey:@"loadCounter"]) setenv("TOTK_LOAD_OVERLAY", "0", 0);

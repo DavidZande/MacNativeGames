@@ -1,5 +1,16 @@
 # Parallel replay: design notes (2026-10-19)
 
+**Current status after uncapped testing:** the [consolidated findings](practical-performance-20261019.md)
+supersede this note's performance priorities. The existing async replay and
+one-frame-late fence remain in use. The measured 1.0.0 world is now primarily
+GPU-limited (roughly 83–84 FPS standing at 900p); expanding parallel replay has
+not been implemented or shown to improve this workload. Simple argument-epoch
+and texture-plan fast paths were [checked and A/B tested](binding-fastpaths-experiment.md)
+without a reliable gain and remain off. The CPU profile and staged estimates
+below are historical proposals, not current savings or delivery estimates.
+The current benchmark rejects `60` / `fine` tokens; use the
+[uncapped commands](uncapped-benchmarks.md) instead.
+
 **Outcome (later the same day):** a cheaper route made the parallel replay unnecessary for the busy area. Decompiling
 the frame-sync class showed the game keeps one frame in flight and waits on the frame fence with no timeout, under its
 graphics mutex. With the translation thread on, that wait is now answered when the previous frame's fence is reached
@@ -66,8 +77,10 @@ Each stage is behind a flag, verified with the GPU probes and a checked busy-are
    read-only walk (the PSO predictor `pso_predict_rest` and the uniform-snapshot helpers already work this way) and fills
    per-command results the replay thread then only reads: programs for `BIND_PROGRAM`, texture / sampler views for bound
    handles, pool lookups for buffer bindings, pipeline keys. The replay thread checks a generation stamp and falls back
-   to its own lookup on any mismatch, so a wrong guess costs time, never correctness. Expected: most of the ~15% lookup
-   share, i.e. ~1-1.5 ms per frame off the critical path.
+   to its own lookup on any mismatch. Generation/lifetime handling still needs
+   independent correctness checks. The original ~1–1.5 ms estimate came from
+   this historical profile; no resolve-ahead implementation or measured saving
+   establishes it, and CPU savings need not improve a GPU-limited frame.
 2. **Move more Metal work to the encode stage (days).** Argument-table writes, blits and dispatch encoding that only need
    values the replay thread already resolved can go into the packet stream, so the replay thread stops making those calls
    (~8%) and waits less for B (~5%). B has ~35% headroom; a second B (compute / copies) is possible if it fills up.
@@ -76,5 +89,7 @@ Each stage is behind a flag, verified with the GPU probes and a checked busy-are
    several workers, each into its own MTL4 command buffer, committed in order. Needs the state inventory above turned
    into a per-worker context. Only worth starting if stages 1-2 leave the replay well above the GPU time.
 
-Stages 1 and 2 are independent of each other and keep the single walk, so they keep today's rendering behaviour by
-construction. Stage 3 is the real "parallel replay by render pass".
+Stages 1 and 2 retain a single walk, but that alone does not prove rendering
+equivalence: resource publication, snapshots, aliases, lifetime and command
+ordering still need validation. Stage 3 is the proposed "parallel replay by
+render pass" and remains unimplemented.

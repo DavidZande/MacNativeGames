@@ -81,6 +81,10 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             if (ra[@"sample_mask"]) o->writes_smask = [ra[@"sample_mask"] intValue] != 0;
             for (NSNumber *c in ra[@"colors"]) if (c.intValue >= 0 && c.intValue < 8) o->color_mask |= (uint8_t)(1u << c.intValue);
         }
+        NSDictionary *fout = [j[@"deps"] isKindOfClass:[NSDictionary class]] ? j[@"deps"][@"fout"] : nil;
+        if (!o->color_mask && [fout isKindOfClass:[NSDictionary class]]) {
+            for (NSString *k in fout) { int c = k.intValue; if (c >= 0 && c < 8) o->color_mask |= (uint8_t)(1u << c); }
+        }
         memset(o->uv_attr, -1, sizeof o->uv_attr); memset(o->uv_aff_attr, -1, sizeof o->uv_aff_attr);
         NSDictionary *ua = [ra isKindOfClass:[NSDictionary class]] ? ra[@"uv_affine"] : nil;
         if ([ua isKindOfClass:[NSDictionary class]]) for (NSString *k in ua) { int l = k.intValue; NSDictionary *e = ua[k]; int a = [e[@"attr"] intValue];

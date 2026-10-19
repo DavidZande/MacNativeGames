@@ -9,7 +9,7 @@ than a sampled call-stack attribution of those exact frames.
 
 ## Exact paged serial history
 
-Replace those two append-only hash sets with the production
+Those two append-only hash sets now use the production
 `totk_serial_set.h`: a sparse radix index into 65,536-bit pages, with a small
 page cache. Each stored fact uses one bit in its allocated page. A new page
 allocates at most five index nodes plus an 8 KiB leaf after the root exists;
@@ -41,6 +41,11 @@ line continues after the existing detailed memory log reaches its 400-line cap.
   other local shader fixes, so this is supporting integration evidence, not an
   isolated performance comparison of this branch. No long-session plateau is
   claimed. UBSan passed; ASan could not initialize on the macOS 27.2 host.
+
+This change was pulled into the local fork as `5133055` (upstream PR #34).
+The later M1 Pro / 1.0.0 performance and cache trials are recorded separately in
+the [current findings](practical-performance-20261019.md); the M3 long-session
+observation above is not a soak test of that later build.
 
 This PR is independent of pipeline prediction PR #29 and asynchronous loading
 PR #30. It changes only the representation of the two retained serial-history

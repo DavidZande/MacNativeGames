@@ -229,7 +229,42 @@ static uint32_t observed_region(uint64_t *out,uint64_t size){
  return r;
 }
 static uint32_t observed_pages(uint64_t addr,uint64_t size){uint32_t r=((uint32_t(*)(uint64_t,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryPagesEmm"))(addr,size);fprintf(stderr,"[totk] AllocateMemoryPages address=%llx size=%llx result=%x\n",(unsigned long long)addr,(unsigned long long)size,r);return r;}
+/* Diagnostic only: preserve the SDK's event wait, and measure only the event
+   embedded in the frame system found by the guarded controller stack walk. */
+extern uint64_t nvn_game_system(void);
+extern uint64_t dm_nvn_frame_count(void);
+static void (*pacing_wait_original)(void *);
+static _Atomic uint64_t pacing_calls, pacing_wait_ns, pacing_multi;
+static void observed_pacing_wait(void *event) {
+ uint64_t sys=nvn_game_system();
+ if(!sys||(uintptr_t)event!=sys+0x1f0){pacing_wait_original(event);return;}
+ uint32_t interval;memcpy(&interval,(const void *)(uintptr_t)(sys+0x88),4);
+ uint64_t frame=dm_nvn_frame_count(),start=runtime_now_ns();
+ pacing_wait_original(event);
+ uint64_t elapsed=runtime_now_ns()-start;
+ atomic_fetch_add(&pacing_calls,1);atomic_fetch_add(&pacing_wait_ns,elapsed);
+ if(interval>1)atomic_fetch_add(&pacing_multi,1);
+ fprintf(stderr,"[guest-pacing] frame=%llu interval=%u wait_ms=%.3f\n",(unsigned long long)frame,interval,elapsed/1e6);
+}
+void runtime_pacing_trace_frame(uint64_t frame) {
+ if(!pacing_wait_original||frame%300)return;
+ fprintf(stderr,"[guest-pacing-summary] frame=%llu calls=%llu interval_gt1=%llu wait_ms=%.3f\n",(unsigned long long)frame,
+  (unsigned long long)atomic_load(&pacing_calls),(unsigned long long)atomic_load(&pacing_multi),atomic_load(&pacing_wait_ns)/1e6);
+}
 void *runtime_observer(const char *name) {
+ /* Successful allocations are routine. The old observers switched to the
+    host stack, resolved the SDK symbol again and wrote a log line for each
+    call (over 21,000 calls in one save-load check). Keep the SDK's direct
+    path normally; explicit VAMM diagnostics retain the original observers. */
+ if(!strcmp(name,"_ZN2nn2os21AllocateAddressRegionEPmm")||!strcmp(name,"_ZN2nn2os19AllocateMemoryPagesEmm")) {
+  const char *trace=getenv("TOTK_TRACE_VAMM");
+  if(!trace||!*trace||!strcmp(trace,"0"))return NULL;
+ }
+ if(getenv("TOTK_PACING_TRACE")&&!strcmp(name,"_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE")) {
+  pacing_wait_original=runtime_symbol(name);
+  if(!pacing_wait_original)runtime_fail("pacing diagnostic requires the original SDK WaitSystemEvent");
+  return observed_pacing_wait;
+ }
  static const struct {const char *name;void *fn;} entries[]={
  {"_ZN2nn2os21AllocateAddressRegionEPmm",observed_region},{"_ZN2nn2os19AllocateMemoryPagesEmm",observed_pages},{"nnosInitialize",observed_os_init},{"nninitInitializeSdkModule",observed_sdk_init},{"nninitStartup",observed_startup},{"nnMain",observed_main}};
  for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;

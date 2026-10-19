@@ -3,12 +3,23 @@
 Findings from 2026-10-18, for the thread that owns the ahead-of-time pass (`prepare_shader_seed.py`, `nvn_mtl.m`,
 `totk_shader_rt.m`, the build). No owned file was edited, nothing was rebuilt, and the game was not launched.
 
+**Status update, 2026-10-19:** the AGL inventory integration described below is
+already implemented in `prepare_shader_seed.py` (`BAHS` → `agl_stages`); it is
+not an outstanding task. Counts below are the original cache snapshot, not the
+current cache inventory. Full Ghidra analysis of 1.0.0 has since completed; the
+decompiler availability note below describes only the original investigation.
+Later pipeline warm-up, uncapped performance and remaining work are recorded
+in the [current findings](practical-performance-20261019.md).
+
 ## Short answer
 
-The game builds no shaders at runtime. Almost all of the shaders that looked runtime-built come from **AGL shader
+Almost all of the shaders that looked runtime-built come from **AGL shader
 archives (`.sharcb`, magic `BAHS`, version 9)**. They hold complete, precompiled GLSLC output (a 0x880-byte control
 section plus NVN code) for every compiled variation, in AGL's own container format rather than BNSH. The seed pass only
-looks for `BNSH` inside `FSHA`/`BNSH` data, so it misses all of them.
+looked only for `BNSH` inside `FSHA`/`BNSH` data at the time of this investigation,
+so it missed them. The current seed pass also enumerates AGL archives. The
+fourteen unplaced shaders remain unresolved; this scan does not prove where
+every shader originates.
 
 - The user's translation cache has 9,777 shaders. 417 of them are not in the 9,360 seed.
 - 207 of those 417 are in Effect/UI BNSH files, which the `--extra` pass already covers (192 Effect, 15 UI).
@@ -41,7 +52,7 @@ the 24,341 BNSH programs across the whole RomFS, so they are purely additive. A 
 - The code is at base + code_off, with NVN header magic `0x12345678` for graphics or `0x12345679` for compute.
 - Key = `sha256(control[0:0x880] + code[0:length])`, the same as `prog_get` in `nvn_mtl.m`. This was verified for all 193.
 
-## How to add them to the ahead-of-time pass
+## Integration in the ahead-of-time pass (now implemented)
 
 `games/totk/scripts/enumerate_agl_sharcb.py` (new, standalone, read-only on RomFS) implements the above.
 `stages(data)` yields `(key, stage, control, code, info)`, already in the shape `bnsh_shaders()` yields. A minimal

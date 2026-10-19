@@ -14,6 +14,22 @@ static CAMetalLayer *metalLayer;
 static NSView *bootOverlay;
 static NSTextField *bootStage,*bootDetail;
 static NSProgressIndicator *bootProgress;
+static NSImageView *benchPreview;
+/* Offscreen measurements never call front_frame_presented. Keep their window
+   useful without adding drawable waits or readbacks to measured frames. */
+static int bench_window(void){return getenv("TOTK_PRESENT_SKIP")&&getenv("TOTK_FRAME_SAMPLES");}
+static void bench_show(void){
+ if(!bench_window()||!bootOverlay||benchPreview)return;
+ NSSize s=bootOverlay.bounds.size;
+ [bootProgress stopAnimation:nil];bootProgress.hidden=YES;
+ bootStage.frame=NSMakeRect(0,s.height-55,s.width,40);bootStage.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;
+ bootDetail.frame=NSMakeRect(0,s.height-85,s.width,28);bootDetail.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;
+ bootStage.stringValue=@"Uncapped benchmark — preparing measurements";
+ bootDetail.stringValue=@"Rendering offscreen · preview updates between measurements";
+ benchPreview=[[NSImageView alloc] initWithFrame:NSMakeRect(20,20,s.width-40,MAX(1,s.height-120))];
+ benchPreview.imageScaling=NSImageScaleProportionallyUpOrDown;benchPreview.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
+ [bootOverlay addSubview:benchPreview];bootOverlay.hidden=NO;
+}
 static NSView *shortcutHelp;
 static uint64_t bootStartNS;
 static _Atomic uint64_t presentedFrames;
@@ -60,7 +76,7 @@ void runtime_boot_progress(const char *stage,uint64_t done,uint64_t total){
  if(stage!=last){fprintf(stderr,"[totk-boot] %.3f %s\n",bootStartNS?(runtime_now_ns()-bootStartNS)/1e9:0,stage?stage:"startup");last=stage;}
  NSString *s=ui_en(stage);
  dispatch_async(dispatch_get_main_queue(), ^{
-  if(!bootOverlay||bootOverlay.hidden)return;
+  if(!bootOverlay||bootOverlay.hidden||benchPreview)return;
   bootStage.stringValue=s;
   if(total){bootDetail.stringValue=[NSString stringWithFormat:@"%.1f / %.1f GB",done/1e9,total/1e9];
    bootProgress.indeterminate=NO;bootProgress.doubleValue=(double)done/(double)total*100.0;}
@@ -68,12 +84,12 @@ void runtime_boot_progress(const char *stage,uint64_t done,uint64_t total){
  });
 }
 void runtime_boot_status(const char *stage,const char *detail){
- if(stage&&!strcmp(stage,"Compiling shaders")){NSString *d=@(detail?detail:"");dispatch_async(dispatch_get_main_queue(),^{if(!bootOverlay||bootOverlay.hidden)return;bootStage.stringValue=@"Compiling shaders";bootDetail.stringValue=d;});return;}   /* frequent: not logged (local change) */
+ if(stage&&!strcmp(stage,"Compiling shaders")){NSString *d=@(detail?detail:"");dispatch_async(dispatch_get_main_queue(),^{if(!bootOverlay||bootOverlay.hidden||benchPreview)return;bootStage.stringValue=@"Compiling shaders";bootDetail.stringValue=d;});return;}   /* frequent: not logged (local change) */
  if(bootStartNS)fprintf(stderr,"[totk-boot] %.3f %s — %s\n",(runtime_now_ns()-bootStartNS)/1e9,stage?stage:"正在启动",detail?detail:"");
  NSString *s=ui_en(stage);
  NSString *d=detail?ui_en(detail):@"Working, please wait";
  dispatch_async(dispatch_get_main_queue(), ^{
-  if(!bootOverlay||bootOverlay.hidden)return;
+  if(!bootOverlay||bootOverlay.hidden||benchPreview)return;
   bootStage.stringValue=s;bootDetail.stringValue=d;
   bootProgress.indeterminate=YES;[bootProgress startAnimation:nil];
  });
@@ -81,7 +97,7 @@ void runtime_boot_status(const char *stage,const char *detail){
 void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_t shader_total,uint64_t pipelines,uint64_t pipeline_total){
  atomic_store(&warmPending,1);
  dispatch_async(dispatch_get_main_queue(), ^{
-  if(!bootOverlay||bootOverlay.hidden)return;
+  if(!bootOverlay||bootOverlay.hidden||benchPreview)return;
   double percent=total ? fmin(100.0,(double)done/(double)total*100.0) : 100.0;
   bootStage.stringValue=[NSString stringWithFormat:@"Warming up shaders and pipelines %.0f%%",floor(percent)];
   bootDetail.stringValue=[NSString stringWithFormat:@"%llu/%llu items · shaders %llu/%llu · pipelines %llu/%llu",
@@ -93,7 +109,7 @@ void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_
 }
 void runtime_warm_done(void){
  atomic_store(&warmPending,0);
- dispatch_async(dispatch_get_main_queue(), ^{if(atomic_load(&presentedFrames))bootOverlay.hidden=YES;});
+ dispatch_async(dispatch_get_main_queue(), ^{if(bench_window())bench_show();else if(atomic_load(&presentedFrames))bootOverlay.hidden=YES;});
 }
 uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 /* TOTK_ASSUME_FOCUS=1: unattended test runs. macOS refuses to activate an app launched from the background while the user is working in
@@ -603,7 +619,18 @@ static void front_take_screenshot(void){
 void runtime_front_settings_cmd(const char *op,const char *arg){
  NSString *o=@(op?op:""),*a=arg?@(arg):nil;
  dispatch_async(dispatch_get_main_queue(),^{
-  if([o isEqualToString:@"show"])[settings show:nil];
+  if([o hasPrefix:@"bench"]&&bench_window()){
+   bench_show();
+   if([o isEqualToString:@"benchstatus"]&&a.length)bootStage.stringValue=[@"Uncapped benchmark — " stringByAppendingString:a];
+   else if([o isEqualToString:@"benchpreview"]&&a.length){NSImage *img=[[NSImage alloc] initWithContentsOfFile:a];if(img)benchPreview.image=img;}
+   else if([o isEqualToString:@"benchshot"]&&a.length){
+    NSBitmapImageRep *rep=[bootOverlay bitmapImageRepForCachingDisplayInRect:bootOverlay.bounds];
+    [bootOverlay cacheDisplayInRect:bootOverlay.bounds toBitmapImageRep:rep];
+    NSData *png=[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    fprintf(stderr,"[totk-bench] window capture %s\n",[png writeToFile:a atomically:YES]?"written":"failed");
+   }
+  }
+  else if([o isEqualToString:@"show"])[settings show:nil];
   else if([o isEqualToString:@"hide"])[settings.panel performClose:nil];
   else if([o isEqualToString:@"minimize"])[window miniaturize:nil];   /* tests of the hidden-window behaviour */
   else if([o isEqualToString:@"restore"])[window deminiaturize:nil];

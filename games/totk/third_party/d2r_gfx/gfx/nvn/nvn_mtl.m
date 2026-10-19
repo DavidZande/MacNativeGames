@@ -21,6 +21,7 @@
 #include "../tex/nvn_deswizzle.h"
 #include "../tex/nvn_deswizzle_gpu.h"
 #include "totk_shader_rt.h"
+#include "totk_compute_warm.h"
 #include "totk_serial_set.h"
 #include "totk_mfx.h"
 #include "totk_mfx_up.h"
@@ -1046,14 +1047,22 @@ static inline void m4_end(id e) {
    the previous pass's fragment work instead of waiting for it. MEASUREMENT ONLY until the vertex-stage hazard scan (1) exists:
    a vertex shader sampling a texture rendered just before would read it too early. 0 (default): full barriers both ways.
    Dropping every barrier (TOTK_BARRIER_START=0 END=0, races) took the frame from 11.82 to 10.66 ms at the Lookout fixture. */
+static uint32_t g_bar_vs_first_write = UINT32_MAX, g_bar_vs_last_read; static int g_bar_vs_ok;
+static uint32_t g_exec_seq;
 static int bar_narrow(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_BARRIER_NARROW"); v = e ? atoi(e) : 0;
-        if (v) MLOG("【实验】TOTK_BARRIER_NARROW=%d：渲染通道之间只按片元阶段排序（顶点阶段可与上一通道的片元重叠）%s", v, v == 2 ? "，不查顶点阶段依赖，只供测量" : ""); }
+    if (v < 0) { const char *e = getenv("TOTK_BARRIER_NARROW"); v = e ? atoi(e) : 1;
+        if (v) MLOG("【实验】TOTK_BARRIER_NARROW=%d：渲染通道之间只按片元阶段排序（顶点阶段可与上一通道的片元重叠）%s", v, v == 2 ? "，不查顶点阶段依赖，只供测量" : "，含提交内顶点阶段读附件前瞻检查"); }
     return v;
 }
-static int bar_start_mode(void) { return bar_start_on() ? (bar_narrow() == 2 ? 2 : 1) : 0; }
-static int bar_end_mode(void) { return bar_end_on() ? (bar_narrow() == 2 ? 2 : 1) : 0; }
+static int bar_narrow_active(void) {
+    int m = bar_narrow();
+    if (m == 2) return 1;
+    if (m != 1 || !g_bar_vs_ok) return 0;
+    return !(g_exec_seq >= g_bar_vs_first_write && g_exec_seq <= g_bar_vs_last_read + 1);
+}
+static int bar_start_mode(void) { return bar_start_on() ? (bar_narrow_active() ? 2 : 1) : 0; }
+static int bar_end_mode(void) { return bar_end_on() ? (bar_narrow_active() ? 2 : 1) : 0; }
 static inline void m4_end_render(id<MTL4RenderCommandEncoder> e) {   // end of a render encoder the replay thread encoded itself
     int m = bar_end_mode();
     if (m == 2) [e barrierAfterStages:MTLStageVertex | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageBlit | MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
@@ -1865,7 +1874,7 @@ static void chunk_cfg(void) {
     static int base_first = -1, base_size;
     if (base_first < 0) {
         const char *e = getenv("TOTK_CHUNK_DRAWS"), *f = getenv("TOTK_CHUNK_FIRST");
-        base_size = e ? atoi(e) : 75; base_first = f ? atoi(f) : 60;
+        base_size = e ? atoi(e) : 200; base_first = f ? atoi(f) : 120;
         if (base_size <= 0 || base_first <= 0) base_size = base_first = 0;
     }
     int size = atomic_load(&g_chunk_size_request), first = atomic_load(&g_chunk_first_request);
@@ -2002,6 +2011,7 @@ uint64_t mtl_sub_commit(void) {
     g_alloc_fence[g_alloc_cur] = fence;
     g_cb = nil;
     g_commit_blocks = nil;
+    g_bar_vs_ok = 0;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
     return fence;
 }
@@ -2010,6 +2020,8 @@ uint64_t mtl_last_fence(void) { return g_fence; }
 int mtl_last_commit_error(void) { return atomic_load(&g_last_commit_error); }
 
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
+    if (__atomic_load_n(&g_done, __ATOMIC_ACQUIRE) >= fence) return 1;
+    if (!timeout_ns) return 0;
     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
     uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600000000000ull ? 3600000000000ull : timeout_ns);
     dl.tv_sec += ns / 1000000000ull; dl.tv_nsec = ns % 1000000000ull;
@@ -2179,7 +2191,8 @@ uint64_t mtl_dead_serial_textures(void) { return g_dead_put_total; }
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
 typedef struct { uint64_t pf, type, w, h, z, levels, layers, samples, usage, storage; uint8_t swz[4]; } reup_key;   // TOTK: what tex_desc varies between mirrored textures (re-upload recycling, see reup_take)
 /* Same-shader argument blocks may survive intervening program changes only
-   while every binding/resource generation still matches. Default off. */
+   while every binding/resource generation still matches. Default off: the quick
+   uncapped A/B did not show a consistent benefit in the current world scene. */
 static _Atomic int g_arg_epoch_on = -1, g_arg_epoch_check;
 static _Atomic uint64_t g_arg_epoch_hits, g_arg_epoch_extra, g_arg_epoch_verified;
 static int g_arg_epoch_negative;
@@ -2219,6 +2232,8 @@ static _Atomic int g_vertex_streams_on = -1;
 static _Atomic int g_texture_plan_on = -1, g_texture_plan_check;
 static _Atomic int g_anom_requested = -1;
 static uint64_t g_texture_plan_total, g_texture_plan_selected, g_texture_plan_verified;
+/* Immutable reflection lists avoid scanning unrelated bindings, but the quick
+   world A/B was effectively flat. Keep this opt-in rather than claim an FPS win. */
 static int texture_plan_on(void) {
     int v = atomic_load(&g_texture_plan_on);
     if (v < 0) { const char *e = getenv("TOTK_TEXTURE_PLAN"); v = e && atoi(e); atomic_store(&g_texture_plan_on, v);
@@ -3786,6 +3801,11 @@ static int udc_on(void) {
 // DM_NVN_TBDR=1 enables experimental D2R pass rewriting for equivalence diagnostics.
 static int tbdr_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TBDR"), *r = getenv("DM_NVN_RULER"); v = e && !strcmp(e, "1"); g_ruler_truth = r && !strcmp(r, "1"); if (!v) MLOG("TOTK: TBDR pass optimizations disabled; DM_NVN_TBDR=1 opts into experimental pass rewriting"); } return v && !g_ruler_truth; }
 int dm_nvn_ruler_truth(void) { tbdr_on(); return g_ruler_truth; }   // 视觉尺子真值阶段（宿主侧的被测设置据此让开，如 3D 渲染比例） | Visual ruler ground-truth phase (host-side settings under test yield accordingly, e.g. the 3D render scale)
+static int totk_tbdr_dis(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TBDR"); v = e && !strcmp(e, "0"); } return v || dm_nvn_ruler_truth(); }
+static int totk_store_opt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_STORE_OPT"); v = !(e && !strcmp(e, "0")); } return v && !totk_tbdr_dis(); }
+static int totk_load_cover_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_LOAD_COVER"); v = !(e && !strcmp(e, "0")); } return v && !totk_tbdr_dis(); }
+static int totk_ds_omit_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_DS_OMIT"); v = !(e && !strcmp(e, "0")); } return v && !totk_tbdr_dis(); }
+static int totk_hoist_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_HOIST_CLEAR"); v = !(e && !strcmp(e, "0")); } return v && !totk_tbdr_dis(); }
 static int rt_range_on(void) { static int v = -1; if (v < 0) { const char *e=getenv("DM_NVN_RT_RANGE"); v=e && !strcmp(e,"1"); } return v; }   // 窄候选，缺省关 | Narrow candidate, off by default
 static uint64_t g_sd_dead_bytes, g_sd_n_dead, g_sd_n_all;
 // ---------- 跨提交附件有效性账本 ----------
@@ -4233,7 +4253,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         any = 1;
         pd.colorAttachments[i].loadAction = R.clear_c[i] ? MTLLoadActionClear : MTLLoadActionLoad;
         pd.colorAttachments[i].clearColor = R.cc[i];
-        int cov = tbdr_on() && !R.clear_c[i] && (g_fd_dw || g_fd_di) && fz_load_covers(i, pd.colorAttachments[i].texture, pd.colorAttachments[i].level);
+        int cov = !lay_n && (tbdr_on() || totk_load_cover_on()) && !R.clear_c[i] && (g_fd_dw || g_fd_di) && fz_load_covers(i, pd.colorAttachments[i].texture, pd.colorAttachments[i].level);
         if (!R.clear_c[i] && (g_fd_dw || g_fd_di) && !cov) PD("Q %llu c%d 读入不可省 why=%d", g_stat_pass + 1, i, g_fd_why);
         if (cov) {
             static int probe = -1; if (probe < 0) { probe = getenv("DM_NVN_LOADPROBE") ? atoi(getenv("DM_NVN_LOADPROBE")) : 0; if (probe) MLOG("DM_NVN_LOADPROBE：读入可省的附件改清成哨兵色并回读核对"); }
@@ -4717,6 +4737,17 @@ static int msl_stores_through(NSString *src, NSString *name) {
     return 0;
 }
 static void refl_mark_stores(NvShader *o, NSArray *bs, NSString *src) {
+    const char *s = src.UTF8String;
+    if (s && o->stage == 1) {
+        if (!o->rf.color_mask) {
+            for (const char *p = strstr(s, "[[color("); p; p = strstr(p + 8, "[[color(")) {
+                int c = p[8] - '0';
+                if (c >= 0 && c < 8 && p[9] == ')') o->rf.color_mask |= (uint8_t)(1u << c);
+            }
+        }
+        o->rf.may_discard = strstr(s, "discard_fragment()") != NULL;
+        o->rf.writes_smask = strstr(s, "[[sample_mask]]") != NULL;
+    }
     if (![bs isKindOfClass:[NSArray class]] || (int)bs.count != o->rf.nb) return;   // nvn_refl_from_json keeps the json order 1:1
     for (int i = 0; i < o->rf.nb; i++) {
         nvn_rbind *b = &o->rf.b[i]; if (b->rw || (b->kind != NVN_RB_SBUFP && b->kind != NVN_RB_SBUFU)) continue;
@@ -5371,11 +5402,12 @@ static void udc_note_draw(NvProg *pr) {
     if (pr && pr->udc_img) zskip_clear();   // 图像槽可写：保守清空 | Image slots are writable: conservatively clear
     int image_write = pr ? pr->udc_imgw : 0;
     uint32_t shader_color_mask = pr ? pr->udc_cmask : 0;
+    int fs_writes_depth = pr && pr->sh[1] && pr->sh[1]->writes_depth;
     for (int i = 0; i < g_nsd; i++) {
         sd_att *t = &g_sd[i];
         if (image_write) { t->wrote = 1; t->wwhy = 1; }
-        else if (t->depth == 0 && t->idx >= 0 && (((S.chmask.mask >> (4 * t->idx)) & 0xf) || (shader_color_mask >> t->idx & 1))) { t->wrote = 1; t->wwhy = (S.chmask.mask >> (4 * t->idx)) & 0xf ? 2 : 3; }
-        else if (t->depth == 1 && S.ds.dw) { t->wrote = 1; t->wwhy = 4; }
+        else if (t->depth == 0 && t->idx >= 0 && ((S.chmask.mask >> (4 * t->idx)) & 0xf) && (!pr || (shader_color_mask >> t->idx & 1) || (t->idx == 7 && g_pass.mfx && g_mfx.role))) { t->wrote = 1; t->wwhy = 2; }
+        else if (t->depth == 1 && ((S.ds.dt && S.ds.dw) || fs_writes_depth)) { t->wrote = 1; t->wwhy = 4; }
         else if (t->depth == 2 && S.ds.st && (S.st_wmask[0] || S.st_wmask[1])
                 && (S.ds.fail_f != NVN_STENCIL_OP_KEEP || S.ds.zfail_f != NVN_STENCIL_OP_KEEP || S.ds.zpass_f != NVN_STENCIL_OP_KEEP
                     || S.ds.fail_b != NVN_STENCIL_OP_KEEP || S.ds.zfail_b != NVN_STENCIL_OP_KEEP || S.ds.zpass_b != NVN_STENCIL_OP_KEEP)) { t->wrote = 1; t->wwhy = 5; }
@@ -5969,7 +6001,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (cached) return cached;
     id<MTLRenderPipelineState> ps = nil;
     NSError *e = nil; uint64_t bt = bp_now();
-    if (!g_pso_lmap && async_pso_on()) {
+    if (!g_pso_lmap && async_pso_on() && g_enc_mode < 2) {
         int r = pso_pend_poll(&k, &ps);
         if (r == 0) { g_async_pso_skipped++; return nil; }   /* still compiling: skip this draw */
         if (r < 0) {
@@ -6052,13 +6084,12 @@ static void warm_enqueue(WarmItem *item) {
 /* Count the exact manifest rows and cached variants this run will visit before
    displaying a determinate bar. Shader/PSO counts are separate: one pipeline
    row may load two shaders, and a failed row still advances the task bar. */
-static void warm_plan(NSArray<NSString *> *paths, NSArray<NSString *> *files, NSMutableSet<NSString *> *keys,
+static void warm_plan(NSArray<NSString *> *manifests, NSArray<NSString *> *files, NSMutableSet<NSString *> *keys,
                       NSMutableSet<NSString *> *eligible,
                       uint64_t *tasks, uint64_t *shaders, uint64_t *pipelines) {
     NSMutableSet<NSString *> *rows = [NSMutableSet set];
     *tasks = *shaders = *pipelines = 0;
-    for (NSString *path in paths) {
-        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    for (NSString *txt in manifests) {
         for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
             if (!line.length || [line hasPrefix:@"#"] || [rows containsObject:line]) continue;
             [rows addObject:line];
@@ -6175,7 +6206,7 @@ static void warm_prime_only(void) {
         MLOG("[effect-prime] done: %llu effect/UI shaders, %llu failed, %d threads, %.1f s", (unsigned long long)done, (unsigned long long)failed, n, (bp_now() - t0) / 1e9);
     });
 }
-static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
+static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *manifests, NSArray<NSString *> *files,
                         NSSet<NSString *> *eligible,
                         NSMutableSet<NSString *> *planned_keys,uint64_t total,uint64_t shader_total,uint64_t pipeline_total) {
     @autoreleasepool {
@@ -6184,9 +6215,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         NSUInteger path_index = 0;
         uint64_t done = 0;
         for (NSString *path in paths) {
-            NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-            if (!txt) { MLOG("【红】预热清单读取失败：%s", path.UTF8String);
-                if (path_index++ == 0) atomic_store(&g_warm_priority_done, 1); continue; }
+            NSString *txt = manifests[path_index];
             warm_prime(warm_prime_keys(txt, eligible, [NSSet setWithArray:dict.allKeys]), path.lastPathComponent.UTF8String);
             for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
                 if (![eligible containsObject:line] || [seen containsObject:line]) continue;
@@ -6401,16 +6430,36 @@ static void warm_start(void) {
     }
     if (!g_warm_items) g_warm_items = [NSMutableArray array];
     NSArray<NSString *> *files = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:totk_rt_dir() error:nil] sortedArrayUsingSelector:@selector(compare:)] ?: @[];
+    // Freeze the same manifest contents for planning and execution. Append a
+    // synthetic C-list so the existing deduplication, progress and WarmItem
+    // hand-off also cover unplayed compute variants. Render shaders in the
+    // extra seed keep their inexpensive background-only policy.
+    NSMutableArray<NSString *> *manifests = [NSMutableArray array];
+    for (NSString *path in paths) {
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        if (!txt) MLOG("【红】预热清单读取失败：%s", path.UTF8String);
+        [manifests addObject:txt ?: @""];
+    }
+#if !TARGET_OS_IPHONE
+    const char *compute = getenv("TOTK_WARM_COMPUTE");
+    if (compute && atoi(compute)) {
+        NSString *txt = totk_compute_warm_manifest(totk_rt_dir(), files);
+        paths = [paths arrayByAddingObject:@"cached-compute.tsv"];
+        [manifests addObject:txt];
+        MLOG("[compute-warm] discovered %lu cached compute pipelines (TOTK_WARM_COMPUTE=1)",
+             (unsigned long)[txt componentsSeparatedByString:@"\n"].count - 1);
+    }
+#endif
     uint64_t total = 0, shader_total = 0, pipeline_total = 0;
     NSMutableSet<NSString *> *planned_keys = [NSMutableSet set];
     NSMutableSet<NSString *> *eligible = [NSMutableSet set];
-    warm_plan(paths,files,planned_keys,eligible,&total,&shader_total,&pipeline_total);
+    warm_plan(manifests,files,planned_keys,eligible,&total,&shader_total,&pipeline_total);
     if (runtime_warm_progress) runtime_warm_progress(0,total,0,shader_total,0,pipeline_total);
     g_warm_t0 = bp_now();
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);   // 不是可有可无的后台活：它决定玩家进局前管线是否就绪 | Not optional background work: it decides whether the pipelines are ready before the player enters a run
     dispatch_queue_t q = dispatch_queue_create("dm.nvn.pso-warm", attr);
     atomic_store(&g_warm_running, 1);
-    dispatch_async(q, ^{ warm_worker(paths,files,eligible,planned_keys,total,shader_total,pipeline_total); });
+    dispatch_async(q, ^{ warm_worker(paths,manifests,files,eligible,planned_keys,total,shader_total,pipeline_total); });
     // The title's seed manifest must be ready before its first frame. The
     // profile-specific list and remaining translated variants finish behind
     // the menu, then mtl_warm_wait at save-load waits before entering play.
@@ -7161,7 +7210,7 @@ static uint64_t lay_gpu(int offset) {   // GPU address of the constant `offset` 
 void mtl_layer_stats(uint64_t v[4]) { v[0] = g_stat_pass; v[1] = g_lay.passes; v[2] = g_lay.merges; v[3] = g_lay.refused; }
 static void sd_finish(void) {
     if (!g_nsd) return;
-    if (!tbdr_on()) {   // 优化全关：一律写回 | All optimizations off: always write back
+    if (g_lay.active || !(tbdr_on() || totk_store_opt_on())) {   // 优化全关：一律写回 | All optimizations off: always write back
         for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i];
             enc_r_store(g_enc, t->depth, MTLStoreActionStore, (NSUInteger)t->idx); }
         g_nsd = 0; return; }
@@ -7526,6 +7575,40 @@ static int pass_ds_need(void) {
     PD("S %llu 前瞻 结果=%d 需求=%d（1 深度 2 模板）原因=%d 扫过 %d 条 返回栈 %d 余句柄 %d", g_stat_pass + 1, r, out, g_ds_why, g_ds_scanned, g_ret_n, g_nrest);
     return out;
 }
+static int ds_mode_pso_ready(NvProg *pr, int mode) {
+    if (mode < 2 || !pr || !pr->sh[0]) return mode;
+    if (mfx_enabled()) return 0;
+    const p_set_rt *r = &R.rt; uint32_t cf[8] = {0}, dfull = 0, sfull = 0, samples = 1;
+    for (int i = 0; i < r->n && i < 8; i++) {
+        MTLTextureDescriptor *d = r->color[i] ? tex_desc(r->color[i], tex_mirrored(r->color[i])) : nil;
+        if (d) { cf[i] = (uint32_t)attachment_format(r->color[i], &r->cview[i], r->has_cview[i], d.pixelFormat); samples = (uint32_t)d.sampleCount; }
+    }
+    MTLTextureDescriptor *dd = r->depth ? tex_desc(r->depth, tex_mirrored(r->depth)) : nil;
+    if (dd) {
+        MTLPixelFormat f = attachment_format(r->depth, &r->dview, r->has_dview, dd.pixelFormat);
+        dfull = f != MTLPixelFormatStencil8 ? (uint32_t)f : 0;
+        sfull = (f == MTLPixelFormatStencil8 || f == MTLPixelFormatDepth32Float_Stencil8) ? (uint32_t)f : 0;
+        if ((mode == 3 && sfull) || (mode == 4 && dfull)) samples = (uint32_t)dd.sampleCount;
+    }
+    uint32_t df = mode == 4 ? dfull : 0, sf = mode == 3 ? sfull : 0;
+    if (df == dfull && sf == sfull) return mode;
+    pso_key k; pso_key_fill(&k, pr->sh[0], pr->sh[1], cf, df, sf, samples, 0);
+    if (hm_get_ptr(&g_pso, &k)) return mode;
+    if (!async_pso_on()) return mode;
+    id<MTLRenderPipelineState> ps = nil;
+    int st = pso_pend_poll(&k, &ps);
+    if (st == 1 && ps) {
+        pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, pr->sh[0], pr->sh[1], 0, NULL, &sk); pso_skey_hex(&sk, shex);
+        pso_record("R\t%s\n", shex); pso_user_record("R\t%s\n", shex);
+        hm_put_id(&g_pso, &k, ps); g_async_pso_ready++;
+        return mode;
+    }
+    if (st < 0) {
+        pso_pend_kick(&k, pr->sh[0], pr->sh[1]);
+        if (pso_pend_find(&k) >= 0) g_async_pso_kicked++;
+    }
+    return 0;
+}
 // 纯清除通道前提：开通道时向后扫，形如「本通道若干绘制 → 若干组（SetRenderTargets + 只有清除）→ 回到与本通道相同的目标」，
 // 就把这几组清除提到本通道之前执行、原位置跳过，回到同一目标时由同目标续用接上——本通道的附件不再为夹在中间的清除整块写回再读入
 // （选角页：grunge 与粒子都画 28 / 27 第 0 级 + 深度，中间只清第 1、2 级）。
@@ -7547,25 +7630,32 @@ static uint64_t h_ser(uint64_t h) { int tid = (int)(h & 0xfffff); return tid ? a
 // Events (seq = replay sequence number): READ a draw / dispatch reads this texture per program reflection; ATT it is a current attachment at a draw; CLEAR cleared as a whole block while an attachment; COPY / CLRTEX either end of a copy / the cleared texture.
 // Decision (the first valid event decides): READ / COPY / CLRTEX -> needed; ATT whose SetRenderTargets is after the render pass end -> needed (load); CLEAR with the same -> redundant; no event -> needed.
 // On any uncertainty (replay sequence number does not match the index, nesting too deep) the index is invalidated and all remaining render passes of this submit store (storing is always correct, it just saves less bandwidth).
-typedef struct { uint32_t seq, rtseq; uint64_t ser; const uint8_t *op; uint16_t lv, sl; uint8_t kind, plane, anyls, why; } sdx_ev;   // plane 0 颜色 8 深度模板（ATT）1 深度 2 模板（CLEAR） | plane 0 color 8 depth-stencil (ATT) 1 depth 2 stencil (CLEAR)
+typedef struct { uint32_t seq, rtseq; uint64_t ser; const uint8_t *op; uint16_t lv, sl; uint8_t kind, plane, anyls, why; } sdx_ev;   // plane 0 颜色 8 深度模板（ATT）1 深度 2 stencil (CLEAR)
 enum { SDX_READ = 1, SDX_NEED, SDX_ATT, SDX_CLEAR };
 #define SDX_NONE 0xffffffffu
 static sdx_ev *g_sdx, *g_sdx_tmp; static uint32_t g_sdx_n, g_sdx_cap; static int g_sdx_ok;   // 索引有效 | Index valid
 // 候选贴图（当过附件的）→ 桶：开放定址；事件发生时尚未当过附件的贴图，对此前结束的任何通道都无关，不记
 // Candidate textures (those that have been attachments) -> buckets: open addressing; a texture that has not yet been an attachment when an event occurs is irrelevant to any render pass that ended before then, so it is not recorded
 #define SDX_HB 2048
-static uint64_t g_sdx_hk[SDX_HB]; static uint16_t g_sdx_hb[SDX_HB]; static uint32_t g_sdx_nb, g_sdx_bcnt[SDX_HB + 1], g_sdx_bst[SDX_HB + 1];
+static uint64_t g_sdx_hk[SDX_HB]; static uint16_t g_sdx_hb[SDX_HB]; static uint32_t g_sdx_nb, g_sdx_bcnt[SDX_HB + 1], g_sdx_bst[SDX_HB + 1], g_sdx_first_att[SDX_HB];
 static int sdx_bucket(uint64_t ser, int add) {   // 返回桶号；不在集合（且不加）返回 −1；满了作废索引 | Returns the bucket number; returns -1 if not in the set (and not adding); invalidates the index when full
     if (!ser) return -1;
     for (uint32_t i = (uint32_t)(ser * 0x9E3779B97F4A7C15ull >> 53), n = 0; n < SDX_HB; i = (i + 1) & (SDX_HB - 1), n++) {
         if (g_sdx_hk[i] == ser) return g_sdx_hb[i];
-        if (!g_sdx_hk[i]) { if (!add) return -1; if (g_sdx_nb >= SDX_HB / 2) { g_sdx_ok = 0; return -1; } g_sdx_hk[i] = ser; g_sdx_hb[i] = (uint16_t)g_sdx_nb; return (int)g_sdx_nb++; }
+        if (!g_sdx_hk[i]) { if (!add) return -1; if (g_sdx_nb >= SDX_HB / 2) { g_sdx_ok = 0; return -1; } g_sdx_hk[i] = ser; g_sdx_hb[i] = (uint16_t)g_sdx_nb; g_sdx_first_att[g_sdx_nb] = UINT32_MAX; return (int)g_sdx_nb++; }
     }
     return -1;
 }
+static void sdx_note_att(uint64_t ser, uint32_t seq) { int b = sdx_bucket(ser, 1); if (b >= 0 && seq < g_sdx_first_att[b]) g_sdx_first_att[b] = seq; }
 static const uint8_t **g_sdx_op; static uint32_t g_sdx_nop, g_sdx_opcap;
-static uint32_t g_exec_seq;   // 回放中当前操作的序号 | Sequence number of the current operation during replay
+// g_exec_seq：回放中当前操作的序号（定义在 bar_narrow 前） | Sequence number of the current operation during replay
 static uint64_t g_pp_slot[6][160]; static const prog_t *g_pp_prog; static const p_set_rt *g_pp_rt; static uint32_t g_pp_rtseq;
+static p_scissor g_sdx_sc; static int g_sdx_has_sc, g_sdx_rt_open;
+static int sdx_scissor_full(const tex_t *t, const view_t *v, int has_v) {
+    NSUInteger level = has_v && v->set_levels ? v->base_level : 0;
+    NSUInteger w = mip_extent(t->d.width, level), h = mip_extent(t->d.target == 0 || t->d.target == 3 ? 1 : t->d.height, level);
+    return !g_sdx_has_sc || (g_sdx_sc.x <= 0 && g_sdx_sc.y <= 0 && (int64_t)g_sdx_sc.x + g_sdx_sc.w >= (int64_t)w && (int64_t)g_sdx_sc.y + g_sdx_sc.h >= (int64_t)h);
+}
 static uint32_t *g_rtx_seq, *g_drx_seq; static uint32_t g_rtx_n, g_rtx_cap, g_drx_n, g_drx_cap;   // 本次提交的 SET_RT / 绘制序号表（可读 tile 合并的预筛用） | This submit's SET_RT / draw sequence number tables (used by the pre-screen of the readable tile merge)
 static void seq_push(uint32_t **v, uint32_t *n, uint32_t *cap, uint32_t x) { if (*n == *cap) { *cap = *cap ? *cap * 2 : 1024; *v = realloc(*v, *cap * sizeof **v); } (*v)[(*n)++] = x; }
 static void sdx_ev_add(sdx_ev e) { if (sdx_bucket(e.ser, 0) < 0) return; if (g_sdx_n == g_sdx_cap) { g_sdx_cap = g_sdx_cap ? g_sdx_cap * 2 : 4096; g_sdx = realloc(g_sdx, g_sdx_cap * sizeof *g_sdx); g_sdx_tmp = realloc(g_sdx_tmp, g_sdx_cap * sizeof *g_sdx); } g_sdx[g_sdx_n++] = e; }
@@ -7581,20 +7671,33 @@ static void sdx_walk(const uint8_t *p, int depth) {
             case OP_END: return;
             case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
             case OP_CALL: { uint64_t t; memcpy(&t, a, 8); sdx_walk((const uint8_t *)t, depth + 1); break; }
-            case OP_SET_RT: { const p_set_rt *r = a; g_pp_rt = r; g_pp_rtseq = seq; seq_push(&g_rtx_seq, &g_rtx_n, &g_rtx_cap, seq);
-                for (int k = 0; k < r->n && k < 8; k++) if (r->color[k]) sdx_bucket(r->color[k]->serial, 1);
-                if (r->depth) sdx_bucket(r->depth->serial, 1);
+            case OP_SET_RT: { const p_set_rt *r = a; g_pp_rt = r; g_pp_rtseq = seq; g_sdx_rt_open = 0; seq_push(&g_rtx_seq, &g_rtx_n, &g_rtx_cap, seq);
+                for (int k = 0; k < r->n && k < 8; k++) if (r->color[k]) sdx_note_att(r->color[k]->serial, seq);
+                if (r->depth) sdx_note_att(r->depth->serial, seq);
                 break; }
+            case OP_SCISSOR: g_sdx_sc = *(const p_scissor *)a; g_sdx_has_sc = 1; break;
             case OP_RENDER_ENABLE: g_sdx_ren = ((const p_flag *)a)->value; break;
             case OP_RENDER_COND: g_sdx_ren = cond_eval(a, p); break;
             case OP_CLEAR_COLOR: { const p_clear_color *c = a; const p_set_rt *r = g_pp_rt;
                 if (!g_sdx_ren) break;   // TOTK: this clear will not run
-                if (!r || (c->mask & 0xf) != 0xf || c->index < 0 || c->index >= r->n || c->index >= 8 || !r->color[c->index]) break;
+                if (!r || !(c->mask & 0xf) || c->index < 0 || c->index >= r->n || c->index >= 8 || !r->color[c->index]) break;
+                if (g_sdx_rt_open || (c->mask & 0xf) != 0xf || !sdx_scissor_full(r->color[c->index], &r->cview[c->index], r->has_cview[c->index])) {
+                    g_sdx_rt_open = 1;
+                    for (int k = 0; k < r->n && k < 8; k++) if (r->color[k]) { uint16_t lv, sl; sdx_lvsl(&r->cview[k], r->has_cview[k], &lv, &sl); sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->color[k]->serial, p, lv, sl, SDX_ATT, 0, 0, 2}); }
+                    if (r->depth) { uint16_t lv, sl; sdx_lvsl(&r->dview, r->has_dview, &lv, &sl); sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->depth->serial, p, lv, sl, SDX_ATT, 8, !r->has_dview, 2}); }
+                    break;
+                }
                 uint16_t lv, sl; sdx_lvsl(&r->cview[c->index], r->has_cview[c->index], &lv, &sl); int last = -1;   // 同一子资源挂在多个序号时按最后一个算 | When the same subresource is attached at several indices, the last one counts
                 for (int k = 0; k < r->n && k < 8; k++) { uint16_t l2, s2; if (!r->color[k] || r->color[k]->serial != r->color[c->index]->serial) continue; sdx_lvsl(&r->cview[k], r->has_cview[k], &l2, &s2); if (l2 == lv && s2 == sl) last = k; }
                 if (last == c->index) sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->color[c->index]->serial, p, lv, sl, SDX_CLEAR, 0, 0, 0});
                 break; }
-            case OP_CLEAR_DS: { const p_clear_ds *c = a; const p_set_rt *r = g_pp_rt; if (!g_sdx_ren || !r || !r->depth) break;
+            case OP_CLEAR_DS: { const p_clear_ds *c = a; const p_set_rt *r = g_pp_rt; if (!g_sdx_ren || !r || !r->depth || (!c->depth_mask && !(c->stencil_mask & 0xff))) break;
+                if (g_sdx_rt_open || ((c->stencil_mask & 0xff) && (c->stencil_mask & 0xff) != 0xff) || !sdx_scissor_full(r->depth, &r->dview, r->has_dview)) {
+                    g_sdx_rt_open = 1;
+                    for (int k = 0; k < r->n && k < 8; k++) if (r->color[k]) { uint16_t lv, sl; sdx_lvsl(&r->cview[k], r->has_cview[k], &lv, &sl); sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->color[k]->serial, p, lv, sl, SDX_ATT, 0, 0, 2}); }
+                    uint16_t lv, sl; sdx_lvsl(&r->dview, r->has_dview, &lv, &sl); sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->depth->serial, p, lv, sl, SDX_ATT, 8, !r->has_dview, 2});
+                    break;
+                }
                 uint16_t lv, sl; sdx_lvsl(&r->dview, r->has_dview, &lv, &sl);
                 if (c->depth_mask) sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->depth->serial, p, lv, sl, SDX_CLEAR, 1, !r->has_dview, 0});
                 if ((c->stencil_mask & 0xff) == 0xff) sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->depth->serial, p, lv, sl, SDX_CLEAR, 2, !r->has_dview, 0});
@@ -7604,40 +7707,51 @@ static void sdx_walk(const uint8_t *p, int depth) {
                 break; }
             case OP_BIND_PROGRAM: g_pp_prog = ((const p_bind_program *)a)->prog; break;
             case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: {
-                if (h.op != OP_DISPATCH) seq_push(&g_drx_seq, &g_drx_n, &g_drx_cap, seq);
-                __unsafe_unretained NvProg *pr = g_pp_prog ? prog_get(g_pp_prog) : nil;
-                if (!pr) { for (int st = 0; st < 6; st++) for (int k = 0; k < 160; k++) if (g_pp_slot[st][k]) sdx_ev_add((sdx_ev){seq, 0, g_pp_slot[st][k], p, 0, 0, SDX_READ, 0, 0, 1}); }
-                else for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || (h.op == OP_DISPATCH) != (st == 5)) continue;
-                    for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; int k = b->kind == NVN_RB_IMG ? 128 + b->reg : (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) ? b->reg : -1;
+                if (h.op != OP_DISPATCH) { seq_push(&g_drx_seq, &g_drx_n, &g_drx_cap, seq); if (g_sdx_ren) g_sdx_rt_open = 1; }
+                else g_sdx_rt_open = 0;
+                __unsafe_unretained NvProg *pr = g_pp_prog ? prog_get_cached(g_pp_prog) : nil;
+                if (!pr || pr->missing) {
+                    if (h.op != OP_DISPATCH) { g_bar_vs_first_write = 0; g_bar_vs_last_read = UINT32_MAX / 2; }
+                    for (int st = 0; st < 6; st++) for (int k = 0; k < 160; k++) if (g_pp_slot[st][k]) sdx_ev_add((sdx_ev){seq, 0, g_pp_slot[st][k], p, 0, 0, SDX_READ, 0, 0, 1});
+                } else for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || (h.op == OP_DISPATCH) != (st == 5)) continue;
+                    for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i];
+                        if (h.op != OP_DISPATCH && st == 1 && (b->kind == NVN_RB_IMG || ((b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_SBUFU) && b->rw))) { g_bar_vs_first_write = 0; g_bar_vs_last_read = UINT32_MAX / 2; }
+                        int k = b->kind == NVN_RB_IMG ? 128 + b->reg : (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) ? b->reg : -1;
                         if (k < 0 || k >= 160 || sh->stage < 0 || sh->stage >= 6) continue; uint64_t ser = g_pp_slot[sh->stage][k];
-                        if (ser) sdx_ev_add((sdx_ev){seq, 0, ser, p, 0, 0, SDX_READ, 0, 0, 1}); } }
+                        if (ser) { sdx_ev_add((sdx_ev){seq, 0, ser, p, 0, 0, SDX_READ, 0, 0, 1});
+                            if (h.op != OP_DISPATCH && st == 0) { int bk = sdx_bucket(ser, 0);
+                                if (bk >= 0 && g_sdx_first_att[bk] <= seq) { if (g_sdx_first_att[bk] < g_bar_vs_first_write) g_bar_vs_first_write = g_sdx_first_att[bk]; if (seq > g_bar_vs_last_read) g_bar_vs_last_read = seq; } } } } }
                 const p_set_rt *r = g_pp_rt;
                 if (h.op != OP_DISPATCH && r) {
                     for (int k = 0; k < r->n && k < 8; k++) if (r->color[k]) { uint16_t lv, sl; sdx_lvsl(&r->cview[k], r->has_cview[k], &lv, &sl); sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->color[k]->serial, p, lv, sl, SDX_ATT, 0, 0, 2}); }
                     if (r->depth) { uint16_t lv, sl; sdx_lvsl(&r->dview, r->has_dview, &lv, &sl); sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->depth->serial, p, lv, sl, SDX_ATT, 8, !r->has_dview, 2}); }
                 }
                 break; }
-            case OP_COPY_T2T: { const p_copy_t2t *c = a; if (c->src) sdx_ev_add((sdx_ev){seq, 0, c->src->serial, p, 0, 0, SDX_NEED, 0, 0, 3}); if (c->dst) sdx_ev_add((sdx_ev){seq, 0, c->dst->serial, p, 0, 0, SDX_NEED, 0, 0, 3}); break; }
-            case OP_COPY_T2B: case OP_COPY_B2T: { const p_copy_b2t *c = a; if (c->tex) sdx_ev_add((sdx_ev){seq, 0, c->tex->serial, p, 0, 0, SDX_NEED, 0, 0, 3}); break; }
-            case OP_CLEAR_TEX: { const p_clear_tex *c = a; if (c->tex) sdx_ev_add((sdx_ev){seq, 0, c->tex->serial, p, 0, 0, SDX_NEED, 0, 0, 4}); break; }
+            case OP_COPY_T2T: { g_sdx_rt_open = 0; const p_copy_t2t *c = a; if (c->src) sdx_ev_add((sdx_ev){seq, 0, c->src->serial, p, 0, 0, SDX_NEED, 0, 0, 3}); if (c->dst) sdx_ev_add((sdx_ev){seq, 0, c->dst->serial, p, 0, 0, SDX_NEED, 0, 0, 3}); break; }
+            case OP_COPY_T2B: case OP_COPY_B2T: { g_sdx_rt_open = 0; const p_copy_b2t *c = a; if (c->tex) sdx_ev_add((sdx_ev){seq, 0, c->tex->serial, p, 0, 0, SDX_NEED, 0, 0, 3}); break; }
+            case OP_CLEAR_TEX: { g_sdx_rt_open = 0; const p_clear_tex *c = a; if (c->tex) sdx_ev_add((sdx_ev){seq, 0, c->tex->serial, p, 0, 0, SDX_NEED, 0, 0, 4}); break; }
             default: break;
         }
         p += h.size;
     }
 }
 void mtl_sub_index(const uint64_t *h, int n) {   // 提交开始（hle_nvn.c QueueSubmitCommands）：建本次提交的写回前瞻索引 | Start of submit (hle_nvn.c QueueSubmitCommands): build this submit's store lookahead index
-    g_xv_ntouch = 0; g_sdx_n = g_sdx_nop = 0; g_rtx_n = g_drx_n = 0; g_exec_seq = 0; g_sdx_ok = tbdr_on();
+    g_xv_ntouch = 0; g_sdx_n = g_sdx_nop = 0; g_rtx_n = g_drx_n = 0; g_exec_seq = 0;
+    g_bar_vs_first_write = UINT32_MAX; g_bar_vs_last_read = 0; g_bar_vs_ok = 0;
+    g_sdx_ok = tbdr_on() || totk_store_opt_on() || bar_narrow() == 1;
     if (!g_sdx_ok) { g_xv_n = 0; g_xv_block = 1; return; }   // 索引不可用：账本清空、本次提交不新增（没法核下一次触碰） | Index unavailable: clear the ledger and add nothing in this submit (the next touch cannot be verified)
     g_xv_block = 0;
     memset(g_sdx_hk, 0, sizeof g_sdx_hk); g_sdx_nb = 0;
     for (int i = 0; i < g_xv_n; i++) sdx_bucket(g_xv[i].ser, 1);   // 账本里的贴图进候选集：否则它在本次提交里只被采样、不作附件时读事件不入索引，兜底看不见 | Textures in the ledger enter the candidate set: otherwise, when one is only sampled and not used as an attachment in this submit, its read events are not indexed and the fallback cannot see them
-    if (R.has_rt) { for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k]) sdx_bucket(R.rt.color[k]->serial, 1); if (R.rt.depth) sdx_bucket(R.rt.depth->serial, 1); }   // 提交开始时的目标（首个绘制可能不经 SetRenderTargets 重开通道） | The targets at the start of the submit (the first draw may reopen the render pass without going through SetRenderTargets)
-    g_pp_prog = S.prog; g_pp_rt = NULL; g_pp_rtseq = SDX_NONE;
+    if (R.has_rt) { for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k]) sdx_note_att(R.rt.color[k]->serial, 0); if (R.rt.depth) sdx_note_att(R.rt.depth->serial, 0); }   // 提交开始时的目标（首个绘制可能不经 SetRenderTargets 重开通道） | The targets at the start of the submit (the first draw may reopen the render pass without going through SetRenderTargets)
+    g_pp_prog = S.prog; g_pp_rt = R.has_rt ? &R.rt : NULL; g_pp_rtseq = R.has_rt ? 0 : SDX_NONE;
+    g_sdx_sc = R.sc; g_sdx_has_sc = R.has_sc; g_sdx_rt_open = g_enc != nil;
     for (int st = 0; st < 6; st++) { for (int k = 0; k < 128; k++) g_pp_slot[st][k] = S.tex[st][k] ? h_ser(S.tex[st][k]) : 0;
                                      for (int k = 0; k < 32; k++) g_pp_slot[st][128 + k] = S.img[st][k] ? h_ser(S.img[st][k]) : 0; }
     g_sdx_ren = 1;
     for (int i = 0; i < n && g_sdx_ok; i++) sdx_walk((const uint8_t *)h[i], 0);
     if (!g_sdx_ok) return;
+    g_bar_vs_ok = 1;
     // 计数排序到桶：事件本按序号追加，同一序号内 READ 先于 ATT（同一绘制先判读后判附件），稳定散列后桶内有序
     // Counting sort into buckets: events are appended in sequence-number order, and within the same sequence number READ precedes ATT (the same draw is judged for reads first, then attachments), so after a stable scatter each bucket is ordered
     memset(g_sdx_bcnt, 0, (g_sdx_nb + 1) * sizeof *g_sdx_bcnt);
@@ -7650,7 +7764,7 @@ void mtl_sub_index(const uint64_t *h, int n) {   // 提交开始（hle_nvn.c Que
 }
 static void sdx_seq(const uint8_t *p) {   // mtl_exec 每条操作：序号与索引核对（不符即作废，余下一律写回） | Every operation in mtl_exec: check the sequence number against the index (on mismatch invalidate, and store everything for the rest)
     if (!g_sdx_ok) return;
-    if (g_exec_seq >= g_sdx_nop || g_sdx_op[g_exec_seq] != p) { RED_ONCE(40, "写回前瞻索引与回放顺序不符（序号 %u / %u），本次提交余下通道一律写回", g_exec_seq, g_sdx_nop); g_sdx_ok = 0; return; }
+    if (g_exec_seq >= g_sdx_nop || g_sdx_op[g_exec_seq] != p) { RED_ONCE(40, "写回前瞻索引与回放顺序不符（序号 %u / %u），本次提交余下通道一律写回", g_exec_seq, g_sdx_nop); g_sdx_ok = g_bar_vs_ok = 0; return; }
     g_exec_seq++;
 }
 static int sdx_decide(uint8_t st[9]) {   // st[i]：2 多余；否则 why << 2（需要的原因，同 sd_need）。返回 0 = 索引不可用 | st[i]: 2 redundant; otherwise why << 2 (the reason it is needed, same as sd_need). Returns 0 = index unavailable
@@ -7663,7 +7777,7 @@ static int sdx_decide(uint8_t st[9]) {   // st[i]：2 多余；否则 why << 2�
         for (uint32_t j = lo; j < end; j++) { const sdx_ev *e = &g_sdx[j];
             if (g_hoist_n && hoist_skipped(e->op)) continue;
             if (e->kind == SDX_READ || e->kind == SDX_NEED) { st[i] = (uint8_t)(e->why << 2); break; }
-            if (e->rtseq == SDX_NONE || e->rtseq < P || (g_hoist_n && hoist_skipped(g_sdx_op[e->rtseq]))) continue;   // 该目标在通道结束之前设的：通道结束之后未重设为附件，不算 | This target was set before the render pass ended: not re-set as an attachment after the render pass ended, so it does not count
+            if (e->rtseq == SDX_NONE || (e->kind == SDX_CLEAR && e->rtseq < P) || (g_hoist_n && hoist_skipped(g_sdx_op[e->rtseq]))) continue;   // 该清除在通道结束之前设的目标：通道结束之后未重设为附件，不算 | This clear's target was set before the render pass ended: not re-set as an attachment after the render pass ended, so it does not count
             int hit = t->depth ? (e->kind == SDX_ATT ? e->plane == 8 : e->plane == t->depth) && (e->anyls || (e->lv == t->lv && e->sl == t->sl))
                                : e->plane == 0 && e->lv == t->lv && e->sl == t->sl;
             if (!hit) continue;
@@ -9378,7 +9492,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (exp_skip_fs(pr)) return;   // TOTK_EXP_SKIP_FS (measurement only)
     // 续用的通道可能是少挂深度 / 模板开的（开法 2 / 3 / 4）：这次绘制要的平面没挂，就在它之前切开（重开时按新前瞻挂）
     // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
-    if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
+    if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw || (pr && pr->sh[1] && pr->sh[1]->writes_depth)) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
         static int once2; if (!once2++) MLOG("同目标续用：续用通道内绘制要的深度 / 模板平面没挂，在此切开（首例 通道 %llu）", g_stat_pass);
         PD("M %llu 续用通道内绘制要的深度 / 模板平面没挂，在此切开", g_stat_pass); rp_end(); }
     if (g_rt_range_active && (!rt_range_pr_ro(pr) || !S.ds.dt || S.ds.dw || S.ds.st)) rp_end();   // 原encoder边界的外部写可见性不删 | The external write visibility at the original encoder boundary is not removed
@@ -9400,13 +9514,14 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
 #endif
     int defer_q_draw = !g_enc && !g_defer_replaying && g_defer_natq > 0;   // Q 开通道的这次绘制：通道照常经 hoist_try / fuse_try 开好后，先回放 P 再画本次 | The draw that opens Q's render pass: after the render pass is opened as usual through hoist_try / fuse_try, replay P first and then draw this one
     if (g_frz_state) goto frz_plain;   // 世界冻结的完整帧 / 冻结帧：不前提、不推迟、不合并（跳通道的状态机要看到每一条设目标） | Full frame / frozen frame of world freeze: no hoisting, no deferral, no merging (the pass-skipping state machine must see every set-target)
-    if (!g_enc && tbdr_on()) hoist_try();   // 先把夹在本通道与其续用之间的纯清除通道提前做掉（rp_begin_ex 之前，不占本通道） | First hoist and execute the pure-clear render passes sandwiched between this render pass and its continuation (before rp_begin_ex, not occupying this render pass)
+    if (!g_enc && (tbdr_on() || totk_hoist_on())) hoist_try();   // 先把夹在本通道与其续用之间的纯清除通道提前做掉（rp_begin_ex 之前，不占本通道） | First hoist and execute the pure-clear render passes sandwiched between this render pass and its continuation (before rp_begin_ex, not occupying this render pass)
     // 推迟判定在 hoist_try 之后：被提前的纯清除通道在前瞻里跳过，P 的同目标续段才认得出来
     // The deferral decision comes after hoist_try: hoisted pure-clear render passes are skipped in the lookahead, and only then can P's same-target continuation segment be recognized
     if (!g_enc && tbdr_on() && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) { g_draw_skip[7]++; return; } }
     if (!g_enc && tbdr_on() && !g_fz_checking) fuse_try();   // 可读 tile 通道合并缺省开；结构 / 本像素证明不成立仍退回普通通道，CHECK 重画时不重入 | Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
 frz_plain:;
-    int need = g_enc || !tbdr_on() ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 都不挂 3 只挂模板 4 只挂深度 | 2 attach neither, 3 attach stencil only, 4 attach depth only
+    int need = g_enc || !(tbdr_on() || totk_ds_omit_on()) ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 都不挂 3 只挂模板 4 只挂深度 | 2 attach neither, 3 attach stencil only, 4 attach depth only
+    if (!g_enc && mode >= 2 && !tbdr_on()) mode = ds_mode_pso_ready(pr, mode);
     int skip_d = mode != 0;
     if (!g_enc && !g_cg.replaying && cg_on()) {   // TOTK: cube-face-set pass groups (nvn_cube_group.h)
         if (cg_take(pr, dw, di)) return;

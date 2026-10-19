@@ -35,12 +35,26 @@ static unsigned g_n, g_pso, g_lib, g_load;
 static double g_make_ms;
 static uint64_t g_frames;
 static int g_on = -1;
+/* Optional benchmark samples: append batches on the existing writer thread,
+   never perform file I/O on the game's frame path. Timestamps are retirement
+   times (GPU results arrive eight frames late), on CLOCK_MONOTONIC. */
+typedef struct { uint64_t frame, retired_ns; double frame_ms, gpu_ms; int loading; } frame_sample;
+static frame_sample g_samples[PERF_MAX];
+static const char *g_sample_path;
+static uint64_t g_sample_overflow;
 
 static int perf_on(void) { if (g_on < 0) { const char *e = getenv("TOTK_PERF_LOG"); g_on = !(e && !strcmp(e, "0")); } return g_on; }
-void totk_perf_frame(double frame_ms, double gpu_ms, unsigned pso, unsigned lib, double make_ms, int loading) {
+void totk_perf_frame(uint64_t frame, double frame_ms, double gpu_ms, unsigned pso, unsigned lib, double make_ms, int loading) {
     if (!perf_on()) return;
     pthread_mutex_lock(&g_mu);
-    if (g_n < PERF_MAX) { g_fr[g_n] = frame_ms; g_gpu[g_n] = gpu_ms; g_n++; }
+    if (g_n < PERF_MAX) {
+        g_fr[g_n] = frame_ms; g_gpu[g_n] = gpu_ms;
+        if (g_sample_path) {
+            struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+            g_samples[g_n] = (frame_sample){frame, (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec, frame_ms, gpu_ms, loading};
+        }
+        g_n++;
+    } else if (g_sample_path) g_sample_overflow++;
     g_pso += pso; g_lib += lib; g_make_ms += make_ms; g_load |= loading != 0; g_frames++;
     pthread_mutex_unlock(&g_mu);
 }
@@ -61,7 +75,9 @@ static double footprint_mb(void) {
 static const char *env_or(const char *name, const char *dflt) { const char *v = getenv(name); return v && *v ? v : dflt; }
 static void *writer(void *arg) {
     (void)arg;
-    char path[1024]; snprintf(path, sizeof path, "%s/Library/Logs/MacNativeGames/perf.csv", env_or("HOME", "/tmp"));
+    char path[1024]; const char *private_csv = getenv("TOTK_PERF_CSV");
+    if (private_csv && *private_csv) snprintf(path, sizeof path, "%s", private_csv);
+    else snprintf(path, sizeof path, "%s/Library/Logs/MacNativeGames/perf.csv", env_or("HOME", "/tmp"));
     FILE *f = fopen(path, "a"); if (!f) return NULL;
     time_t now = time(NULL); char ts[32]; strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", localtime(&now));
     fprintf(f, "# launch %s pid %d\n", ts, getpid());
@@ -69,6 +85,10 @@ static void *writer(void *arg) {
                "new_pipelines,new_libraries,build_ms,skipped_draws,skipped_missing,footprint_mb,loading,world,draws_per_frame,async_queued,async_skipped,audio_underruns,xlate_block_ms,xlate_pending,timer_reads,svc_calls,inplace_pso,inplace_merged,inplace_pso_ms,inplace_pso_max_ms,wakes,wake_ms,core_waits,core_wait_ms,main_wake_ms,main_core_wait_ms,main_lock_ms,main_cond_ms,main_addr_ms,main_sync_ms,main_host_wait_ms,core0_pct,core1_pct,core2_pct,"
                "mode,render_res,fps60,present_hz,mfx_upscale,mfx_output,picture,interpolation,warm_threads,async_pso\n");
     fflush(f);
+    FILE *samples = g_sample_path ? fopen(g_sample_path, "w") : NULL;
+    if (g_sample_path && !samples) fprintf(stderr, "[perf] cannot open frame samples: %s\n", g_sample_path);
+    if (samples) { fprintf(samples, "frame,retired_ns,frame_ms,gpu_ms,loading\n"); fflush(samples); }
+    static frame_sample raw[PERF_MAX]; uint64_t overflow_seen = 0;
     static double fr[PERF_MAX], gp[PERF_MAX], pv[PERF_MAX];
     double t0 = (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9, last_cpu = cpu_s(), last_t = t0;
     uint64_t last_skip = 0, last_miss = 0, last_draws = 0, last_frames = 0, last_aq = 0, last_as = 0, last_au = 0, last_xb = 0, last_tr = 0, last_sv = 0, tr = 0, sv = 0, last_ipn = 0, last_ipm = 0, last_ipns = 0, hs[16] = {0}, last_hs[16] = {0};
@@ -76,10 +96,21 @@ static void *writer(void *arg) {
         sleep(1);
         pthread_mutex_lock(&g_mu);
         unsigned n = g_n; memcpy(fr, g_fr, n * sizeof *fr); memcpy(gp, g_gpu, n * sizeof *gp);
+        if (samples) memcpy(raw, g_samples, n * sizeof *raw);
+        uint64_t overflow = g_sample_overflow;
         unsigned npv = g_npv, pdrop = g_pdrop; memcpy(pv, g_pv, npv * sizeof *pv); g_npv = g_pdrop = 0;
         unsigned pso = g_pso, lib = g_lib, load = g_load; double make = g_make_ms; uint64_t frames = g_frames;
         g_n = g_pso = g_lib = g_load = 0; g_make_ms = 0;
         pthread_mutex_unlock(&g_mu);
+        if (samples) {
+            for (unsigned i = 0; i < n; i++) fprintf(samples, "%llu,%llu,%.6f,%.6f,%d\n",
+                (unsigned long long)raw[i].frame, (unsigned long long)raw[i].retired_ns, raw[i].frame_ms, raw[i].gpu_ms, raw[i].loading);
+            if (overflow != overflow_seen) {
+                fprintf(samples, "# overflow=%llu\n", (unsigned long long)overflow); overflow_seen = overflow;
+                fprintf(stderr, "[perf] frame sample overflow: %llu\n", (unsigned long long)overflow);
+            }
+            fflush(samples);
+        }
         double t = (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9, c = cpu_s();
         double cpu = t > last_t ? 100.0 * (c - last_cpu) / (t - last_t) : 0; last_cpu = c; last_t = t;
         unsigned l50 = 0, l100 = 0, ng = 0; double gs = 0;
@@ -106,5 +137,6 @@ static void *writer(void *arg) {
 }
 __attribute__((constructor)) static void perf_start(void) {
     if (!perf_on() || getenv("TOTK_HEADLESS")) return;
+    const char *path = getenv("TOTK_FRAME_SAMPLES"); g_sample_path = path && *path ? path : NULL;
     pthread_t th; if (!pthread_create(&th, NULL, writer, NULL)) pthread_detach(th);
 }
