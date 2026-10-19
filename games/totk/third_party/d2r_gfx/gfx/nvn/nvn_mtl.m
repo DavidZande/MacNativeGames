@@ -4867,6 +4867,18 @@ static uint64_t stage_sig(int st);
    restores copy earlier states), so they are 0 and stage_sig compares only the slots below it (it compared all 128). */
 static int g_tex_hi[6] = {1, 1, 1, 1, 1, 1};
 static NSArray *rt_local(const uint8_t *control, int st);
+/* From upstream PR #28: the draw predictor (pso_predict_rest) only looks programs up. prog_get hashes shader code and can
+   start translations and library loads for a draw that is only predicted, on the submit thread inside the frame. A
+   program not built yet is just not predicted; when it is actually drawn, prog_get handles it as before. */
+static __unsafe_unretained NvProg *prog_get_cached(const prog_t *cp) {   // submit thread only
+    prog_t *p = (prog_t *)cp;
+    static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;
+    uint64_t gen = g_ser_gen;
+    if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser))) { lgen = gen; return lpr; }
+    __unsafe_unretained NvProg *have = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
+    if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; }
+    return have;
+}
 static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
@@ -7296,7 +7308,7 @@ static void pso_predict_rest(void) {
         }
         if (hq.op == OP_DRAW || hq.op == OP_DRAW_IDX) {
             draws++;
-            __unsafe_unretained NvProg *pr = S.prog ? prog_get(S.prog) : nil; if (!pr || !pr->sh[0]) continue;
+            __unsafe_unretained NvProg *pr = S.prog ? prog_get_cached(S.prog) : nil; if (!pr || !pr->sh[0] || pr->missing) continue;   // lookup only (prog_get_cached)
             __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
             const uint32_t dv[4] = {dfull, 0, 0, dfull}, sv[4] = {sfull, 0, sfull, 0};
             for (int v = 0; v < 4; v++) {
