@@ -137,7 +137,7 @@ verify-shaders:
 	"$(PY)" scripts/verify_shader_compilation.py
 
 build/thread-probe: scripts/thread_probe.c runtime/threads.c runtime/thread_compat.h runtime/thread_enter.S
-	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn/include scripts/thread_probe.c runtime/threads.c runtime/thread_enter.S -o "$@"
+	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn/include scripts/thread_probe.c runtime/threads.c runtime/thread_enter.S -Wl,-U,_totk_tl_on -Wl,-U,_totk_tl_at -o "$@"
 
 probe-thread: build/thread-probe
 	build/thread-probe > analysis/thread-probe.json
