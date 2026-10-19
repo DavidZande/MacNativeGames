@@ -2140,6 +2140,21 @@ static int uncapped_interval_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_UNCAPPED_INTERVAL"); v = e && atoi(e); atomic_store(&g_uncapped_interval, v); }
     return v;
 }
+/* Local change, the capped 60 FPS mode (settings "60 FPS", DM_PRESENT_HZ=60): the game's frame-rate controller
+   (main+0x8f6bec) asks for interval 2 as soon as main-thread work passes ~16.7 ms, and honouring it held busy areas at
+   ~29 FPS although they run at 54-67 uncapped. With the real-time frame step (TOTK_REALTIME) game time follows the
+   measured present-to-present time, so the interval no longer sets game speed: present on every tick of the cap, as the
+   uncapped mode does. Needs the 60 FPS patch (the "30 FPS" setting keeps the game's interval) and leaves deterministic
+   runs alone. TOTK_CAP_INTERVAL=game restores the game's interval. */
+static int g_cap_full = -1;
+static int cap_full_rate(void) {
+    if (g_cap_full < 0) {
+        const char *e = getenv("TOTK_CAP_INTERVAL"), *rt = getenv("TOTK_REALTIME"), *f60 = getenv("TOTK_FPS60");
+        g_cap_full = !(e && !strcmp(e, "game")) && !(rt && !strcmp(rt, "0")) && !(f60 && !strcmp(f60, "0"));
+        if (g_cap_full) LOG("[nvn] capped mode: every frame on the next tick of the cap, the game's present interval is ignored (TOTK_CAP_INTERVAL=game: honour it)");
+    }
+    return g_cap_full && !g_uncapped && !dm_detclock_enabled();
+}
 static double g_rt_comp_ms;   // 当前声明的实时计算量（ms；0 = 未声明） | Currently declared real-time computation amount (ms; 0 = not declared)
 static double g_rt_period_ms;
 static void sleep_until_ns(uint64_t dl);
@@ -2484,7 +2499,7 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
        counts 60 Hz ticks; paced on 120 Hz ticks it is doubled, so on-time frames keep their timing (16.7 / 33.3 ms) and a
        frame that just misses lands on the next 8.3 ms tick (41.7 ms) instead of the next 16.7 ms one (50 ms). */
     static int scale = -1; if (scale < 0) { const char *e = getenv("TOTK_INTERVAL_SCALE"); scale = e ? atoi(e) : 1; if (scale < 1 || scale > 4) scale = 1; }
-    unsigned base = g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
+    unsigned base = g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || cap_full_rate() || o->interval <= 0 ? 1u : (unsigned)o->interval;
     return base * (unsigned)scale;
 }
 static uint64_t present_period(const win_t *o) {
@@ -2502,13 +2517,15 @@ static uint64_t present_period(const win_t *o) {
 void dm_nvn_probe_present_interval(void) {
     int saved_hz = g_hz, saved_display = g_display_mode, saved_uncapped = g_uncapped;
     int saved_flag = atomic_load(&g_uncapped_interval), checked = 0;
+    cap_full_rate(); int saved_cap_full = g_cap_full;
     const char *neg = getenv("TOTK_PROBE_NEGATIVE");
     for (int hz = 60; hz <= 120; hz += 60) for (int uncapped = 0; uncapped < 2; uncapped++)
-    for (int display = 0; display < 2; display++) for (int on = 0; on < 2; on++)
+    for (int display = 0; display < 2; display++) for (int on = 0; on < 2; on++) for (int full = 0; full < 2; full++)
     for (int interval = -1; interval <= 3; interval++) {
         win_t w = {.interval = interval}; g_hz = hz; g_display_mode = display; g_uncapped = uncapped;
         atomic_store(&g_uncapped_interval, neg && atoi(neg) == 11 ? 0 : on);
-        unsigned expected = display || (uncapped && on && !dm_detclock_enabled()) || interval <= 0 ? 1u : (unsigned)interval;
+        g_cap_full = neg && atoi(neg) == 13 ? 0 : full;   /* negative control 13: the capped full-rate rule is never applied */
+        unsigned expected = display || (uncapped && on && !dm_detclock_enabled()) || (!uncapped && full && !dm_detclock_enabled()) || interval <= 0 ? 1u : (unsigned)interval;
         if (present_ticks(&w) != expected || present_period(&w) != (uint64_t)expected * 1000000000ull / hz)
             die("present interval probe: effective pacing differs from expected");
         checked++;
@@ -2520,6 +2537,7 @@ void dm_nvn_probe_present_interval(void) {
        over, so the uncapped pacing stays and the half-rate check fails. */
     extern void mfx_set(int mode); extern int mfx_latch(void);
     int saved_paced = g_paced_hz, saved_mfx = mfx_enabled();
+    g_cap_full = 0;   /* below: the interpolation modes against the game's interval */
     mfx_set(MFX_HALF); if (!(neg && atoi(neg) == 20)) mfx_latch();
     for (int uncapped = 0; uncapped < 2; uncapped++) for (int interval = -1; interval <= 3; interval++) {
         win_t w = {.interval = interval}; g_paced_hz = 100; g_hz = uncapped ? UNCAPPED_HZ : 100; g_display_mode = 0; g_uncapped = uncapped;
@@ -2546,7 +2564,7 @@ void dm_nvn_probe_present_interval(void) {
     }
     mfx_set(saved_mfx); mfx_latch();
     g_hz = saved_hz; g_paced_hz = saved_paced; g_display_mode = saved_display; g_uncapped = saved_uncapped;
-    atomic_store(&g_uncapped_interval, saved_flag);
+    atomic_store(&g_uncapped_interval, saved_flag); g_cap_full = saved_cap_full;
     LOG("[present-interval] %d pacing cases passed", checked);
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
