@@ -4632,12 +4632,17 @@ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
 /* TOTK: the translated Switch shaders rely on exactly rounded IEEE float arithmetic (integer-division idioms built from
    float bit patterns, invariant positions, depth compares); Metal's default fast math breaks them. */
 static MTLCompileOptions *totk_precise_opts(void) {
-    static MTLCompileOptions *o; if (o) return o;
-    o = [MTLCompileOptions new];
-    if (@available(macOS 15.0, *)) o.mathMode = MTLMathModeSafe; else o.fastMathEnabled = NO;
-    /* TOTK_FAST_MATH=1 (measurement only): fast math for every translated shader. Known to break the tile-light vertex
-       shader's integer-division idiom, so pictures from such runs are not evidence of correctness. */
-    if (getenv("TOTK_FAST_MATH") && atoi(getenv("TOTK_FAST_MATH"))) { if (@available(macOS 15.0, *)) o.mathMode = MTLMathModeFast; else o.fastMathEnabled = YES; MLOG("【实验】TOTK_FAST_MATH=1：着色器用快速数学"); }
+    /* Made once and published only when complete (upstream 35606fe): the parallel warm-up and the background compiles call
+       this from several threads, and a thread must never get the options before mathMode is set (that compiles with fast math). */
+    static MTLCompileOptions *o; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        MTLCompileOptions *x = [MTLCompileOptions new];
+        if (@available(macOS 15.0, *)) x.mathMode = MTLMathModeSafe; else x.fastMathEnabled = NO;
+        /* TOTK_FAST_MATH=1 (measurement only): fast math for every translated shader. Known to break the tile-light vertex
+           shader's integer-division idiom, so pictures from such runs are not evidence of correctness. */
+        if (getenv("TOTK_FAST_MATH") && atoi(getenv("TOTK_FAST_MATH"))) { if (@available(macOS 15.0, *)) x.mathMode = MTLMathModeFast; else x.fastMathEnabled = YES; MLOG("【实验】TOTK_FAST_MATH=1：着色器用快速数学"); }
+        o = x;
+    });
     return o;
 }
 /* TOTK (2026-10-15): which words of the NVN driver constant segments c0 / c2 a translated shader reads, scanned from its MSL
