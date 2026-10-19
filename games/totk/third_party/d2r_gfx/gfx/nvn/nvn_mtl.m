@@ -5984,6 +5984,9 @@ static struct { pso_key k; id<MTLRenderPipelineState> ps; int used, done; } g_pp
 static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
 static void pso_predict_rest(void);
+// Statistics line (pso_predict_rest, every 100 scans; ported from upstream c5b3ae7): guesses refused because the table was
+// full, time draws waited for a background compile, scans and which budget ended them.
+static uint64_t g_pp_full, g_pp_waits, g_pp_wait_ns, g_pp_scans, g_pp_scan_ns, g_pp_stop[3];
 static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
 /* Local change: background pipeline builds (prediction and TOTK_ASYNC_PSO) run on their own queue below the render
    thread: TOTK_COMPILE_QOS=utility (default) | default | initiated (the old behaviour). With background compiling off the
@@ -6024,6 +6027,7 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
         if (slot < 0) for (int i = 0; i < PSO_PEND_MAX; i++) if (!g_pp[i].used) { slot = i; break; }
     }
     if (at < 0 && slot >= 0) { g_pp[slot].k = *k; g_pp[slot].ps = nil; g_pp[slot].done = 0; g_pp[slot].used = 1; }
+    if (at < 0 && slot < 0) g_pp_full++;
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
     MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
@@ -6035,7 +6039,10 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
 static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交线程调：表里有就等它编完并取走；没有返回 nil | Called by the submit thread: if it is in the table, wait for it to finish compiling and take it; otherwise return nil
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k); id<MTLRenderPipelineState> ps = nil;
-    if (at >= 0) { while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu); ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
+    if (at >= 0) { uint64_t t0 = bp_now(); int waited = !g_pp[at].done;
+        while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu);
+        if (waited) { g_pp_waits++; g_pp_wait_ns += bp_now() - t0; }
+        ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
@@ -7414,6 +7421,40 @@ static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl);
 // 通道实际挂不挂深度 / 模板要到回放时才定（纯深度 / 纯模板 / 都不挂的省略），所以每种可能的挂法各算一条键——猜多了只是后台白编，不影响结果。
 // Prediction for parallel precompilation (see the note before pso_get): scan from after the current operation to the end of this submit, replaying only state; at a draw, compute the pipeline key from "the state at that time + that render pass's attachment formats" and dispatch those not yet built to the background.
 // Whether a render pass actually attaches depth / stencil is only decided at replay (depth-only / stencil-only / neither attached are omitted), so one key is computed for each possible attach mode -- guessing too many only means wasted background compiles and does not affect the result.
+/* Ported from upstream c5b3ae7 (after PR #29), 2026-10-19. TOTK_PROBE_NEGATIVE 24 / 26 / 27 each break one rule below
+   (probe-gfx must then fail). */
+static int pred_negative(void) { static int neg = -1; if (neg < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); neg = e ? atoi(e) : 0; } return neg; }
+/* The stages a predicted draw uses: the variant its state selects (stage_sig), and only one already built -- prediction
+   must not translate, compile or change a program's active binding. A program with a stage not translated yet
+   (pr->missing) draws nothing and its fragment stage can be absent: not predicted. The fork used the active variant
+   (pr->sh) whatever the state, so it compiled pipelines for variants no draw would use. Negative 24 takes the active
+   variant; 26 ignores untranslated stages. */
+static int prog_prediction_stages(const prog_t *p, NvShader **vs, NvShader **fs) {
+    __unsafe_unretained NvProg *pr = p ? prog_get_cached(p) : nil;
+    if (!pr || (pr->missing && pred_negative() != 26)) return 0;
+    NvShader *stages[2] = {nil, nil};
+    for (int st = 0; st < 2; st++) {
+        if (!pr->sh[st]) { if (!st) return 0; continue; }
+        uint64_t sig = stage_sig(st);
+        stages[st] = sig == pr->sig[st] || pred_negative() == 24 ? pr->sh[st] : pr->alt[st][@(sig)];
+        if (!stages[st]) return 0;
+    }
+    *vs = stages[0]; *fs = stages[1]; return 1;
+}
+// Attach modes guessed for one draw: v = 0 the pass's own depth / stencil, 1 neither, 2 stencil only, 3 depth only
+// (ds_scan drops the planes no draw uses, which is only known at replay).
+static const uint8_t PRED_DEPTH[4] = {1, 0, 0, 1}, PRED_STENCIL[4] = {1, 0, 1, 0};
+// A fragment function that exports depth makes ds_scan attach the pass's depth buffer, so a guess without it is never
+// used -- and pso_desc would compile that variant's library (fs_fn_without_depth) on the submit thread for nothing.
+// Negative 27 guesses it anyway.
+static int pred_guess_wanted(int v, uint32_t dfull, uint32_t sfull, __unsafe_unretained NvShader *fs) {
+    uint32_t d = PRED_DEPTH[v] ? dfull : 0, s = PRED_STENCIL[v] ? sfull : 0;
+    if (v && d == dfull && s == sfull) return 0;   // same as the pass's own
+    if (v == 2 && !sfull) return 0;
+    if (v == 3 && (!dfull || !sfull)) return 0;
+    if (dfull && !d && fs && fs->writes_depth && pred_negative() != 27) return 0;
+    return 1;
+}
 static void pso_predict_rest(void) {
     static int enabled = -1; if (enabled < 0) { const char *e = getenv("TOTK_PSO_PREDICT"); enabled = !e || atoi(e); }
     if (!enabled) return;
@@ -7424,8 +7465,24 @@ static void pso_predict_rest(void) {
     fz_cursor cur = {.p = g_exec_next};
     // 先收齐再丢：按「附件原样挂」的键排在前（最可能用到），其余挂法排在后——后台并发有限，先丢的先编完
     // Collect them all first, then dispatch: keys for "attachments attached as-is" go first (most likely to be used), the other attach modes after -- background concurrency is limited, and what is dispatched first is compiled first
-    enum { QN = 160 }; static struct { pso_key k; void *vs, *fs; } qa[QN], qb[QN]; int na = 0, nb = 0;
-    for (int guard = 0; guard < 200000 && na < QN; guard++) {
+    /* Budget per scan (from upstream c5b3ae7): commands, keys (each of the two queues), microseconds --
+       TOTK_PSO_PREDICT_SCAN / _KEYS / _US; defaults 8192 / 32 / 2000. Keys for the pass's own attachments are kicked as
+       they are found, so the current draw does not wait for the whole scan before any worker starts. */
+    enum { QN = 160 }; static int max_ops = -1, max_keys, max_us;
+    if (max_ops < 0) {
+        const char *e = getenv("TOTK_PSO_PREDICT_SCAN"); int ops = e ? atoi(e) : 8192;
+        e = getenv("TOTK_PSO_PREDICT_KEYS"); max_keys = e ? atoi(e) : 32; if (max_keys < 1) max_keys = 1; if (max_keys > QN) max_keys = QN;
+        e = getenv("TOTK_PSO_PREDICT_US"); max_us = e ? atoi(e) : 2000; if (max_us < 1) max_us = 1;
+        max_ops = ops < 1 ? 1 : ops;
+        MLOG("[totk] pipeline prediction: after a submission's first pipeline miss, scans at most %d commands, %d keys, %d us", max_ops, max_keys, max_us);
+    }
+    uint64_t started = bp_now();
+    static struct { pso_key k; void *vs, *fs; } qa[QN], qb[QN]; int na = 0, nb = 0;
+    int stop = 0;   // which budget ended the scan: 1 commands, 2 keys, 3 time (0: end of the submission)
+    for (int guard = 0; ; guard++) {
+        if (guard >= max_ops) { stop = 1; break; }
+        if (na >= max_keys) { stop = 2; break; }
+        if (bp_now() - started > (uint64_t)max_us * 1000ull) { stop = 3; break; }
         const uint8_t *q; op_hdr hq; const void *aq;
         if (!fz_next(&cur, &q, &hq, &aq)) break;
         if (hq.op == OP_SET_RT) {
@@ -7442,18 +7499,16 @@ static void pso_predict_rest(void) {
         }
         if (hq.op == OP_DRAW || hq.op == OP_DRAW_IDX) {
             draws++;
-            __unsafe_unretained NvProg *pr = S.prog ? prog_get_cached(S.prog) : nil; if (!pr || !pr->sh[0] || pr->missing) continue;   // lookup only (prog_get_cached)
-            __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
-            const uint32_t dv[4] = {dfull, 0, 0, dfull}, sv[4] = {sfull, 0, sfull, 0};
+            NvShader *vs = nil, *fs = nil;
+            if (!S.prog || !prog_prediction_stages(S.prog, &vs, &fs)) continue;   // lookup only (prog_get_cached), the state's variant
             for (int v = 0; v < 4; v++) {
-                if (v && dv[v] == dv[0] && sv[v] == sv[0]) continue;
-                if (v == 2 && !sfull) continue; if (v == 3 && (!dfull || !sfull)) continue;
-                pso_key k; pso_key_fill(&k, vs, fs, cf, dv[v], sv[v], samples, 0);
+                if (!pred_guess_wanted(v, dfull, sfull, fs)) continue;
+                pso_key k; pso_key_fill(&k, vs, fs, cf, PRED_DEPTH[v] ? dfull : 0, PRED_STENCIL[v] ? sfull : 0, samples, 0);
                 if (hm_get_id(&g_pso, &k)) continue;
                 int dup = 0; for (int i = 0; i < (v ? nb : na) && !dup; i++) dup = !memcmp(&(v ? qb : qa)[i].k, &k, sizeof k);
                 if (dup) continue;
-                if (!v && na < QN) { qa[na].k = k; qa[na].vs = (__bridge void *)vs; qa[na].fs = (__bridge void *)fs; na++; }
-                else if (v && nb < QN) { qb[nb].k = k; qb[nb].vs = (__bridge void *)vs; qb[nb].fs = (__bridge void *)fs; nb++; }
+                if (!v && na < max_keys) { qa[na].k = k; qa[na].vs = (__bridge void *)vs; qa[na].fs = (__bridge void *)fs; na++; pso_pend_kick(&k, vs, fs); }
+                else if (v && nb < max_keys) { qb[nb].k = k; qb[nb].vs = (__bridge void *)vs; qb[nb].fs = (__bridge void *)fs; nb++; }
             }
             continue;
         }
@@ -7461,10 +7516,18 @@ static void pso_predict_rest(void) {
         state_op(hq.op, aq);
     }
     (void)df; (void)sf;
-    for (int i = 0; i < na; i++) pso_pend_kick(&qa[i].k, (__bridge NvShader *)qa[i].vs, (__bridge NvShader *)qa[i].fs);
     for (int i = 0; i < nb; i++) pso_pend_kick(&qb[i].k, (__bridge NvShader *)qb[i].vs, (__bridge NvShader *)qb[i].fs);
     memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("并行预编：本次提交余下 %d 次绘制，丢给后台 %d 条管线", draws, (int)g_pp_kicked - kicked0);
+    g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
+    if (g_pp_scans % 100 == 0) {
+        pthread_mutex_lock(&g_pp_mu); uint64_t full = g_pp_full, waits = g_pp_waits, wait_ns = g_pp_wait_ns; int busy = 0;
+        for (int i = 0; i < PSO_PEND_MAX; i++) busy += g_pp[i].used; pthread_mutex_unlock(&g_pp_mu);
+        MLOG("[pso-predict] to submission %llu: %llu scans (%.2f ms each; ended by commands %llu, keys %llu, time %llu), %llu pipelines started in the background, %llu taken by draws (%llu waits, %.1f ms), %llu refused (table full), %d slots in use",
+             (unsigned long long)g_sub_serial, (unsigned long long)g_pp_scans, g_pp_scan_ns / 1e6 / (double)g_pp_scans,
+             (unsigned long long)g_pp_stop[0], (unsigned long long)g_pp_stop[1], (unsigned long long)g_pp_stop[2],
+             (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6, (unsigned long long)full, busy);
+    }
 }
 
 /* Prediction visits later scissor commands but must leave the active draw's state untouched. */
@@ -7481,9 +7544,48 @@ void dm_nvn_probe_prediction(void) {
     struct {op_hdr h;p_render_cond c;op_hdr end;} cond={{OP_RENDER_COND,8+sizeof(p_render_cond)},{0},{OP_END,8}};
     const void *op=&cond;unsigned slot=((uintptr_t)op>>3)&1023;cond_cache_ent cache=g_cond_cache[slot];uint64_t unknown=g_draw_skip[14];
     g_exec_next=(const uint8_t *)&cond;pso_predict_rest();
-    if(getenv("TOTK_PROBE_NEGATIVE"))state_op(OP_RENDER_COND,&cond.c);
+    if(pred_negative()>0&&pred_negative()<24)state_op(OP_RENDER_COND,&cond.c);   // older negative numbers; 24-27 are the checks below
     if(memcmp(&cache,&g_cond_cache[slot],sizeof cache)||g_draw_skip[14]!=unknown)MDIE("pipeline prediction evaluated a future conditional counter");
-    R = saved; g_exec_next = next;
+    /* Ported with upstream c5b3ae7. A future program that is not built yet is not resolved: prog_get would translate its
+       absent bytes (or compile real future shaders). */
+    prog_t future = {.nstage = 1, .serial = UINT64_MAX - 17};
+    struct { op_hdr bind; p_bind_program program; op_hdr draw; p_draw args; op_hdr end; } cold = {
+        {OP_BIND_PROGRAM, 8 + sizeof(p_bind_program)}, {&future, 3},
+        {OP_DRAW, 8 + sizeof(p_draw)}, {0}, {OP_END, 8}
+    };
+    typeof(S) saved_state = S;
+    uint64_t old_libs = g_bp_lib_n, old_psos = g_bp_pso_n;
+    g_exec_next = (const uint8_t *)&cold; pso_predict_rest();
+    if (g_bp_lib_n != old_libs || g_bp_pso_n != old_psos || memcmp(&S, &saved_state, sizeof S))
+        MDIE("pipeline prediction compiled a future program or changed bindings");
+    // The variant the state selects is predicted, without selecting it for a draw.
+    NvProg *pr = [NvProg new]; NvShader *active = [NvShader new], *alternate = [NvShader new];
+    uint64_t signature = stage_sig(0);
+    pr->sh[0] = active; pr->sig[0] = signature ^ 1;
+    pr->alt[0] = [NSMutableDictionary dictionaryWithObject:alternate forKey:@(signature)];
+    prog_t cached = {.serial = nvn_new_serial()};
+    serial_put(cached.serial, pr);
+    NvShader *vs = nil, *fs = nil;
+    if (!prog_prediction_stages(&cached, &vs, &fs) || vs != alternate || pr->sh[0] != active || pr->sig[0] != (signature ^ 1))
+        MDIE("pipeline prediction selected a binding variant for the active draw");
+    [pr->alt[0] removeAllObjects];
+    if (prog_prediction_stages(&cached, &vs, &fs) || pr->sh[0] != active)
+        MDIE("pipeline prediction resolved a missing binding variant");
+    // A program with a stage not translated yet draws nothing; its fragment stage can be absent.
+    pr->sig[0] = signature; pr->missing = 2;
+    if (prog_prediction_stages(&cached, &vs, &fs))
+        MDIE("pipeline prediction predicted a program with an untranslated stage");
+    serial_del(cached.serial);
+    // A depth-exporting fragment function gets the pass's depth buffer: guesses without it are never used.
+    NvShader *depth_fs = [NvShader new], *color_fs = [NvShader new]; depth_fs->writes_depth = 1;
+    const uint32_t d32 = MTLPixelFormatDepth32Float, ds8 = MTLPixelFormatDepth32Float_Stencil8;
+    if (!pred_guess_wanted(0, d32, 0, depth_fs) || pred_guess_wanted(1, d32, 0, depth_fs) || pred_guess_wanted(2, ds8, ds8, depth_fs)
+        || !pred_guess_wanted(3, ds8, ds8, depth_fs) || !pred_guess_wanted(0, 0, 0, depth_fs))
+        MDIE("pipeline prediction guessed a pass without depth for a depth-exporting fragment function");
+    if (!pred_guess_wanted(1, d32, 0, color_fs) || !pred_guess_wanted(2, ds8, ds8, color_fs) || pred_guess_wanted(3, d32, 0, color_fs)
+        || pred_guess_wanted(2, d32, 0, color_fs))
+        MDIE("pipeline prediction attach-mode guesses changed");
+    S = saved_state; R = saved; g_exec_next = next;
 }
 
 static void fz_probe_cov2(const p_set_rt *r2, const uint8_t *first, const int8_t *p2map, const uint8_t *clr, int n1, int n) {
