@@ -62,6 +62,7 @@ def config_env(name):
         elif p == 'synclog': env['TOTK_SYNC_LOG'] = '1'   # GPU-fence waits: calls, blocked, time
         elif p == 'freecores': env['TOTK_FREE_CORES'] = '1'   # no Switch core arbitration between guest threads
         elif p == 'fine': env.update(DM_PRESENT_HZ='120', TOTK_INTERVAL_SCALE='2')   # 60 FPS cap paced on 120 Hz ticks
+        elif p == 'replay': env['TOTK_ASYNC_REPLAY'] = '1'   # submit replay and Metal encoding on the translation thread
         elif p == 'noprime': env['TOTK_XLATE_PRIME'] = '0'   # translated libraries compiled on the render thread (before this fix)
         elif p in ('qosutil', 'qosdef', 'qosinit'): env['TOTK_COMPILE_QOS'] = {'qosutil': 'utility', 'qosdef': 'default', 'qosinit': 'initiated'}[p]
         elif p == 'xcold': env.update(TOTK_SHADER_SEED='off', DM_PSO_MANIFEST='off', TOTK_WARM_LIGHT='0')   # empty translation cache (see run)

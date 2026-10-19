@@ -195,7 +195,14 @@ int main(int argc, char **argv) {
           if ([d objectForKey:@"asyncCompile"] && ![d boolForKey:@"asyncCompile"]) { setenv("TOTK_ASYNC_PSO", "0", 0); setenv("TOTK_ASYNC_XLATE", "0", 0); setenv("TOTK_ASYNC_SHLOAD", "0", 0); }
           if ([d objectForKey:@"pauseHidden"] && ![d boolForKey:@"pauseHidden"]) setenv("TOTK_PAUSE_HIDDEN", "0", 0);
           NSString *fps = [d stringForKey:@"fpsCap"] ?: @"unlimited";
-          if ([fps isEqualToString:@"60"]) setenv("DM_PRESENT_HZ", "60", 0);
+          if ([fps isEqualToString:@"60"]) {
+              /* Fine pacing on a 120 Hz screen: the 60 FPS cap is counted on 120 Hz ticks, so a frame that just misses
+                 16.7 ms is shown at 25 ms instead of 33 ms (busy area: present p95 33 -> 25 ms, worst frame 72 -> 55 ms,
+                 same frame rate). A 60 Hz screen keeps the plain 60 Hz cap. */
+              NSInteger maxfps = 0; if (@available(macOS 12.0, *)) maxfps = NSScreen.mainScreen.maximumFramesPerSecond;
+              if (maxfps >= 120 && !getenv("DM_PRESENT_HZ")) { setenv("DM_PRESENT_HZ", "120", 0); setenv("TOTK_INTERVAL_SCALE", "2", 0); }
+              else setenv("DM_PRESENT_HZ", "60", 0);
+          }
           else if ([fps isEqualToString:@"30"]) { setenv("TOTK_FPS60", "0", 0); setenv("DM_PRESENT_HZ", "60", 0); }
           if ([d objectForKey:@"fpsCounter"] && ![d boolForKey:@"fpsCounter"]) setenv("TOTK_FPS_OVERLAY", "0", 0);
           if ([d objectForKey:@"shaderCounter"] && ![d boolForKey:@"shaderCounter"]) setenv("TOTK_SHADER_OVERLAY", "0", 0);
