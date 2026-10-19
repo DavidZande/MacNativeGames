@@ -30,7 +30,7 @@ void mtl_res_snapshot(mtl_res_count *out);
 // 一次提交：begin → 若干操作 → commit（返回本次提交完成时的栅栏值）
 // One submit: begin -> several operations -> commit (returns the fence value at which this submit completes)
 void mtl_sub_begin(void);
-/* TOTK: uniform contents as of the submit call. capture runs in nvnQueueSubmitCommands (game thread) when the replay is
+/* TOTK: uniform and small read-only storage contents as of the submit call. capture runs in nvnQueueSubmitCommands (game thread) when the replay is
    handed to the translation thread; snapshot_cap builds the submission's copies at the start of its replay (cap may be
    NULL: copy from memory now) and frees cap. */
 void *mtl_sub_capture_ubos(const uint64_t *h, int n);
@@ -55,6 +55,9 @@ int mtl_probe_texture_retire(void);
 int mtl_probe_ds_clear(void);
 int mtl_probe_ub_rename(void);
 int mtl_probe_ubo_snapshot(void);
+int mtl_probe_ui_snapshot(void);
+int mtl_probe_rt_feedback(void);
+int mtl_probe_readback_prefetch(void);
 int mtl_probe_drv_c0(void);
 int mtl_probe_dispatch_chain(void);
 int mtl_probe_copy_alias(void);

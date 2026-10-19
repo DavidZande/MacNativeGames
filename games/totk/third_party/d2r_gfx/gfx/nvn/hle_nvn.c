@@ -2080,8 +2080,8 @@ static uint64_t x_sub_ran(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_x
    thread waits on the frame fence (game system +0x1d8, fenced by the render thread right after the frame's submit,
    main+0x87ff24) with no timeout (main+0xa91f98), so the frame's whole replay plus its GPU work sat on the main thread's
    path. Answered one frame late, that wait returns when the PREVIOUS frame's fence is reached, and the replay of the
-   frame just submitted overlaps the game's next frame. Uniform contents are copied at submit in this mode; other memory
-   the game rewrites after the wait is not (the experiment is to see whether that shows). */
+   frame just submitted overlaps the game's next frame. Uniforms and small read-only storage buffers (including per-glyph instance data) are captured at submit.
+   Other shared game memory still relies on the game's own buffering. */
 static int fence_lag_on(void) {
     static int v = -1;
     /* On by default since 2026-10-19 (busy area 54.0 -> 59.7 FPS standing, no single-frame anomalies); =0 turns it off. */

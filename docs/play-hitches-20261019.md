@@ -14,7 +14,7 @@ flickers. This records how the causes were found, what changed, what was measure
 | In-place pipeline builds when the pending table was full | 126 ms stall with one in-place build; "table full" in the log | Table 384 → 1024 slots; a full table skips the draw for a frame | No in-place build stalls seen since |
 | Command-recording copies on the game's job threads | Largest `memmove` callers on the recording threads | Large recordings handed over without copying; bulk inlining on | Recording copy time −40–50% (in-session A/B); no visible effect alone |
 | **GPU write-back on `nvnMemoryPoolInvalidateMappedRange`** | The ~110 ms stalls every 10 frames after spawning: a job thread sat in our write-back, one GPU round trip per mip level | Batched write-back (one command buffer, one wait) | Scripted spawn: frames over 50 ms 23 → 3–4, worst frame per second 113 → 38 ms |
-| UI text flicker | Gone with `TOTK_FENCE_LAG=0` (David, play test) | None kept (see "Flicker") | Open |
+| UI text flicker | Gone with `TOTK_FENCE_LAG=0`; Construct label corrupt in 10/40 frames with texture-only snapshots | Capture read-only glyph instance storage; late fence retained | Full label in 40/40 frames; see [UI follow-up](ui-flicker-20261019.md) |
 
 Commits on `mac-local-improvements`: 9c16454 (first four rows and diagnostics), b453fed (write-back), plus upstream
 pulls 923dafa, 9b75221, 9be6745, eaff858, c93494f (see `upstream-prs-2026-10-19.md` in the workspace).
@@ -100,10 +100,15 @@ to read them. Turning the late fence off costs ~20 FPS in busy areas. A write ba
 texture page waits for the queued replays) reduced the flicker little, waited ~6 ms per frame and caused a 2.5 s
 freeze once; it is kept as an experiment, **off** (`TOTK_WRITE_BARRIER=1`).
 
+Follow-up: [glyph instance storage capture](ui-flicker-20261019.md) preserves the per-character position / glyph data
+of each queued submission. The initial broad texture snapshot experiment did not fix the Construct label and was
+removed. The storage correction keeps the late-fence performance mode enabled without using the write barrier.
+
 ## Switches
 
 | Switch | Default | Effect |
 |---|---|---|
+| `TOTK_STORAGE_SNAPSHOT` | on | Capture small read-only storage inputs, including per-glyph instance records |
 | `TOTK_TEXELS_RECT` | on | ReadTexels / WriteTexels on CPU-pool textures copy only the rectangle |
 | `TOTK_PKG_HOT` | on | Textures re-uploaded 3 frames running are checked by content, not page faults |
 | `TOTK_PSO_FULL_SYNC` | off | `=1`: a full pending table builds in place again |
@@ -126,8 +131,7 @@ controls), `make probe-dirty-race` (17 checks, barrier hooks included), `scripts
 
 ## What is left
 
-1. **UI flicker with the late fence.** Options: accept it, turn `TOTK_FENCE_LAG` off (~20 FPS less in busy areas),
-   or a per-texture snapshot at submit for the CPU-written UI textures.
+1. **UI flicker follow-up.** Glyph storage snapshots fix the reproduced Construct label; see [verification and remaining play coverage](ui-flicker-20261019.md).
 2. **The remaining ~22 ms per invalidate**: ~17 ms waiting for the frame the game just rendered and ~4 ms drain,
    about three times in a row after spawning. Frames now stay under ~40 ms there; a deeper change would need the
    readback to be answered from data the GPU produced earlier.
@@ -141,3 +145,12 @@ controls), `make probe-dirty-race` (17 checks, barrier hooks included), `scripts
 Raw evidence: `bench/` in the workspace (play sessions `20261019-17*` / `18*`, scripted runs `20261019-19*`,
 per-frame timelines `play-20261019-frames-*.tsv` / `spawn-frames-*.tsv`, thread timelines `spawn-timeline-*.tsv`,
 CPU samples `*/sample-spawn.txt`).
+
+
+## 2026-10-19 late continuation: experimental producer readback & targeted upload wait
+
+See [the current shadow/readback handoff](shadow-feedback-20261019.md) for implementation, GPU probe evidence and walking captures.
+- Invalidate hitch cause resolved: previously, `mtl_pool_invalidate` waited for all pending GPU upload command buffers (`g_up_pending`), meaning a readback was delayed 20–30 ms by unrelated background texture uploads queued behind in-flight frames. Implemented targeted dependency tracking `g_up_inflight`: invalidations now only wait if the texture being read back is actually a pending upload destination.
+- All 10 GPU probes pass (readback prefetch passes 71,006 checks, including 2-texture/shared-page regression). All 45 Python unit tests and all native probes pass.
+- In the latest walking benchmark (`bench/shadow-20261019-221609-walk`), 92 readback prefetch snapshots were consumed, and in-world invalidation stalls > 20 ms were eliminated: walk-1 p99 19.37 ms (max 25.50 ms, 1 frame >= 25 ms, 0 >= 33 ms); walk-2 p99 17.64 ms (max 24.78 ms, 0 frames >= 25 ms, 0 >= 33 ms).
+- Installed app remains unchanged while the candidate undergoes final user review.
