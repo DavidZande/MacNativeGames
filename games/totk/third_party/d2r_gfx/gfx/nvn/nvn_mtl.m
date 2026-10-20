@@ -2608,7 +2608,12 @@ static int wb_prefetched_back(wb_ent *e) {
         if(nvn_swizzle(&t->d,l,0,(uint8_t *)buffer.contents+off,lp,t->mem))MDIE("prefetched texture swizzle");off+=lp*lr;g_wb_bytes+=lp*lr;}
     nvn_dirty_gpu_write_end(tok);g_wb_done++;static unsigned hits,large_hits;unsigned first_large=t->d.width>1&&++large_hits<=8;if(++hits<=8||first_large||hits%500==0)MLOG("[readback-prefetch] consumed %u snapshots; %ux%u levels=%u live=%llu KiB",hits,t->d.width,t->d.height,t->d.levels,(unsigned long long)(atomic_load(&g_wb_snapshot_bytes)>>10));return 1;
 }
-void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
+static void mtl_pool_invalidate_inner(const pool_t *p, uint64_t off, uint64_t n);
+/* Runs on the game's thread (nvnMemoryPoolInvalidateMappedRange), which has no autorelease pool: without one every
+   write-back's autoreleased command buffer and blit encoder lived for ever (upstream 635fb31: TOTK's AGXG16GFamilyBuffer /
+   BlitContext pairs growing by the thousands per lap; Breath of the Wild 3.7 GB in 30 minutes). */
+void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { @autoreleasepool { mtl_pool_invalidate_inner(p, off, n); } }
+static void mtl_pool_invalidate_inner(const pool_t *p, uint64_t off, uint64_t n) {
     if (!p || !p->mem || !atomic_load(&g_wb_on)) return;
     pthread_mutex_lock(&g_smu);
     if (!g_wb.n) { pthread_mutex_unlock(&g_smu); return; }
@@ -6244,7 +6249,7 @@ static dispatch_queue_t pso_compile_queue(void) {
     });
     return q;
 }
-static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // 提交线程调：没在缓存、没在表里才丢 | Called by the submit thread: kick only if it is neither in the cache nor in the table
+static void pso_pend_kick_fn(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn) {   /* fsfn: a substituted fragment function (TOTK framebuffer-fetch variant), nil = the shader's own */   // 提交线程调：没在缓存、没在表里才丢 | Called by the submit thread: kick only if it is neither in the cache nor in the table
     if (hm_get_id(&g_pso, k)) return;
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k), slot = -1;
@@ -6271,12 +6276,13 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
     if (at < 0 && slot < 0) g_pp_full++;
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
+    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, fsfn, 0); g_pp_kicked++;
     dispatch_async(pso_compile_queue(), ^{
         NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
     });
 }
+static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) { pso_pend_kick_fn(k, vs, fs, nil); }
 static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交线程调：表里有就等它编完并取走；没有返回 nil | Called by the submit thread: if it is in the table, wait for it to finish compiling and take it; otherwise return nil
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k); id<MTLRenderPipelineState> ps = nil;
@@ -6293,6 +6299,18 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交�
 static int async_pso_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_PSO"); v = !(e && !atoi(e));   /* default on (benchmarked: no visible breakage) */ MLOG("background pipeline compiling (TOTK_ASYNC_PSO): %s", v ? "on" : "off"); } return v; }
 uint64_t g_async_pso_kicked, g_async_pso_skipped, g_async_pso_ready;   /* perf.csv / log */
 uint64_t g_inplace_pso_n, g_inplace_pso_ns, g_inplace_pso_max_ns, g_inplace_merged_n;   /* pipelines built on the render thread (perf.csv) */
+/* TOTK: a later draw in a pass opened without depth / stencil (g_enc_mode >= 2) whose pipeline is not built yet used to
+   be built in place (no skipped draws inside an omitted pass). At world entry those builds queued behind the background
+   compiles: 36 in-place builds, up to 1.08 s each, one 8.7 s frame (bench 20261020-124944). Now the omitted-pass variant
+   is queued in the background and draw_inner ends the pass and reopens it with depth / stencil attached (mode 0), where
+   the normal async path applies. draw_inner sets g_pso_reopen_ok when that split is allowed; pso_get answers with
+   g_pso_reopen. TOTK_PSO_OMIT_SYNC=1: build in place as before. */
+static int g_pso_reopen_ok, g_pso_reopen;
+static id<MTLFunction> g_fbf_fn;   // TOTK (nvn_rt_fetch.h): this draw's framebuffer-fetch fragment function (nil = none); pso_get keys its pipeline by it
+static int g_fbf_fallback;         // pso_get: that pipeline is not built yet; draw_inner redoes the draw on the copy path
+uint64_t g_fbf_fallbacks;
+uint64_t g_pso_omit_reopen;
+static int pso_omit_sync(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_OMIT_SYNC"); v = e && atoi(e); } return v; }
 static int pso_pend_poll(const pso_key *k, id<MTLRenderPipelineState> *out) {   /* 1 ready (taken), 0 still compiling, -1 not queued */
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k), r = -1;
@@ -6307,10 +6325,18 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
     if (g_pass.layered) k.a2c |= PSO_LAYERED;   // TOTK: layered pass (see g_lay)
     if (g_mfx.role) k.a2c |= (uint32_t)g_mfx.role << 2;   // TOTK_MFX: scene / UI copy variant (see pso_desc)
+    if (g_fbf_fn && g_pso_lmap) { g_fbf_fallback = 1; g_fbf_fallbacks++; return nil; }   // TOTK: a merged-pass pipeline cannot take the framebuffer-fetch variant: copy instead
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
+    else if (g_fbf_fn) k.fsfn = (__bridge void *)g_fbf_fn;   // TOTK: framebuffer-fetch variant (nvn_rt_fetch.h)
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
     if (cached) return cached;
     id<MTLRenderPipelineState> ps = nil;
+    if (g_fbf_fn && !g_pso_lmap) {   /* built in the background only; until then draw_inner redoes the draw with copies */
+        int r = pso_pend_poll(&k, &ps);
+        if (r == 1 && ps) { hm_put_id(&g_pso, &k, ps); return ps; }   // not recorded for warm-up: the variant is proven again each run
+        if (r < 0) pso_pend_kick_fn(&k, vs, fs, g_fbf_fn);
+        g_fbf_fallback = 1; g_fbf_fallbacks++; return nil;
+    }
     NSError *e = nil; uint64_t bt = bp_now();
     if (!g_pso_lmap && async_pso_on() && g_enc_mode < 2) {
         int r = pso_pend_poll(&k, &ps);
@@ -6327,6 +6353,15 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
             { static int sync_full = -1; if (sync_full < 0) { const char *e = getenv("TOTK_PSO_FULL_SYNC"); sync_full = e && atoi(e); }
               if (!sync_full) { g_async_pso_skipped++; static unsigned said; if (said++ < 5 || said % 500 == 0) MLOG("[async-pso] pending table full: draw skipped, retried next frame (%u so far)", said); return nil; } }
         } else if (ps) g_async_pso_ready++;
+    } else if (!g_pso_lmap && async_pso_on() && g_pso_reopen_ok && !pso_omit_sync()) {   /* omitted-DS pass: see g_pso_reopen */
+        int r = pso_pend_poll(&k, &ps);
+        if (r == 1 && ps) g_async_pso_ready++;
+        else {
+            if (r < 0) { pso_pend_kick(&k, vs, fs); if (pso_pend_find(&k) >= 0) g_async_pso_kicked++; }
+            g_pso_reopen = 1; g_pso_omit_reopen++;
+            static unsigned said; if (said++ < 5 || said % 500 == 0) MLOG("[async-pso] pipeline for a pass without depth / stencil not ready: queued, pass reopened with them (%u so far)", said);
+            return nil;
+        }
     }
     if (!ps && !g_pso_lmap) ps = pso_pend_take(&k);
     if (ps) g_pp_taken++;
@@ -9276,13 +9311,17 @@ static void wv_bump_pass(MTL4RenderPassDescriptor *d) {
     if (dt && (d.depthAttachment.storeAction != MTLStoreActionDontCare || d.depthAttachment.loadAction == MTLLoadActionClear
         || d.stencilAttachment.storeAction != MTLStoreActionDontCare || d.stencilAttachment.loadAction == MTLLoadActionClear)) wv_bump_one(dt);
 }
+#include "nvn_rt_fetch.h"
+static int g_fbf_force_copy;   // draw_inner: this draw's framebuffer-fetch pipeline is not ready; take the copy path
 static void feedback_reset(void) {
+    g_fbf_fn = nil;
     if(g_fb_n){for(int i=0;i<g_fb_n;i++)g_fb_copy[i]=nil;g_fb_n=0;args_dirty_all();}
 }
 static void feedback_prepare(NvProg *pr) {
     feedback_reset();
     static dispatch_once_t once;static int on;dispatch_once(&once,^{const char *e=getenv("TOTK_RT_FEEDBACK_SNAPSHOT");on=!e||atoi(e);});
     if(!on || !pr || !R.has_rt)return;
+    if(!g_fbf_force_copy && fbf_try(pr))return;   // TOTK: read through framebuffer fetch, no copy (nvn_rt_fetch.h)
     int count = 0, ids[128], flush = 0;
     id<MTLTexture> sources[128];
     registry_lock();
@@ -10077,7 +10116,9 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!g_enc && tbdr_on() && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) { g_draw_skip[7]++; return; } }
     if (!g_enc && tbdr_on() && !g_fz_checking) fuse_try();   // 可读 tile 通道合并缺省开；结构 / 本像素证明不成立仍退回普通通道，CHECK 重画时不重入 | Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
 frz_plain:;
-    int need = g_enc || !(tbdr_on() || totk_ds_omit_on()) ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 都不挂 3 只挂模板 4 只挂深度 | 2 attach neither, 3 attach stencil only, 4 attach depth only
+    int omit_reopened = 0;   // TOTK: this draw's pipeline was missing inside a pass without depth / stencil: reopen it with them (see g_pso_reopen)
+omit_reopen:;
+    int need = g_enc || omit_reopened || !(tbdr_on() || totk_ds_omit_on()) ? 3 : pass_ds_need(), mode = defer_q_draw || omit_reopened ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 都不挂 3 只挂模板 4 只挂深度 | 2 attach neither, 3 attach stencil only, 4 attach depth only
     if (!g_enc && mode >= 2 && !tbdr_on()) mode = ds_mode_pso_ready(pr, mode);
     int skip_d = mode != 0;
     if (!g_enc && !g_cg.replaying && cg_on()) {   // TOTK: cube-face-set pass groups (nvn_cube_group.h)
@@ -10111,7 +10152,14 @@ frz_plain:;
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass;
     if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // 可读 tile 合并：按物理 → 逻辑映射与特化取管线 | Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
+    { static __unsafe_unretained id last_fbf; if ((__bridge void *)g_fbf_fn != (__bridge void *)last_fbf) { last_fbf = g_fbf_fn; g_pso_dirty = 1; } }   // TOTK: pipeline with / without the framebuffer-fetch variant
+    g_pso_reopen_ok = g_enc_mode >= 2 && !omit_reopened && !defer_q_draw && !g_defer_replaying && !g_fz.active && !g_lay.active && !g_cg.replaying && !g_rt_range_active && !g_frz_state;
     if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
+    g_pso_reopen_ok = 0;
+    if (g_fbf_fallback) {   /* TOTK: the framebuffer-fetch pipeline is still compiling: this draw copies its feedback inputs instead */
+        g_fbf_fallback = 0; PD("M %llu 片上读回授管线未就绪：本次改走拷贝", g_stat_pass); rp_end();
+        g_fbf_force_copy = 1; feedback_prepare(pr); g_fbf_force_copy = 0; g_pso_dirty = 1; goto omit_reopen; }
+    if (g_pso_reopen) { g_pso_reopen = 0; PD("M %llu 无深度模板通道内管线未就绪：后台编，带深度模板重开", g_stat_pass); rp_end(); omit_reopened = 1; goto omit_reopen; }
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
     if (!ps) { g_draw_skip[9]++; static int failed_n; if (failed_n++ < 3) MLOG("[pipeline-draw] rt-depth=%p serial=%llu fmt=%#x pass-depth=%u dt=%u dw=%u fs-depth=%d", R.rt.depth, (unsigned long long)(R.rt.depth ? R.rt.depth->serial : 0), R.rt.depth ? R.rt.depth->d.format : 0, g_pass.dfmt, S.ds.dt, S.ds.dw, pr->sh[1] ? pr->sh[1]->writes_depth : 0); return; }
