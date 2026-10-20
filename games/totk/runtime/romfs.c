@@ -218,20 +218,105 @@ static void handle_source(uint64_t h,const Entry *e,int *fd,uint64_t *base,uint6
  pthread_mutex_lock(&lock);uint8_t ov=handle_ovl[h-0x100000000ULL];pthread_mutex_unlock(&lock);
  if(ov){*fd=overlays[ov-1].fd;*base=0;*size=overlays[ov-1].size;}else{*fd=image_fd;*base=e->offset;*size=e->size;}
 }
+/* TOTK (2026-10-20): read cache for small reads of the image. Entering the world, the game's two loader threads read
+   ~3,500 small files in one second (median 2 KB, whole files, docs/world-entry-io-20261020.md); every read was a cold
+   pread of 80-390 us, so the burst cost 200-300 ms of syscall latency, not bandwidth. Those files lie next to each
+   other in the image (gap 0 between them sorted by offset), but the kernel's read-ahead does not see that: each is
+   its own small read at a new position (F_RDADVISE is ignored on APFS). Here a read below 256 KiB is served from
+   256 KiB tiles of the image keyed by position, each filled whole with one pread: in the traced burst 437 tile reads
+   instead of 3,554 file reads, 2.4x the bytes. A read ending in the second half of its tile, when the tile before it is cached too
+   (a reader moving forward), also queues the next two tiles for background threads, so the loader finds them ready. The image is read-only, so nothing can
+   go stale. TOTK_ROMFS_CACHE=0 turns it off; TOTK_ROMFS_CACHE_MB sets the size (default 64);
+   TOTK_ROMFS_CACHE_CHECK=1 compares every cached read with a direct read (diagnostic). */
+#define RC_TILE (256u<<10)
+#define RC_MAX 1024
+typedef struct { uint64_t tile,used; uint8_t *buf; int filling; } rc_slot;   /* tile = index + 1 (0 = empty) */
+static rc_slot rc[RC_MAX];
+static unsigned rc_n;
+static uint64_t rc_clock;
+static pthread_mutex_t rc_mu=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rc_cv=PTHREAD_COND_INITIALIZER,rc_qcv=PTHREAD_COND_INITIALIZER;
+static uint64_t rc_q[64];
+static unsigned rc_qn;
+static _Atomic uint64_t rc_hit_bytes,rc_fill_bytes,rc_fills,rc_ahead,rc_bypass;
+static int rc_on(void) {
+ static int v=-1;if(v>=0)return v;
+ const char *e=getenv("TOTK_ROMFS_CACHE"),*m=getenv("TOTK_ROMFS_CACHE_MB");
+ int mb=m?atoi(m):64;if(mb<4)mb=4;if(mb>RC_MAX/4)mb=RC_MAX/4;rc_n=(unsigned)mb*4;
+ v=!(e&&!atoi(e))&&!image_map;
+ fprintf(stderr,"[totk-fs] RomFS read cache (TOTK_ROMFS_CACHE): %s, %u x 256 KiB tiles\n",v?"on":"off",rc_n);
+ return v;
+}
+static rc_slot *rc_find(uint64_t t) {for(unsigned i=0;i<rc_n;i++)if(rc[i].tile==t+1)return &rc[i];return NULL;}
+static rc_slot *rc_victim(void) {   /* least recently used slot not being filled; NULL if all are */
+ rc_slot *v=NULL;for(unsigned i=0;i<rc_n;i++){if(rc[i].filling)continue;if(!rc[i].tile)return &rc[i];if(!v||rc[i].used<v->used)v=&rc[i];}return v;
+}
+static void rc_pread(uint8_t *dst,uint64_t off,uint64_t n) {
+ for(uint64_t done=0;done<n;){ssize_t r=src_pread(image_fd,dst+done,(size_t)(n-done),(off_t)(off+done));if(r<=0)runtime_fail("RomFS read failure");done+=(uint64_t)r;}
+}
+static void rc_fill(rc_slot *s,uint64_t t) {   /* s is marked filling by the caller; rc_mu not held */
+ if(!s->buf&&!(s->buf=malloc(RC_TILE)))runtime_fail("RomFS cache allocation");
+ uint64_t lo=t*RC_TILE,hi=lo+RC_TILE;if(hi>ROMFS_IMAGE_SIZE)hi=ROMFS_IMAGE_SIZE;
+ rc_pread(s->buf,lo,hi-lo);
+ atomic_fetch_add(&rc_fills,1);atomic_fetch_add(&rc_fill_bytes,hi-lo);
+ pthread_mutex_lock(&rc_mu);s->filling=0;s->used=++rc_clock;pthread_cond_broadcast(&rc_cv);pthread_mutex_unlock(&rc_mu);
+}
+static rc_slot *rc_claim_locked(uint64_t t) {   /* a slot for tile t marked filling, or NULL if every slot is busy */
+ rc_slot *s=rc_victim();if(s){s->tile=t+1;s->filling=1;}return s;
+}
+static void *rc_worker(void *arg) {
+ (void)arg;
+ for(;;){
+  pthread_mutex_lock(&rc_mu);while(!rc_qn)pthread_cond_wait(&rc_qcv,&rc_mu);
+  uint64_t t=rc_q[0];memmove(rc_q,rc_q+1,--rc_qn*sizeof rc_q[0]);
+  rc_slot *s=rc_find(t)?NULL:rc_claim_locked(t);
+  pthread_mutex_unlock(&rc_mu);
+  if(s){rc_fill(s,t);atomic_fetch_add(&rc_ahead,1);}
+ }
+ return NULL;
+}
+static void rc_ahead_locked(uint64_t t) {   /* queue tile t for a background fill unless present or queued */
+ if(t*RC_TILE>=ROMFS_IMAGE_SIZE||rc_find(t))return;
+ for(unsigned i=0;i<rc_qn;i++)if(rc_q[i]==t)return;
+ if(rc_qn==64)return;
+ static int started;if(!started){started=1;for(int i=0;i<3;i++){pthread_t th;if(!pthread_create(&th,NULL,rc_worker,NULL))pthread_detach(th);}}
+ rc_q[rc_qn++]=t;pthread_cond_signal(&rc_qcv);
+}
+static void rc_read(uint8_t *dst,uint64_t off,uint64_t n) {   /* image bytes [off,off+n) through the tiles */
+ while(n){
+  uint64_t t=off/RC_TILE,tlo=t*RC_TILE,take=tlo+RC_TILE-off;if(take>n)take=n;
+  pthread_mutex_lock(&rc_mu);
+  rc_slot *s=rc_find(t);
+  if(s&&s->filling){pthread_cond_wait(&rc_cv,&rc_mu);pthread_mutex_unlock(&rc_mu);continue;}
+  if(off+take-tlo>RC_TILE/2&&t&&rc_find(t-1)){rc_ahead_locked(t+1);rc_ahead_locked(t+2);}   /* a reader moving forward: through this tile, after the one before */
+  if(s){memcpy(dst,s->buf+(off-tlo),(size_t)take);s->used=++rc_clock;pthread_mutex_unlock(&rc_mu);
+   atomic_fetch_add(&rc_hit_bytes,take);dst+=take;off+=take;n-=take;continue;}
+  s=rc_claim_locked(t);pthread_mutex_unlock(&rc_mu);
+  if(!s){rc_pread(dst,off,take);atomic_fetch_add(&rc_bypass,1);dst+=take;off+=take;n-=take;continue;}   /* every slot is filling */
+  rc_fill(s,t);   /* the next pass of the loop copies from it */
+ }
+}
 unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer,uint64_t size) {
  Entry e;if(!out||offset<0||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,fsize;handle_source(h,&e,&fd,&base,&fsize);if((uint64_t)offset>fsize||(!buffer&&size))return INVALID;
  uint64_t n=size;if(n>fsize-(uint64_t)offset)n=fsize-(uint64_t)offset;uint64_t done=0;
  static _Atomic int profile_mode=-1;int profile=atomic_load(&profile_mode);if(profile<0){profile=getenv("TOTK_FS_TIMING")!=NULL;atomic_store(&profile_mode,profile);}uint64_t prep_start=profile?runtime_now_ns():0;
  dm_guest_write_prepare(buffer,(size_t)n);
  uint64_t t0=runtime_now_ns();
+ {static FILE *tr;static int tr_on=-1;if(tr_on<0){const char *e=getenv("TOTK_FS_TRACE");tr=e?fopen(e,"w"):NULL;tr_on=tr!=NULL;}   /* diagnostic: one line per read (ns, image offset, size, file start, file size, thread) */
+  if(tr_on&&fd==image_fd){pthread_mutex_lock(&lock);fprintf(tr,"%llu %llu %llu %llu %llu %x\n",(unsigned long long)t0,(unsigned long long)(base+(uint64_t)offset),(unsigned long long)n,(unsigned long long)base,(unsigned long long)fsize,(unsigned)runtime_thread_current_handle());pthread_mutex_unlock(&lock);}}
  if(fd==image_fd&&image_map){memcpy(buffer,image_map+base+(uint64_t)offset,(size_t)n);done=n;}
+ else if(fd==image_fd&&n<(256u<<10)&&rc_on()){rc_read(buffer,base+(uint64_t)offset,n);done=n;
+  static int check=-1;if(check<0)check=getenv("TOTK_ROMFS_CACHE_CHECK")!=NULL;   /* diagnostic: every cached read compared with a direct read */
+  if(check){uint8_t *v=malloc((size_t)n);if(!v)runtime_fail("RomFS cache check allocation");rc_pread(v,base+(uint64_t)offset,n);if(memcmp(v,buffer,(size_t)n))runtime_fail("RomFS cache returned different bytes");free(v);
+   static _Atomic uint64_t checked;if(atomic_fetch_add(&checked,1)%5000==0)fprintf(stderr,"[totk-fs] cache check: %llu reads identical\n",(unsigned long long)atomic_load(&checked));}}
  else while(done<n){size_t chunk=(size_t)(n-done);if(chunk>8<<20)chunk=8<<20;ssize_t r=src_pread(fd,(uint8_t *)buffer+done,chunk,(off_t)(base+(uint64_t)offset+done));if(r<=0)runtime_fail("RomFS read failure");done+=(uint64_t)r;}
  {uint64_t d=runtime_now_ns()-t0;atomic_fetch_add(&rd_calls,1);atomic_fetch_add(&rd_bytes,done);atomic_fetch_add(&rd_ns,d);if(runtime_thread_current_handle()==0x1001)atomic_fetch_add(&rd_main_ns,d);}
  if(profile){uint64_t now=runtime_now_ns();atomic_fetch_add(&read_calls,1);atomic_fetch_add(&read_bytes,done);atomic_fetch_add(&read_ns,now-t0);atomic_fetch_add(&read_prepare_ns,t0-prep_start);
   uint64_t last=atomic_load(&read_report_ns);
   if(now-last>1000000000ULL&&atomic_compare_exchange_strong(&read_report_ns,&last,now))
-   fprintf(stderr,"[totk-fs] read window t=%.3f calls=%llu bytes=%llu wall_ms=%.3f prepare_ms=%.3f\n",now/1e9,
-    (unsigned long long)atomic_exchange(&read_calls,0),(unsigned long long)atomic_exchange(&read_bytes,0),atomic_exchange(&read_ns,0)/1e6,atomic_exchange(&read_prepare_ns,0)/1e6);}
+   fprintf(stderr,"[totk-fs] read window t=%.3f calls=%llu bytes=%llu wall_ms=%.3f prepare_ms=%.3f cache hit=%.1fMB fill=%.1fMB fills=%llu ahead=%llu bypass=%llu\n",now/1e9,
+    (unsigned long long)atomic_exchange(&read_calls,0),(unsigned long long)atomic_exchange(&read_bytes,0),atomic_exchange(&read_ns,0)/1e6,atomic_exchange(&read_prepare_ns,0)/1e6,
+    atomic_exchange(&rc_hit_bytes,0)/1048576.0,atomic_exchange(&rc_fill_bytes,0)/1048576.0,(unsigned long long)atomic_exchange(&rc_fills,0),(unsigned long long)atomic_exchange(&rc_ahead,0),(unsigned long long)atomic_exchange(&rc_bypass,0));}
  *out=done;return 0;
 }
 unsigned runtime_romfs_size(int64_t *out,uint64_t h) {Entry e;if(!out||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,size;handle_source(h,&e,&fd,&base,&size);*out=(int64_t)size;return 0;}
