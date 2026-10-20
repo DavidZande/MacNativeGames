@@ -140,6 +140,12 @@ preferred frame-rate range so the display refreshes when a frame is ready (varia
 between 120 Hz slots. Combine optionally with dynamic resolution driven by measured GPU time and MetalFX temporal
 upscaling (upstream PR #87).
 
+**Play test 2026-10-20 (default on, 8e1bd92): back to default off.** The first ~3.5 min looked right (75–87 FPS, each
+frame shown once). After a dip to ~45 FPS the preferred rate went to 41 Hz and never came back: drawables arrive at
+the display rate, so the game was paced to 40 FPS (main thread ~22 of every 25 ms in `m_lock`), measured 40 FPS, and
+kept the display at 41 Hz for the rest of the session. Fix before re-enabling: lower the rate only when the game is
+clearly slower than the display (repeated refreshes), and step it back up whenever the game keeps pace (no repeats).
+
 ---
 
 ## 2. Frame stability: predict instead of react

@@ -12582,7 +12582,7 @@ static int g_vrr_avg_fps, g_vrr_pref_pub;   // published for the ~10 s line (rea
 static _Atomic uint64_t g_vrr_ticks, g_vrr_frames, g_vrr_repeat; static uint64_t g_vrr_log_ns;   // display link thread only
 int mtl_vrr_on(void) {
     if (g_vrr < 0) {
-        const char *e = getenv("TOTK_VRR"); g_vrr = !(e && !atoi(e));   // TOTK_VRR: on by default (2026-10-20); =0 off
+        const char *e = getenv("TOTK_VRR"); g_vrr = e && atoi(e) > 0;   // TOTK_VRR: off by default again (2026-10-20: locks the game at 40 FPS after a dip, see docs)
         if (g_vrr) MLOG("TOTK_VRR=1：显示器跟随游戏帧率（不限帧率、补帧关时按最近 %d 帧的帧间隔自适应刷新，%d Hz 起）", VRR_N, VRR_MIN);
     }
     return g_vrr > 0;
