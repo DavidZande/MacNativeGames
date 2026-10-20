@@ -32,6 +32,7 @@
 #include "totk_vpool.h"
 #include "totk_lifelog.h"
 #include "totk_perf.h"
+#include "totk_flight.h"
 #include <mach/mach_time.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -2096,6 +2097,9 @@ static int fence_lag_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_FENCE_LAG"); int want = !(e && !atoi(e)); v = want && async_replay(); LOG("[nvn] frame fence one frame late (TOTK_FENCE_LAG, =0 off): %s", v ? "on" : want ? "off (needs TOTK_ASYNC_REPLAY)" : "off"); }
     return v;
 }   // for the graphics layer (pool invalidate write-back)
+/* TOTK_FLIGHT: the effective states of the two switches that default on, for event.txt (totk_flight.h). */
+int dm_nvn_async_on(void) { return async_replay(); }
+int dm_nvn_fence_lag_on(void) { return fence_lag_on(); }
 // Fence token for FenceSync: submits enqueued so far (async) or the Metal fence (synchronous).
 static uint64_t fence_now(int *token) {
     if (!async_replay()) { *token = 0; return mtl_last_fence(); }
@@ -2827,6 +2831,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         }
     }
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
+    totk_flight_frame_begin();   /* TOTK_FLIGHT: Instruments interval per frame (no-op when off) */
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);
     { extern void runtime_pacing_trace_frame(uint64_t frame) __attribute__((weak_import));
@@ -2965,7 +2970,18 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
               if (hidden) strlcat(b, "；接读取画面，不可见", sizeof b);
               dm_longframe_note(b); }
-          if (r->f == f - 8) totk_perf_frame(r->f, r->fr, g, r->pso, r->lib, r->make_ms, r->ls); }   /* local change: perf.csv */
+          if (r->f == f - 8) totk_perf_frame(r->f, r->fr, g, r->pso, r->lib, r->make_ms, r->ls);   /* local change: perf.csv */
+          /* TOTK_FLIGHT: the record is finished here (its GPU time has arrived); copy it into the flight ring. */
+          if (totk_flight_on() && r->f == f - 8) {
+              uint64_t xq_in = atomic_load(&g_xq_in_a), xq_done = atomic_load(&g_xq_done_a);   /* TOTK_FLIGHT: lock-free, the present thread must not take g_xq_mu; done can pass in between the two loads, so clamp */
+              tfl_rec x = { .f = r->f, .fr = r->fr, .nv = r->nv, .t_s = r->t_s, .gpu_ms = g, .make_ms = r->make_ms,
+                            .up_mb = r->up_mb, .up_ms = r->up_ms, .sync_ms = r->sync_ms, .acq_ms = r->acq_ms, .ucap_ms = r->ucap_ms,
+                            .mp_ms = r->mp_ms, .hot_ms = r->hot_ms, .m_lock = r->m_lock, .m_addr = r->m_addr, .m_core = r->m_core,
+                            .m_host = r->m_host, .m_sync = r->m_sync, .rd_ms = r->rd_ms, .rd_mb = r->rd_mb,
+                            .pso = r->pso, .lib = r->lib, .up = r->up, .rup = r->rup, .faults = r->faults, .hot = r->hot,
+                            .majflt = r->majflt, .ls = r->ls,
+                            .xq = xq_in > xq_done ? xq_in - xq_done : 0 };
+              totk_flight_record(&x); } }
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();
@@ -2999,5 +3015,6 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         if (a_ > 0) trow(f - 8, "@pres_at_ms", a_ * 1e3 - g_t0_ns / 1e6); }   // 上屏时刻（进程起点 ms；presentedTime 与 mach_absolute_time 同基） | on-screen present time (ms since process start; presentedTime shares a time base with mach_absolute_time)
     if (f >= 8 && slow_on()) slow_emit(f - 8);
     prev_out = now_ns();
+    totk_flight_frame_end();   /* TOTK_FLIGHT */
     totk_tl(TL_PRES_OUT, 0, 0);
 }

@@ -1137,6 +1137,17 @@ static void pt_apply_request(void) {
     MLOG("[pass-gpu] requested %d frames; active range %ld..%ld (diagnostic; exclude from FPS)",
          frames, g_pt_f0, g_pt_f1);
 }
+/* TOTK_FLIGHT: per-pass GPU timing for a flight event. The report path is set here, next to the request, so a capture that
+   is already running never has its output redirected. Returns 0 when a capture is already running (an active heap must not
+   be truncated) or a request is still pending; the recorder then skips passes.tsv for that event. */
+int dm_gfx_pass_gpu_request(int frames, const char *path) {
+    if (frames <= 0 || !path || !*path) return 0;
+    if (g_pt_heap || pt_active() || atomic_load_explicit(&g_pt_request, memory_order_relaxed) >= 0) return 0;
+    if (setenv("TOTK_PASS_GPU_FILE", path, 1) != 0) return 0;
+    atomic_store_explicit(&g_pt_request, frames, memory_order_relaxed);
+    MLOG("[pass-gpu] flight recorder: per-pass timings requested for the next %d frames", frames);
+    return 1;
+}
 static void pt_mark(id cb, char kind, MTL4RenderPassDescriptor *d) {
     if (!pt_active()) return;
     if (!g_pt_heap) {
@@ -1167,23 +1178,26 @@ static void pt_finish(id cb, TotkCommitOptions *o, uint64_t frame) {
     id<MTL4CounterHeap> heap = g_pt_heap; int n = g_pt_n; pt_ent *ents = malloc((size_t)n * sizeof *ents); memcpy(ents, g_pt, (size_t)n * sizeof *ents);
     uint64_t draws_end = g_stat_draw; double hz = (double)[g_dev queryTimestampFrequency];
     g_pt_heap = nil; g_pt_n = 0;
+    /* TOTK_FLIGHT: remember the report path when the work is submitted; a later flight event may change
+       TOTK_PASS_GPU_FILE while this submission's timestamps are still in flight, and this report must stay in its folder. */
+    const char *fp0 = getenv("TOTK_PASS_GPU_FILE"); char *fp_saved = fp0 && *fp0 ? strdup(fp0) : NULL;
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         (void)f; NSData *dat = [heap resolveCounterRange:NSMakeRange(0, (NSUInteger)n)];
-        const MTL4TimestampHeapEntry *ts = dat.bytes; if (!ts || dat.length < (NSUInteger)n * sizeof *ts || hz <= 0) { MLOG("【红】TOTK_PASS_GPU：时间戳读不出"); free(ents); return; }
+        const MTL4TimestampHeapEntry *ts = dat.bytes; if (!ts || dat.length < (NSUInteger)n * sizeof *ts || hz <= 0) { MLOG("【红】TOTK_PASS_GPU：时间戳读不出"); free(ents); free(fp_saved); return; }
         double *ms = calloc((size_t)n, sizeof *ms), total = (ts[n - 1].timestamp - ts[0].timestamp) / hz * 1e3; int *ord = calloc((size_t)n, sizeof *ord), m = 0;
         for (int i = 0; i + 1 < n; i++) { ms[i] = ts[i + 1].timestamp >= ts[i].timestamp ? (ts[i + 1].timestamp - ts[i].timestamp) / hz * 1e3 : 0; ord[m++] = i; }
         for (int i = 1; i < m; i++) for (int j = i; j > 0 && ms[ord[j]] > ms[ord[j - 1]]; j--) { int t = ord[j]; ord[j] = ord[j - 1]; ord[j - 1] = t; }
         double by_kind[128] = {0}; int cnt_kind[128] = {0}; for (int i = 0; i + 1 < n; i++) { by_kind[(unsigned char)ents[i].kind & 127] += ms[i]; cnt_kind[(unsigned char)ents[i].kind & 127]++; }
         MLOG("[pass-gpu] 帧 %llu：%d 个编码器，GPU 首尾 %.3f ms；渲染 %d 个 %.3f ms，计算 %d 个 %.3f ms，拷贝 %d 个 %.3f ms", (unsigned long long)frame, n - 1, total,
              cnt_kind['R'], by_kind['R'], cnt_kind['C'], by_kind['C'], cnt_kind['B'], by_kind['B']);
-        const char *fp = getenv("TOTK_PASS_GPU_FILE"); FILE *ff = fp ? fopen(fp, "a") : NULL;
+        const char *fp = fp_saved; FILE *ff = fp ? fopen(fp, "a") : NULL;
         // with a file the per-encoder rows go only there (one summary line per frame stays in the log)
         for (int k = 0; k < m && k < 40 && !fp; k++) { int i = ord[k]; const pt_ent *p = &ents[i]; uint64_t dn = (i + 1 < n ? ents[i + 1].draw0 : draws_end) - p->draw0;
             MLOG("[pass-gpu]   #%d %c %.3f ms 绘制 %llu %ux%u fmt %u 色 %u 深 %u 读入 %u 写回 %u %s", i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->nstore, p->key[0] ? p->key : "-"); }
         if (ff) { for (int i = 0; i + 1 < n; i++) { const pt_ent *p = &ents[i]; uint64_t dn = ents[i + 1].draw0 - p->draw0;
                       fprintf(ff, "%llu\t%d\t%c\t%.4f\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%s\n", (unsigned long long)frame, i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->key[0] ? p->key : "-"); }
                   fclose(ff); }
-        free(ms); free(ord); free(ents);
+        free(ms); free(ord); free(ents); free(fp_saved);
     }];
 }
 #include "nvn_arg_address_cache.h"

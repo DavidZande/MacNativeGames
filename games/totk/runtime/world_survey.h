@@ -8,3 +8,6 @@ void runtime_survey_init(Module *main_module);
 int runtime_survey_command(const char *line);
 void runtime_survey_tick(uint64_t frame);
 void runtime_survey_cancel_user(void);
+/* TOTK_FLIGHT: the player's position from the scene's actor list; read-only guest memory, 0 when not found or the
+   version has no verified offsets. Does not depend on TOTK_SURVEY. */
+int runtime_player_xyz(float out[3]);

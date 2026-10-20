@@ -10,6 +10,7 @@
 #include <sys/clonefile.h>
 static NSWindow *window;
 uint64_t dm_nvn_frame_count(void);   /* gfx/nvn/hle_nvn.c: game frames presented so far */
+int totk_flight_hotkey(void);        /* gfx/nvn/totk_flight.h: F9 flight-recorder event; 0 when TOTK_FLIGHT is off */
 static CAMetalLayer *metalLayer;
 static NSView *bootOverlay;
 static NSTextField *bootStage,*bootDetail;
@@ -127,7 +128,7 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)keyDown:(NSEvent *)e{if(e.keyCode==111){if(!e.isARepeat)front_take_screenshot();return;}runtime_input_key(e.keyCode,1);}   /* F12: screenshot (local change) */
+-(void)keyDown:(NSEvent *)e{if(e.keyCode==111){if(!e.isARepeat)front_take_screenshot();return;}if(e.keyCode==101&&!e.isARepeat&&totk_flight_hotkey())return;runtime_input_key(e.keyCode,1);}   /* F12: screenshot; F9: flight recorder when on (local change) */
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
 @end

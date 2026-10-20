@@ -23,6 +23,8 @@ void runtime_survey_init(Module *m) {
 int runtime_survey_command(const char *line) { (void)line; return 0; }
 void runtime_survey_tick(uint64_t frame) { (void)frame; }
 void runtime_survey_cancel_user(void) { }
+/* TOTK_FLIGHT: no verified player / scene offsets for this version yet. */
+int runtime_player_xyz(float out[3]) { (void)out; return 0; }
 #else
 enum { SCENE_SLOT = GAME_ADDR(0x4663f08), FORCE_MATRIX = GAME_ADDR(0x69a18c), ACTOR_POS = GAME_ACTOR_POS, ACTOR_ROT = GAME_ACTOR_ROT };
 static uintptr_t survey_main;
@@ -90,7 +92,19 @@ static uintptr_t player_actor(void) {
     }
     return 0;
 }
+/* TOTK_FLIGHT: the player's position for the flight recorder. Same actor-list lookup as the survey, only through the
+   guarded guest-memory readers above (no game calls), and independent of survey_enabled: survey_main is set in init for
+   every version. Returns 0 when the player cannot be found. */
+int runtime_player_xyz(float out[3]) {
+    if (!out || !survey_main) return 0;
+    uintptr_t actor = player_actor();
+    float xyz[3];
+    if (!actor || !read_mem(actor + ACTOR_POS, xyz, sizeof xyz) || !valid_xyz(xyz)) return 0;
+    memcpy(out, xyz, sizeof xyz);
+    return 1;
+}
 void runtime_survey_init(Module *m) {
+    if (!strcmp(m->name, "main")) survey_main = (uintptr_t)m->base;   /* TOTK_FLIGHT: the flight recorder's player lookup needs it with TOTK_SURVEY off */
     const char *enabled = getenv("TOTK_SURVEY");
     if (!enabled || strcmp(enabled, "1")) return;
     const char *owner = getenv("TOTK_SLOT_OWNER"), *profile = getenv("TOTK_PROFILE_DIR");
