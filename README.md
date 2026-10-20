@@ -20,9 +20,68 @@ this repository. All credit for the port itself goes to upstream and the project
 | Shader stalls | No pipeline compiled on the render thread at world entry (was up to 1 s per pipeline, one 8.7 s frame) | cold cache: 0 of 1,782 built in place | `TOTK_PSO_OMIT_SYNC=1` (old) | [follow-ups](docs/perf-followups-20261020.md) |
 | Loading | RomFS read cache: the world-entry burst of ~3,500 tiny files read through 256 KiB tiles | read time −30–35 % | `TOTK_ROMFS_CACHE=0` | [world-entry-io](docs/world-entry-io-20261020.md) |
 
-Also included from upstream and its contributors after this fork branched: bounded texture serial history for long
-sessions (PR #34), hair and cloth animating at the right speed above 30 FPS, released Metal objects after GPU
-write-backs, the Opus decoder registry, and several crash fixes.
+### Full list of improvements
+
+Numbers are from 1.0.0 on an M1 Pro at 900p unless noted; "(upstream)" marks fixes taken from upstream or its
+contributors.
+
+**Higher, steadier frame rate**
+- The game's frame fence is answered one frame late, so the Metal replay overlaps the next game frame instead of
+  blocking it (busy area with the 60 FPS cap: ~29 → 60 FPS). Uncapped, it now runs at roughly 80–90 FPS.
+- Tile-based GPU optimizations: no needless tile loads/stores, unused depth/stencil left out, fewer pass splits and
+  barriers (+9–12 % FPS, −27 % tile memory traffic).
+- Decals read the G-buffer through Metal framebuffer fetch instead of texture copies (+11 % standing, +16 % panning,
+  ~1.1 GB less memory).
+- Cheaper per-draw work on the game's main thread (replay share of the main thread 55 % → 45 %).
+- Uncapped frame rate by default; the 60 FPS setting presents every tick (ignores the game's drop to 30) and uses fine
+  pacing on 120 Hz screens (worst frame 72 → 55 ms, dropped frames ~0).
+
+**Fewer stutters when new effects, enemies or areas appear**
+- Shaders are translated, loaded and compiled in the background; a new object is skipped for a few frames instead of
+  freezing the game.
+- Many more shaders ready before you play: the startup set grows to 13,356 (3,996 AGL shaders added), and 14,950
+  effect and UI shaders are compiled in the background after the first start, so first-time effects are already
+  built. Warm-up runs on all performance cores; 765 extra pipeline entries from upstream's shared list.
+- No pipeline is built on the render thread any more: the background table recycles when full (was up to 126 ms
+  stalls in play) and depth-omitted passes queue instead of building in place (was up to 1 s per pipeline, one 8.7 s
+  freeze when entering the world).
+- Smarter pipeline prediction: cached programs only, the state's own variant, no wasted depth-less guesses (upstream).
+
+**Fewer hitches while playing and loading areas**
+- Texture updates copy only the changed rectangle instead of whole mip levels, and textures the CPU rewrites every
+  frame skip page-fault tracking: frames over 50 ms dropped from 28 to ~16 per minute of play.
+- GPU-to-memory write-backs are batched into one command buffer: the ~110 ms stalls after spawning went from 23 to
+  3–4 in the scripted test.
+- Read-backs wait only for the uploads they depend on: in-world invalidations over 20 ms gone in the walking test.
+- RomFS read cache for the burst of ~3,500 tiny files read when entering the world: read time −30–35 %.
+- Large command recordings are handed over without copying (recording copy time −40–50 %).
+
+**Visual fixes**
+- Moving black / yellow patches on stone and ground (decals sampling the G-buffer they draw into).
+- Flickering or corrupted HUD and label text.
+- Clouds losing their depth test, and flicker from textures sharing storage.
+- Hair and cloth animating too fast above 30 FPS (upstream).
+
+**Stability and long sessions**
+- Crash after 7–30 minutes when the game re-initializes audio decoders (Opus slot reuse and registry, upstream).
+- GPU fault on the first frames (present texture made resident, upstream).
+- Shaders occasionally compiled with fast math by a start-up race (upstream).
+- macOS 27 address-space layout (stack / heap / alias reservation fallback).
+- Bounded texture serial history (upstream PR #34), Metal objects of GPU write-backs released (upstream), a stale
+  optional target no longer crashes after long play (upstream).
+
+**Mac app**
+- Settings window (Cmd-,): graphics, performance, display, controls (button layout, deadzone), saves, advanced.
+- Rolling save backups (APFS clones, newest 10) with restore.
+- Full screen by default (macOS Game Mode), pauses while hidden, clean quit from the Dock / Cmd-Q.
+- Audio: real-time workgroup, re-prime and fade on underrun (fewer crackles).
+- Screenshots with F12 / Cmd-Shift-S; English on-screen text.
+- The 17 GB RomFS stays outside the signed app, so a rebuilt app verifies in seconds.
+
+**For developers**
+- `scripts/bench.py` (uncapped benchmark on an isolated profile copy), `scripts/dev_rebuild.sh` (~15 s game-binary
+  rebuild), `perf.csv`, a per-frame timeline (`DM_NVN_TSV`), a guest CPU profiler, wait / lock statistics, stall stack
+  dumps and a RomFS read trace. Investigation records are in [`docs/`](docs/).
 
 Benchmarks use the fork's `games/totk/scripts/bench.py` (uncapped, offscreen, isolated copy of your profile, see
 [uncapped-benchmarks](docs/uncapped-benchmarks.md)). It and `scripts/dev_rebuild.sh` assume the workspace layout
