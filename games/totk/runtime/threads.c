@@ -596,7 +596,7 @@ int svc_thread(int num, uint64_t *regs) {
         // dispatcher does not hold G — the original code made the same fresh pthread_mutex_lock below). If the value
         // moves, this becomes the no-op return an ArbitrateLock gets for a value that changed under it; the userland
         // loop in the guest retries exactly like everywhere else.
-        static int spin_ns = -1; if (spin_ns < 0) { const char *e = getenv("TOTK_LOCK_SPIN"); spin_ns = (int)(strtoul(e, 0, 0) / 1000); if (spin_ns > 1000) spin_ns = 1000; }
+        static int spin_ns = -1; if (spin_ns < 0) { const char *e = getenv("TOTK_LOCK_SPIN"); spin_ns = (int)(strtoul(e ? e : "0", 0, 0) / 1000); if (spin_ns > 1000) spin_ns = 1000; }
         if (spin_ns > 0 && ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) {
             uint64_t d = now_ns() + (uint64_t)spin_ns * 1000;
             while (now_ns() < d) { uint32_t v = ld32(addr); if (!(v & WAITERS_BIT) || (v & ~WAITERS_BIT) != (uint32_t)regs[0]) break; __builtin_arm_yield(); }
