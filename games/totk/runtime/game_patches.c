@@ -92,6 +92,11 @@ static uint32_t adrp_reg(unsigned rd, uint64_t site, uint64_t target) {
     return 0x90000000u | ((imm & 3u) << 29) | ((imm >> 2) << 5) | (rd & 31u);
 }
 static uint32_t adrp_x9(uint64_t site, uint64_t target) { return adrp_reg(9, site, target); }
+static uint32_t branch_to(uint64_t site, uint64_t target) {   /* b <target>, both offsets in main (from upstream 27c3b43) */
+    int64_t delta = (int64_t)target - (int64_t)site;
+    if ((delta & 3) || delta < -(1 << 27) || delta >= (1 << 27)) runtime_fail("patch branch outside range");
+    return 0x14000000u | ((uint32_t)(delta >> 2) & 0x3ffffffu);
+}
 
 /* iOS cannot write code pages at run time: tools/export (TOTK_EXPORT_IOS, runtime/loader.c) runs these same patches on the
    Mac and the patched text is embedded in the app. On the device the loader only checks that the patched words are there. */
