@@ -1407,6 +1407,120 @@ static void ucap_read(const usnap_cap *c, uint64_t a, uint8_t *out, size_t n) {
         memcpy(out + (s0 - a), c->bytes + c->off[i] + (s0 - c->r[i].lo), (size_t)(e0 - s0));
     }
 }
+/* TOTK_SUBMIT_SANITIZER: debug mode that finds buffers a submission binds that the snapshot does NOT copy and that the
+   game rewrites before the replay reads them (the corrupted HUD letters came from one such buffer). At the submit call
+   every bound range is hashed (uniform, storage, vertex, index; at most 1 MiB each, inside a known pool) and the list
+   travels with the submission; at the start of that submission's replay, after the snapshot exists but before any command
+   runs, every range is hashed again. A change on a snapshotted range is harmless (the replay reads the copy), a change on
+   any other range is the bug this looks for. Off by default: then it costs one cached flag check per submit and per replay. */
+enum { SSAN_UBO, SSAN_SSBO, SSAN_VBO, SSAN_IBO, SSAN_KINDS };
+typedef struct { uint64_t addr, size, hash; uint32_t kind; } ssan_rng;
+typedef struct { int n, cap; ssan_rng *r; } ssan_list;
+static _Atomic int g_ssan_on = -1;
+static int ssan_on(void) {
+    int v = atomic_load(&g_ssan_on);
+    if (v < 0) {
+        const char *e = getenv("TOTK_SUBMIT_SANITIZER"); v = e && atoi(e);
+        atomic_store(&g_ssan_on, v);
+        if (v) MLOG("[submit sanitizer] on: every bound buffer range is hashed at the submit call and re-hashed at the start of the replay (TOTK_SUBMIT_SANITIZER=1; only the translation thread, TOTK_ASYNC_REPLAY, can see a change)");
+    }
+    return v;
+}
+/* TOTK_SUBMIT_SANITIZER: FNV-1a 64 over the bytes; 0 = the range faulted (a page the game unmapped meanwhile), as the guarded snapshot copy. */
+static int ssan_hash(uint64_t a, uint64_t n, uint64_t *out) {
+    sigjmp_buf jb; sigjmp_buf *prev = runtime_fault_guard;   // TOTK_SUBMIT_SANITIZER: the submit call may already sit in a guarded guest call
+    if (sigsetjmp(jb, 1)) { runtime_fault_guard = prev; return 0; }
+    runtime_fault_guard = &jb;
+    const uint8_t *p = (const uint8_t *)(uintptr_t)a;
+    uint64_t h = 14695981039346656037ull; size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 1099511628211ull; }
+    for (; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
+    runtime_fault_guard = prev;
+    *out = h;
+    return 1;
+}
+static void ssan_add(ssan_list *l, int kind, uint64_t a, uint64_t n) {
+    if (!a || !n) return;
+    if (n > (1u << 20)) n = 1u << 20;   // TOTK_SUBMIT_SANITIZER: a huge range is judged by its first 1 MiB
+    void *mb; uint64_t mo;
+    if (!mtl_addr(a, n, &mb, &mo)) return;   // TOTK_SUBMIT_SANITIZER: outside every pool, so the replay could not read it the same way either
+    if (l->n && l->r[l->n - 1].addr == a && l->r[l->n - 1].size == n && l->r[l->n - 1].kind == (uint32_t)kind) return;   // TOTK_SUBMIT_SANITIZER: bound again in a row (one buffer, many draws)
+    if (l->n == l->cap) { l->cap = l->cap ? l->cap * 2 : 256; l->r = realloc(l->r, (size_t)l->cap * sizeof *l->r); if (!l->r) MDIE("submit sanitizer ranges"); }
+    uint64_t h; if (!ssan_hash(a, n, &h)) return;
+    l->r[l->n++] = (ssan_rng){a, n, h, (uint32_t)kind};
+}
+static void ssan_walk(ssan_list *l, const uint8_t *p, int depth) {   // TOTK_SUBMIT_SANITIZER: the same walk as usnap_collect, every binding kind
+    for (;;) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) MDIE("corrupt recording at %p while hashing bindings (op %u size %u)", (const void *)p, h.op, h.size);
+        if (h.op == OP_END) return;
+        if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
+        if (h.op == OP_CALL) { uint64_t t; memcpy(&t, p + 8, 8); if (depth < 16) ssan_walk(l, (const uint8_t *)(uintptr_t)t, depth + 1); }
+        else if (h.op == OP_BIND_UBO || h.op == OP_BIND_SSBO) {
+            const p_bind_buf *b = (const p_bind_buf *)(p + 8);
+            ssan_add(l, h.op == OP_BIND_UBO ? SSAN_UBO : SSAN_SSBO, b->addr, b->size);
+        } else if (h.op == OP_BIND_VBUF) {
+            const p_bind_vbuf *b = (const p_bind_vbuf *)(p + 8);
+            for (int i = 0; i < b->n && i < 16; i++) ssan_add(l, SSAN_VBO, b->r[i].address, b->r[i].size);
+        } else if (h.op == OP_DRAW_IDX) {   // TOTK_SUBMIT_SANITIZER: the index buffer is not bound by its own op, the draw carries it
+            const p_draw_idx *d = (const p_draw_idx *)(p + 8);
+            if (d->count > 0) ssan_add(l, SSAN_IBO, d->ibuf, (uint64_t)d->count * (d->itype == 0 ? 1 : d->itype == 1 ? 2 : 4));
+        }
+        p += h.size;
+    }
+}
+void *mtl_sub_sanitize_capture(const uint64_t *h, int n) {   // TOTK_SUBMIT_SANITIZER: submit call, game thread
+    if (!ssan_on()) return NULL;
+    ssan_list *l = calloc(1, sizeof *l); if (!l) MDIE("submit sanitizer list");
+    for (int i = 0; i < n; i++) ssan_walk(l, (const uint8_t *)(uintptr_t)h[i], 0);
+    return l;
+}
+static int ssan_snap(uint64_t a, uint64_t n) {   // TOTK_SUBMIT_SANITIZER: a snapshot copy holds all of [a, a+n) (copies are disjoint and sorted)
+    if (!g_nusnap || !n) return 0;
+    int i = usnap_first(a);
+    return i < g_nusnap && g_usnap[i].lo <= a && a + n <= g_usnap[i].hi;
+}
+/* TOTK_SUBMIT_SANITIZER: a GPU write still outstanding at the submit call (g_gw, kept by usnap_take) may legitimately
+   change the range before the replay (an earlier submission's compute / render output): expected, not a bug. */
+static int ssan_gpu(uint64_t a, uint64_t n) { for (int i = 0; i < g_ngw; i++) if (g_gw[i].lo < a + n && a < g_gw[i].hi) return 1; return 0; }
+static uint64_t g_ssan_mis_gpu[SSAN_KINDS];
+static uint64_t g_ssan_mis[SSAN_KINDS], g_ssan_mis_free[SSAN_KINDS], g_ssan_subs, g_ssan_ranges, g_ssan_ns, g_ssan_last_frame;
+static uint64_t g_ssan_seen[50]; static int g_ssan_nseen;
+static const char *const g_ssan_kind[SSAN_KINDS] = { "uniform", "storage", "vertex", "index" };
+static void ssan_report(void) {   // TOTK_SUBMIT_SANITIZER: every ~600 frames, what changed and how much of it the snapshot already covers
+    MLOG("[submit sanitizer] %llu submissions: %.0f ranges hashed / submission, %.3f ms / submission; changed after submit: "
+         "uniform %llu (%llu likely bugs), storage %llu (%llu), vertex %llu (%llu), index %llu (%llu); GPU-written (expected) %llu; %d likely-bug addresses logged so far",
+         (unsigned long long)g_ssan_subs, g_ssan_subs ? (double)g_ssan_ranges / (double)g_ssan_subs : 0.0,
+         g_ssan_subs ? (double)g_ssan_ns / (double)g_ssan_subs / 1e6 : 0.0,
+         (unsigned long long)g_ssan_mis[0], (unsigned long long)g_ssan_mis_free[0], (unsigned long long)g_ssan_mis[1], (unsigned long long)g_ssan_mis_free[1],
+         (unsigned long long)g_ssan_mis[2], (unsigned long long)g_ssan_mis_free[2], (unsigned long long)g_ssan_mis[3], (unsigned long long)g_ssan_mis_free[3],
+         (unsigned long long)(g_ssan_mis_gpu[0] + g_ssan_mis_gpu[1] + g_ssan_mis_gpu[2] + g_ssan_mis_gpu[3]), g_ssan_nseen);
+    memset(g_ssan_mis, 0, sizeof g_ssan_mis); memset(g_ssan_mis_free, 0, sizeof g_ssan_mis_free); memset(g_ssan_mis_gpu, 0, sizeof g_ssan_mis_gpu);
+    g_ssan_subs = g_ssan_ranges = g_ssan_ns = 0;   // TOTK_SUBMIT_SANITIZER: g_ssan_nseen stays, the per-address lines are the first 50 of the whole run
+}
+void mtl_sub_sanitize_check(void *listv) {   // TOTK_SUBMIT_SANITIZER: start of the replay, translation thread; the snapshot is known, nothing ran yet
+    ssan_list *l = listv;
+    if (!l) return;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (int i = 0; i < l->n; i++) {
+        uint64_t h; if (!ssan_hash(l->r[i].addr, l->r[i].size, &h) || h == l->r[i].hash) continue;
+        int k = l->r[i].kind < SSAN_KINDS ? (int)l->r[i].kind : 0, snap = ssan_snap(l->r[i].addr, l->r[i].size), gpu = !snap && ssan_gpu(l->r[i].addr, l->r[i].size);
+        g_ssan_mis[k]++; if (gpu) g_ssan_mis_gpu[k]++; else if (!snap) g_ssan_mis_free[k]++;
+        if (g_ssan_nseen < 50 && !snap && !gpu) {   // TOTK_SUBMIT_SANITIZER: individual lines only for likely bugs (harmless changes are counted)
+            int seen = 0;
+            for (int j = 0; j < g_ssan_nseen; j++) if (g_ssan_seen[j] == l->r[i].addr) { seen = 1; break; }
+            if (!seen) {
+                g_ssan_seen[g_ssan_nseen++] = l->r[i].addr;
+                MLOG("[submit sanitizer] %s %#llx+%llu changed after submit: %s", g_ssan_kind[k], (unsigned long long)l->r[i].addr, (unsigned long long)l->r[i].size,
+                     snap ? "the snapshot covers it (harmless: the replay reads the copy)" : gpu ? "written by outstanding GPU work (expected)" : "NOT snapshotted (likely bug: the replay reads whatever the game wrote meanwhile)");
+            }
+        }
+    }
+    g_ssan_subs++; g_ssan_ranges += (uint64_t)l->n; g_ssan_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (f >= g_ssan_last_frame + 600) { g_ssan_last_frame = f; ssan_report(); }
+    free(l->r); free(l);
+}
 static int g_ucap_probe_now;   // probe-gpu-ubo-snapshot negative control only: judge GPU writes at the replay, not the capture
 static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap);
 /* Helper threads for phase 2 of usnap_take: each claims entries through an atomic cursor and copies them; the replay
@@ -12440,6 +12554,47 @@ static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
 static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double, int);
 
+/* TOTK_VRR (default off): adaptive display refresh for the uncapped mode. Uncapped presents do not wait for the display, so
+   at 80-100 fps on a 120 Hz panel each finished frame is held for one or two 8.3 ms refreshes -- uneven on-screen pacing
+   (judder). With TOTK_VRR=1 the display link follows the game's frame interval: a frame goes up when it is ready and is
+   shown once. Off: every refresh shows the newest finished frame, exactly as before. */
+#define VRR_MIN 40
+#define VRR_N 16   // TOTK_VRR: frames in the moving average (~0.2 s at 80 fps, also covers a 30 fps dip)
+static int g_vrr = -1, g_vrr_uncapped;   // TOTK_VRR (read once; -1 = not read yet) / hle_nvn.c: the uncapped mode currently paces the game (interpolation off)
+static double g_vrr_iv[VRR_N], g_vrr_sum, g_vrr_t;   // last game frame intervals, their sum, and the time of the last present
+static int g_vrr_n, g_vrr_i, g_vrr_pref;   // intervals in the window / ring index / preferred rate last set (0 = none yet)
+static uint64_t g_vrr_set_ns;
+static int g_vrr_avg_fps, g_vrr_pref_pub;   // published for the ~10 s line (read by the display link thread)
+static _Atomic uint64_t g_vrr_ticks, g_vrr_frames, g_vrr_repeat; static uint64_t g_vrr_log_ns;   // display link thread only
+int mtl_vrr_on(void) {
+    if (g_vrr < 0) {
+        const char *e = getenv("TOTK_VRR"); g_vrr = e && atoi(e) != 0;
+        if (g_vrr) MLOG("TOTK_VRR=1：显示器跟随游戏帧率（不限帧率、补帧关时按最近 %d 帧的帧间隔自适应刷新，%d Hz 起）", VRR_N, VRR_MIN);
+    }
+    return g_vrr > 0;
+}
+void mtl_vrr_uncapped(int on) { g_vrr_uncapped = on != 0; }   // TOTK_VRR: called by hle_nvn.c on every present
+static int vrr_live(void) { return mtl_vrr_on() && g_vrr_uncapped && g_dm_present_link == 1; }   // TOTK_VRR: only the plain uncapped mode (1), not the pacing modes
+static int vrr_max_hz(void) { int hz = mtl_display_hz(); return hz > 0 ? hz : 120; }
+static CAFrameRateRange vrr_range(void) {   // TOTK_VRR: {40, display max, the game's rate}; the display max until there is an average
+    int max = vrr_max_hz(), pref = g_vrr_pref >= VRR_MIN && g_vrr_pref <= max ? g_vrr_pref : max;
+    return CAFrameRateRangeMake(VRR_MIN, max, (float)pref);
+}
+/* TOTK_VRR: one display-link refresh, fresh = a new frame went up (otherwise the previous frame stays for another refresh).
+   Counts frames and repeated refreshes and logs a line every ~10 s. */
+static void vrr_tick(int fresh) {
+    if (!vrr_live()) return;
+    uint64_t now = now_ns(), last = g_vrr_log_ns;
+    atomic_fetch_add(&g_vrr_ticks, 1);
+    atomic_fetch_add(fresh ? &g_vrr_frames : &g_vrr_repeat, 1);
+    if (!last) { g_vrr_log_ns = now; return; }
+    if (now - last < 10000000000ull) return;
+    uint64_t ticks = atomic_exchange(&g_vrr_ticks, 0), frames = atomic_exchange(&g_vrr_frames, 0), rep = atomic_exchange(&g_vrr_repeat, 0);
+    g_vrr_log_ns = now;
+    MLOG("TOTK_VRR：近 %.1f s 刷新 %llu 次、上屏 %llu 帧、重复显示上一帧 %llu 次；游戏平均 %d 帧，显示偏好 %d Hz", (now - last) / 1e9,
+         (unsigned long long)ticks, (unsigned long long)frames, (unsigned long long)rep, g_vrr_avg_fps, g_vrr_pref_pub);
+}
+
 @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
 @end
 
@@ -12473,9 +12628,18 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_link_cv);
     pthread_mutex_unlock(&g_link_mu);
     pthread_mutex_lock(&g_pq_mu);
-    if (!g_dm_present_link || g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu); return; }
+    int active = g_dm_present_link != 0;
+    if (!active || g_pq_read == g_pq_in) {
+        pthread_mutex_unlock(&g_pq_mu);
+        if (active) vrr_tick(0);   // TOTK_VRR: no new frame this refresh -- the previous frame stays on screen (counted as a repeat)
+        return;
+    }
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
-    pq_item *ip = &g_pq[(g_pq_in - 1) % PQ];
+    /* TOTK_VRR: take the oldest queued frame instead of merging the queue into the newest one, so every finished frame is
+       shown exactly once, in order. Only a backlog deeper than two frames (the display has not caught up with the new rate
+       yet) takes the newest, so input latency does not keep growing. */
+    if (vrr_live()) ticket = g_pq_in - g_pq_read > 2 ? g_pq_in : first;
+    pq_item *ip = &g_pq[(ticket - 1) % PQ];
     int interp = ip->interp >= 0 && !ip->interp_shown ? ip->interp : -1;   // TOTK_MFX: this tick shows the interpolated frame, a later one the game frame
     double tts = update.targetPresentationTimestamp;
     if (interp < 0 && ip->interp >= 0 && tts > 0 && ip->interp_ts > 0) {
@@ -12487,13 +12651,14 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     }
     if (interp >= 0) { ip->interp_shown = 1; ip->interp_ts = tts; }
     pq_item it = *ip; g_link_it_tin = it.t_in;
-    g_pq_read = interp >= 0 ? g_pq_in - 1 : g_pq_in;
+    g_pq_read = interp >= 0 ? ticket - 1 : ticket;
     if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) g_pres[k % PRING] = (pres_ent){k, -1}; }   // 被合并丢弃的旧帧记「未上屏」，上屏统计如实算掉帧 | Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
     if (ticket > 1 && g_pq_done < ticket - 1) g_pq_done = ticket - 1;
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     int submitted;
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, interp); }
+    vrr_tick(submitted);   // TOTK_VRR: this refresh showed a new frame (0 = no drawable: counted as a repeat, as on screen)
     if (!submitted && interp < 0) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
@@ -12507,6 +12672,7 @@ static CAMetalDisplayLink *g_link; static CFRunLoopRef g_link_rl; static int g_l
 static int g_link_owns_layer, g_classic_busy;   // 持 g_pq_mu：图层挂着节拍对象期间 nextDrawable 会抛异常，自取 drawable 的出图线程与节拍对象互斥 | Under g_pq_mu: nextDrawable throws while the layer has the display link object attached, so the present thread that takes its own drawable and the display link object are mutually exclusive
 static int link_on(void) { return g_dm_present_link && g_link != nil; }
 static CAFrameRateRange link_range(int mode) {
+    if (mode == 1 && vrr_live()) return vrr_range();   // TOTK_VRR: the uncapped mode follows the game's frame interval
     if (mode == 3) return CAFrameRateRangeMake(30, 30, 30);
     if (mode == 2) return CAFrameRateRangeMake(60, 120, 120);
     const char *explicit_hz = getenv("DM_PRESENT_HZ"), *rt = getenv("TOTK_REALTIME");
@@ -12550,6 +12716,35 @@ static void link_sync(void) {   // 游戏出图线程每帧调：把节拍对象
     MLOG("出图节拍模式 %d → %d（帧 %llu）", applied, want, (unsigned long long)atomic_load(&g_cur_frame));
     applied = want;
     pthread_mutex_lock(&g_pq_mu); pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
+}
+/* TOTK_VRR: called once per game frame by mtl_present (game thread): keep the display's preferred rate on the game's frame
+   interval. A range change makes the system re-plan its refresh cadence, so it is set only when the average moved by more
+   than 5 fps, and at most twice a second. */
+static void vrr_frame(void) {
+    static int followed;
+    double now = CACurrentMediaTime();
+    if (!vrr_live() || !g_link) {
+        g_vrr_t = 0;
+        if (followed) {   // TOTK_VRR: left the uncapped mode: back to the fixed display rate, counters for a fresh start
+            followed = 0; g_vrr_n = g_vrr_i = 0; g_vrr_sum = g_vrr_pref = 0; g_vrr_log_ns = 0;
+            atomic_store(&g_vrr_ticks, 0); atomic_store(&g_vrr_frames, 0); atomic_store(&g_vrr_repeat, 0);
+            if (g_link) g_link.preferredFrameRateRange = link_range(1);
+        }
+        return;
+    }
+    if (!followed) { followed = 1; g_vrr_n = g_vrr_i = 0; g_vrr_sum = g_vrr_pref = 0; }
+    double iv = g_vrr_t > 0 ? now - g_vrr_t : 0; g_vrr_t = now;
+    if (iv <= 0 || iv > 0.25) return;   // TOTK_VRR: first frame, or a load / menu / background gap, not a frame rate
+    if (g_vrr_n < VRR_N) { g_vrr_iv[g_vrr_n++] = iv; g_vrr_sum += iv; }
+    else { g_vrr_sum += iv - g_vrr_iv[g_vrr_i]; g_vrr_iv[g_vrr_i] = iv; g_vrr_i = (g_vrr_i + 1) % VRR_N; }
+    int max = vrr_max_hz(), fps = (int)(g_vrr_n / g_vrr_sum + 0.5), pref = fps < VRR_MIN ? VRR_MIN : fps > max ? max : fps;
+    g_vrr_avg_fps = fps;
+    uint64_t t = now_ns();
+    if (!g_vrr_pref) { if (g_vrr_n * 2 < VRR_N) return; }   // TOTK_VRR: half a window is enough to start following
+    else if (t - g_vrr_set_ns < 500000000ull || (pref > g_vrr_pref ? pref - g_vrr_pref : g_vrr_pref - pref) <= 5) return;
+    g_link.preferredFrameRateRange = CAFrameRateRangeMake(VRR_MIN, max, (float)pref);
+    g_vrr_pref = g_vrr_pref_pub = pref; g_vrr_set_ns = t;
+    MLOG("TOTK_VRR：游戏帧间隔 %.1f ms（平均 %d 帧）→ 显示偏好刷新 %d Hz（%d–%d）", 1000.0 * g_vrr_sum / g_vrr_n, fps, pref, VRR_MIN, max);
 }
 // 进后台前（mtl_drain）：显示节拍驱动出图时，排着队还没上屏的帧只能由节拍回调取走，而后台里系统不再回调——
 // 原样等「出图队列清空」会永远等下去，进后台的回调不返回，系统把进程杀掉（切到别的 App 后 22 秒内进程消失）。
@@ -12692,6 +12887,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         if (st == 1 && link_on() && now - t0 >= at) { st = 2; mtl_link_pause(1); MLOG("DM_TEST_LINK_STALL：暂停显示节拍 %.1f 秒（帧 %llu）", dur, (unsigned long long)atomic_load(&g_cur_frame)); }
         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL：放开显示节拍（帧 %llu）", (unsigned long long)atomic_load(&g_cur_frame)); }
     }
+    if (mtl_vrr_on()) vrr_frame();   // TOTK_VRR: follow this frame's interval with the display (cached check only when off)
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // 队满才等；正常由 AcquireTexture 先挡住 | Wait only when the queue is full; normally AcquireTexture blocks first
     pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), islot, 0, 0};

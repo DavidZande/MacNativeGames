@@ -35,6 +35,11 @@ void mtl_sub_begin(void);
    NULL: copy from memory now) and frees cap. */
 void *mtl_sub_capture_ubos(const uint64_t *h, int n);
 void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *cap);
+/* TOTK_SUBMIT_SANITIZER (TOTK_SUBMIT_SANITIZER=1, debug, off by default): hashes every range the submission binds at the
+   submit call and re-checks it at the start of the replay (capture runs on the game thread, check on the translation
+   thread just before the commands run; the check frees the list). */
+void *mtl_sub_sanitize_capture(const uint64_t *h, int n);
+void mtl_sub_sanitize_check(void *list);
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n);               // GPU 时序上的缓冲拷贝 | Buffer copy in GPU ordering
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v);   // 完成后写事件值（0 写 / 1 加） | Write the event value after completion (0 write / 1 add)
 void mtl_sub_counter(uint64_t addr, uint32_t type);                       // 完成后写计数器记录 | Write the counter record after completion

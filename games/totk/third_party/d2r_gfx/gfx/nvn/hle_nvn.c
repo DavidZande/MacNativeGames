@@ -1949,7 +1949,7 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 // TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. Local change (2026-10-19): on by default, together with
 // TOTK_FENCE_LAG (see fence_lag_on): alone it only moved the wait from the graphics mutex to the frame fence.
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
-typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
+typedef struct { int kind, n; uint64_t *h; void *ucap; void *ssan; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call; ssan: TOTK_SUBMIT_SANITIZER range hashes taken there
 #define XQ 64
 #define XF 4096
 static xjob g_xq[XQ];
@@ -2009,7 +2009,7 @@ static int async_replay(void) {
     if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = !(e && atoi(e) <= 0); if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
     return v;
 }
-static void submit_exec(int n, const uint64_t *h, void *ucap);
+static void submit_exec(int n, const uint64_t *h, void *ucap, void *ssan);
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame);
 static void *x_thread(void *unused) {
     (void)unused; pthread_setname_np("totk-translate"); t_xthread = 1;
@@ -2020,7 +2020,7 @@ static void *x_thread(void *unused) {
         uint64_t queued = g_xq_in - g_xq_done;   // entries still waiting behind this one
         pthread_mutex_unlock(&g_xq_mu);
         uint64_t x0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), xc0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
-        if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap); free(j.h); }
+        if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap, j.ssan); free(j.h); }
         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
         else {
             // Real-time like the game's render thread that used to replay (set at acquire): otherwise the game's ~50
@@ -2153,14 +2153,15 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         uint64_t u0 = now_ns();
         j.ucap = mtl_sub_capture_ubos((const uint64_t *)h, n);
         atomic_fetch_add(&g_lf_ucap_ns, now_ns() - u0);
+        j.ssan = mtl_sub_sanitize_capture((const uint64_t *)h, n);   // TOTK_SUBMIT_SANITIZER: NULL unless TOTK_SUBMIT_SANITIZER=1
         x_push(&j);
         totk_tl(TL_SUB_OUT, 1, 0);
         return;
     }
-    submit_exec(n, (const uint64_t *)h, NULL);
+    submit_exec(n, (const uint64_t *)h, NULL, NULL);
     totk_tl(TL_SUB_OUT, 0, 0);
 }
-static void submit_exec(int n, const uint64_t *h, void *ucap) {
+static void submit_exec(int n, const uint64_t *h, void *ucap, void *ssan) {
     gfx_enter();
     totk_tl(TL_REP_BEGIN, 0, 0);
     pin_step(__atomic_load_n(&g_submits, __ATOMIC_RELAXED));   /* TOTK: free texture copies no recording refers to any more */
@@ -2175,6 +2176,7 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
     { static int wl = -1; if (wl < 0) wl = getenv("TOTK_WATCH_ADDR") != NULL; if (wl) LOG("[sub] F%llu start t_us=%llu", (unsigned long long)g_frame_pub, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000)); }
     mtl_sub_begin();
     mtl_sub_snapshot_ubos_cap((const uint64_t *)h, n, ucap);   // TOTK: uniforms as of the submit call (ucap: bytes captured there)
+    mtl_sub_sanitize_check(ssan);   // TOTK_SUBMIT_SANITIZER: ranges the game rewrote between the submit call and here (snapshot known, nothing ran yet)
     mtl_sub_index((const uint64_t *)h, n);
     for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
     mtl_exec_rest(NULL, 0);
@@ -2346,6 +2348,7 @@ extern void movie_host_tick(void) __attribute__((weak_import));   /* TOTK runtim
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
 extern uint32_t mtl_present_qos(void);
+extern int mtl_vrr_on(void), mtl_vrr_uncapped(int);   // TOTK_VRR: adaptive display refresh for the uncapped mode (nvn_mtl.m)
 uint64_t g_frame_pub;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
@@ -2841,6 +2844,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           if (ms) LOG("[nvn] 首次进局等管线预热 %d ms（本帧绘制 %llu）", ms, (unsigned long long)this_draws);
       } }
     present_cfg(o);
+    /* TOTK_VRR: tell the graphics side whether the game really runs uncapped right now; the display link then follows the
+       frame interval (no-op unless TOTK_VRR=1). Frame interpolation paces the game itself, so it stays off there. */
+    if (mtl_vrr_on()) mtl_vrr_uncapped(uncapped_now() && !mfx_enabled());
     uint64_t t0 = now_ns();
     if (async_replay()) {   // TOTK: the present (and the replay frame number below) run on the translation thread, after this frame's submits
         xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9};
