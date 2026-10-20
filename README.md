@@ -12,7 +12,7 @@ this repository. All credit for the port itself goes to upstream and the project
 
 | Area | Change | Measured (1.0.0, M1 Pro, 900p) | Off switch | Record |
 |---|---|---|---|---|
-| Frame pacing | The game's frame fence answered one frame late, so the Metal replay (upstream's translation thread, now on by default) overlaps the next game frame | busy area, 60 FPS cap: ~29 → **60 FPS** | `TOTK_FENCE_LAG=0` | [practical-performance](docs/practical-performance-20261019.md) |
+| Frame pacing | The game's frame fence answered one frame late, so the Metal replay (upstream's translation thread, now on by default) overlaps the next game frame | busy area, 60 FPS cap: 54 → **60 FPS** | `TOTK_FENCE_LAG=0` | [practical-performance](docs/practical-performance-20261019.md) |
 | GPU passes | Tile load/store elision, unused depth/stencil omitted, fewer pass splits and barriers | uncapped **+9–12 % FPS**, −27 % tile memory traffic | `DM_NVN_TBDR=0` (all), `TOTK_DS_OMIT=0` | [tbdr-barrier-sync](docs/tbdr-barrier-sync-optimizations-20261019.md) |
 | Decals / ground | Decal passes that read the G-buffer they draw into get correct input (fixes the moving black/yellow patches on stone); where provable, through Metal framebuffer fetch instead of copies | patches gone; vs. copies **80.9 → 89.8 FPS** standing, **70.9 → 82.3** panning, ~1.1 GB less memory | `TOTK_RT_FEEDBACK_FETCH=0` (copies), `TOTK_RT_FEEDBACK_SNAPSHOT=0` (neither) | [shadow-feedback](docs/shadow-feedback-20261019.md), [follow-ups](docs/perf-followups-20261020.md) |
 | UI | Flickering / corrupted HUD letters (glyph data overwritten before the GPU read it) | 10/40 bad frames → 0/40 | `TOTK_STORAGE_SNAPSHOT=0` | [ui-flicker](docs/ui-flicker-20261019.md) |
@@ -27,7 +27,7 @@ contributors.
 
 **Higher, steadier frame rate**
 - The game's frame fence is answered one frame late, so the Metal replay overlaps the next game frame instead of
-  blocking it (busy area with the 60 FPS cap: ~29 → 60 FPS). Uncapped, it now runs at roughly 80–90 FPS.
+  blocking it (busy area with the 60 FPS cap: 54 → 60 FPS). Uncapped, it now runs at roughly 80–90 FPS.
 - Tile-based GPU optimizations: no needless tile loads/stores, unused depth/stencil left out, fewer pass splits and
   barriers (+9–12 % FPS, −27 % tile memory traffic).
 - Decals read the G-buffer through Metal framebuffer fetch instead of texture copies (+11 % standing, +16 % panning,
@@ -87,12 +87,15 @@ Benchmarks use the fork's `games/totk/scripts/bench.py` (uncapped, offscreen, is
 [uncapped-benchmarks](docs/uncapped-benchmarks.md)). It and `scripts/dev_rebuild.sh` assume the workspace layout
 `~/Documents/TearsOfKingdom/` (game file, keys, `TOTK_build/`); `TOTK_TREE` / `TOTK_APP` override the paths.
 
+**Maintainers:** [UPSTREAMING.md](UPSTREAMING.md) maps each improvement to its commits, dependencies, evidence and
+switches, with a suggested order for taking them upstream.
+
 Known open item: the first frames right after spawning can still take ~150–200 ms (a submit-side stall, not disk reads).
 
 ### 中文简介
 
 本仓库是 [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames) 的性能分支，针对 Apple 芯片上的《王国之泪》做了渲染与卡顿修复：
-帧栅栏晚一帧应答（繁忙区域 60 帧上限下约 29 → 60 FPS）、TBDR 通道优化、地面贴花读 G-buffer 的修正（改用 Metal 片上读取，
+帧栅栏晚一帧应答（繁忙区域 60 帧上限下 54 → 60 FPS）、TBDR 通道优化、地面贴花读 G-buffer 的修正（改用 Metal 片上读取，
 帧率提升 11–16%）、界面文字闪烁修复、游玩卡顿与着色器编译卡顿修复、RomFS 读取缓存等。仅在 1.0.0、M1 Pro 上测试。
 构建与使用方法与上游相同（见下文）。每项改动都可用环境变量关闭，详见上表。
 
