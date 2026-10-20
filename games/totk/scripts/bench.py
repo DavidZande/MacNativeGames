@@ -213,6 +213,7 @@ def run(name, args, outdir):
     if args.profile: env['TOTK_SYMBOL_MAP'] = str(rd / 'symbols.txt')
     perf_off = PERF.stat().st_size if PERF.exists() else 0
     log = rd / 'totk.log'
+    env.setdefault('TOTK_FLIGHT_DIR', str(rd / 'flight'))   # flight-recorder events of bench runs stay with the run, not in the player's folder
     if args.app:   # the packaged app's launcher (it writes ~/Library/Logs/MacNativeGames/totk.log)
         GAME_PROC = subprocess.Popen([str(APP / 'Contents/MacOS/TOTK')], env=env, cwd='/', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         log = LOG
