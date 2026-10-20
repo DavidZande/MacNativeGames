@@ -217,7 +217,21 @@ static void main_lock_note(uint64_t addr, uint32_t owner, uint64_t lr, uint64_t 
     e[i].lr = lr; e[i].ns += ns; e[i].n++;
     uint64_t now = now_ns(); if (!last) last = now; if (now - last < 5000000000ull) return;
     double secs = (now - last) / 1e9; last = now;
+    static uint64_t dump_want[8]; static int dump_n = -1;
+    if (dump_n < 0) { dump_n = 0; const char *e = getenv("TOTK_LOCK_DUMP"); if (e) for (const char *p = e; p && *p && dump_n < 8; ) { char *q; uint64_t v = strtoull(p, &q, 0); if (q == p) break; if (v) dump_want[dump_n++] = v; p = *q == ',' ? q + 1 : q; } }
     for (int k = 0; k < N && e[k].n; k++) {
+        if (dump_n && e[k].n) {   // one-shot dump of every listed address: allocators keep headers/links nearby; following the list in later dumps traces the owning pool
+            uint64_t list[8]; int nlist = dump_n;
+            for (int d = 0; d < nlist; d++) list[d] = dump_want[d];
+            dump_n = 0;
+            for (int d = 0; d < nlist; d++) {
+                for (int64_t w = -24; w < 24; w++) {
+                    uint64_t a = list[d] + w * 8;
+                    uint32_t lo = __atomic_load_n((uint32_t *)a, __ATOMIC_SEQ_CST), hi = __atomic_load_n((uint32_t *)(a + 4), __ATOMIC_SEQ_CST);
+                    fprintf(stderr, "[totk] lockdump %#llx %+3ld x0 %#llx\n", (unsigned long long)a, (long)w * 8, (unsigned long long)((uint64_t)hi << 32 | lo));
+                }
+            }
+        }
         thr_t *o = NULL; for (thr_t *x = g_all; x; x = x->all) if (x->handle == (e[k].owner & ~WAITERS_BIT)) { o = x; break; }
         fprintf(stderr, "[totk] main lock waits: lock %#llx owner %#x (entry %#llx arg %#llx prio %d core %d host thread %llu) %.1f ms/s %llu waits/s, caller lr %#llx\n",
                 (unsigned long long)e[k].addr, e[k].owner, o ? (unsigned long long)o->entry : 0ull, o ? (unsigned long long)o->arg : 0ull, o ? o->prio : -1, o ? o->core : -1, o ? (unsigned long long)o->tid : 0ull,
@@ -576,6 +590,17 @@ int svc_thread(int num, uint64_t *regs) {
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
         thr_t *t = cur(); uint64_t addr = regs[1];
+        // Local change (TOTK_LOCK_SPIN=ns, 0 = off): when the value still shows the queued owner, spin for a bounded
+        // window before queueing. The release usually beats a block→wake→core-handoff round trip (~12 µs at idle on the
+        // recorder-queue mutex). G is not held here, so the spin needs no G gymnastics (entry invariant: the SVC
+        // dispatcher does not hold G — the original code made the same fresh pthread_mutex_lock below). If the value
+        // moves, this becomes the no-op return an ArbitrateLock gets for a value that changed under it; the userland
+        // loop in the guest retries exactly like everywhere else.
+        static int spin_ns = -1; if (spin_ns < 0) { const char *e = getenv("TOTK_LOCK_SPIN"); spin_ns = (int)(strtoul(e, 0, 0) / 1000); if (spin_ns > 1000) spin_ns = 1000; }
+        if (spin_ns > 0 && ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) {
+            uint64_t d = now_ns() + (uint64_t)spin_ns * 1000;
+            while (now_ns() < d) { uint32_t v = ld32(addr); if (!(v & WAITERS_BIT) || (v & ~WAITERS_BIT) != (uint32_t)regs[0]) break; __builtin_arm_yield(); }
+        }
         pthread_mutex_lock(&G);
         int64_t r = 0;
         if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) {
