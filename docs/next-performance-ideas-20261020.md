@@ -236,3 +236,25 @@ Later: a reference render of the same capture through Ryujinx to say what the fr
 2. **3a sanitizer**: cheap, finds artifacts, makes every later change safer.
 3. **1a implementation** (dependency-based barriers), then **2b** (upload budget) for the post-spawn stalls.
 4. **1b** (tile-memory G-buffer), the largest structural change.
+
+## Precompiled runtime shaders (TOTK_RT_METALLIB, default on, 2026-10-21)
+
+Play test 2026-10-20 (flight recorder): the launch after macOS's shared Metal cache was cleared compiled all ~25,000
+translated shaders from source: 74 s before the first frame and ~3.5 min of 8-thread background compiling during play
+(the 173 ms hitch and the dip that locked TOTK_VRR at 40 Hz). Now the game loads `<key>.metallib` next to each
+`<key>.metal` (the iOS path, `nvn_rt_metallib.h`), compiled by Xcode's `metal` (Metal Toolchain component) with the
+runtime's options (default language version 4.1, safe math). The output carries the source's mtime and is used only
+while it matches. After the warm-up the game bakes sources new since the last bake on 2 background-QoS threads;
+`scripts/bake_metallibs.py` bakes a whole cache with all cores (39,737 in 23 min, ~600 MB, 0 rejected).
+
+1080p, busy-area save at night (bench 20261020-234507 first launch / 235016 second / 235304 TOTK_RT_METALLIB=0):
+
+| | essential shaders wait | first frame | warm-up | idle FPS | pan FPS | GPU ms idle / pan |
+|---|---|---|---|---|---|---|
+| on, first launch (GPU code cache cold) | 1.7 s | 5.3 s | 115 s (pipelines 58 s) | 91.8 | 82.2 | 10.76 / 11.98 |
+| on, second launch | 0.3 s | 5.8 s | 41 s (pipelines 0.9 s) | 91.8 | 82.6 | 10.78 / 11.93 |
+| off (system cache cold again) | 0.2 s | 3.7 s | not done within the run, 78 s for 2366 shaders | 82.8 | 66.8 | 10.80 / 11.96 |
+
+Same GPU time per frame: the offline-compiled code is as fast. The OS cache was cold again for the off run without
+any reset by us, which is the point: it cannot be relied on.
+

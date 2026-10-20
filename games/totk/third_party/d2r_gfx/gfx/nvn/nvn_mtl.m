@@ -5202,6 +5202,7 @@ static uint64_t g_rt_prebuilt, g_rt_compiled;
    new to the system's Metal compiler cache (a truly cold compile, without clearing the cache of every app). */
 static NSString *msl_salted(NSString *src) { static NSString *salt; static dispatch_once_t once; dispatch_once(&once, ^{ const char *e = getenv("TOTK_MSL_SALT"); salt = e && *e ? [NSString stringWithFormat:@"\n// %s\n", e] : nil; });
     return salt && src ? [src stringByAppendingString:salt] : src; }   // TOTK: translated variants loaded precompiled (iOS) / compiled from MSL here
+#include "nvn_rt_metallib.h"
 static NvShader *shader_load(NSString *pc, int stage) {
     NSError *e = nil;
     // TOTK: runtime translations are MSL source compiled here (macOS allows runtime compilation); the OS caches compiled code.
@@ -5214,6 +5215,8 @@ static NvShader *shader_load(NSString *pc, int stage) {
         // iOS: the variant precompiled on the Mac (ios/tools/build_metallibs.sh, same options) if it came in shaders.pack
         NSString *rt_lib = [NSString stringWithFormat:@"%@/%@.metallib", totk_rt_dir(), pc];
         if ([NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("【红】预编译着色器库加载失败 %s：%s（改为现编）", pc.UTF8String, e.localizedDescription.UTF8String); else g_rt_prebuilt++; }
+#else
+        if ((lib = rtm_load(pc))) g_rt_prebuilt++;   // TOTK_RT_METALLIB: baked by Xcode's compiler (nvn_rt_metallib.h)
 #endif
         if (!lib) { NSString *src = [NSString stringWithContentsOfFile:rt_src encoding:NSUTF8StringEncoding error:&e];
                     if (src) { lib = [g_dev newLibraryWithSource:msl_salted(src) options:totk_precise_opts() error:&e]; g_rt_compiled++; } }
@@ -6630,9 +6633,10 @@ static int warm_threads(void) {
 static void warm_prime(NSArray<NSString *> *keys, const char *what) {
     int n = warm_threads(); if (n <= 1 || !keys.count) return;
     MTLCompileOptions *opts = totk_precise_opts(); NSString *rt = totk_rt_dir();
-    __block _Atomic uint64_t compiled = 0, failed = 0; uint64_t t0 = bp_now(); NSUInteger count = keys.count;
+    __block _Atomic uint64_t compiled = 0, failed = 0, baked = 0; uint64_t t0 = bp_now(); NSUInteger count = keys.count;
     dispatch_apply((size_t)n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t t) {
         for (NSUInteger i = t; i < count; i += (NSUInteger)n) @autoreleasepool {
+            if (rtm_has(keys[i])) { atomic_fetch_add(&baked, 1); continue; }   // loads its .metallib: nothing to prime
             NSString *msl = [NSString stringWithContentsOfFile:[rt stringByAppendingFormat:@"/%@.metal", keys[i]] encoding:NSUTF8StringEncoding error:nil];
             if (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"]) continue;
             NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:msl_salted(msl) options:opts error:&e];
@@ -6645,6 +6649,7 @@ static void warm_prime(NSArray<NSString *> *keys, const char *what) {
     MLOG("并行预编译（%s）：%d 线程，%llu 个着色器，失败 %llu，用时 %.1f s | parallel priming (%s): %d threads, %llu shaders, %llu failed, %.1f s",
          what, n, (unsigned long long)compiled, (unsigned long long)failed, (bp_now() - t0) / 1e9,
          what, n, (unsigned long long)compiled, (unsigned long long)failed, (bp_now() - t0) / 1e9);
+    if (baked) MLOG("parallel priming (%s): %llu shaders skipped, precompiled (TOTK_RT_METALLIB)", what, (unsigned long long)baked);
 }
 /* The shader keys one manifest file will load, in order, without duplicates (the same rows warm_worker visits). */
 static NSArray<NSString *> *warm_prime_keys(NSString *txt, NSSet<NSString *> *eligible, NSSet<NSString *> *skip) {
@@ -6674,6 +6679,7 @@ static void warm_prime_only(void) {
         __block _Atomic uint64_t done = 0, failed = 0; uint64_t t0 = bp_now();
         dispatch_apply((size_t)n, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(size_t t) {
             for (NSUInteger i = t; i < count; i += (NSUInteger)n) @autoreleasepool {
+                if (rtm_has(keys[i])) continue;   // TOTK_RT_METALLIB: loads its .metallib
                 NSString *msl = [NSString stringWithContentsOfFile:[rt stringByAppendingFormat:@"/%@.metal", keys[i]] encoding:NSUTF8StringEncoding error:nil];
                 if (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"]) continue;
                 NSError *er = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:msl_salted(msl) options:opts error:&er];
@@ -6780,6 +6786,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *manifes
         }
         if (runtime_warm_progress) runtime_warm_progress(done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
         MLOG("缓存补充预热：新增 %llu 个着色器，%llu 个失败；清单里还不在翻译缓存的着色器 %llu 个（第一次用到时现翻，自动收集）", cached, failed, (unsigned long long)g_warm_missing);
+        rtm_bake_start();   // TOTK_RT_METALLIB: compile the sources new since the last bake, in the background
         MLOG("管线预热完成：着色器 %llu 个 / 渲染管线 %llu 个（跳过特化片元 %llu）/ 计算管线 %llu 个，后台用时 %.1f ms",
              (unsigned long long)dict.count, g_warm_rps, g_warm_skip_fz, g_warm_cps, (bp_now() - g_warm_t0) / 1e6);
         MLOG("预热分段：着色器库 %llu 次 / %.1f ms，Metal 管线 %llu 次 / %.1f ms",
@@ -6875,6 +6882,7 @@ static void warm_light(void) {
             if (dict.count > 256) [dict removeAllObjects];
             if (tried && (nr + nc) % 500 == 0 && nr + nc) MLOG("轻量管线预热：%llu 条，用时 %.1f s，其中超过 20 ms（现编）%llu 条", nr + nc, (bp_now() - t0) / 1e9, slow);
         }
+        rtm_bake_start();   // TOTK_RT_METALLIB: compile the sources new since the last bake, in the background
         MLOG("轻量管线预热完成：渲染管线 %llu 条、计算管线 %llu 条，失败 / 缺着色器 %llu，超过 20 ms（现编）%llu 条，用时 %.1f s", nr, nc, nfail, slow, (bp_now() - t0) / 1e9);
     });
 #endif
