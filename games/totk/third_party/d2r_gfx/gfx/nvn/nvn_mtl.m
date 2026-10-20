@@ -12568,7 +12568,7 @@ static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
 static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double, int);
 
-/* TOTK_VRR (default off): adaptive display refresh for the uncapped mode. Uncapped presents do not wait for the display, so
+/* TOTK_VRR (default on; =0 off): adaptive display refresh for the uncapped mode. Uncapped presents do not wait for the display, so
    at 80-100 fps on a 120 Hz panel each finished frame is held for one or two 8.3 ms refreshes -- uneven on-screen pacing
    (judder). With TOTK_VRR=1 the display link follows the game's frame interval: a frame goes up when it is ready and is
    shown once. Off: every refresh shows the newest finished frame, exactly as before. */
@@ -12582,7 +12582,7 @@ static int g_vrr_avg_fps, g_vrr_pref_pub;   // published for the ~10 s line (rea
 static _Atomic uint64_t g_vrr_ticks, g_vrr_frames, g_vrr_repeat; static uint64_t g_vrr_log_ns;   // display link thread only
 int mtl_vrr_on(void) {
     if (g_vrr < 0) {
-        const char *e = getenv("TOTK_VRR"); g_vrr = e && atoi(e) != 0;
+        const char *e = getenv("TOTK_VRR"); g_vrr = !(e && !atoi(e));   // TOTK_VRR: on by default (2026-10-20); =0 off
         if (g_vrr) MLOG("TOTK_VRR=1：显示器跟随游戏帧率（不限帧率、补帧关时按最近 %d 帧的帧间隔自适应刷新，%d Hz 起）", VRR_N, VRR_MIN);
     }
     return g_vrr > 0;

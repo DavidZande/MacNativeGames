@@ -1,11 +1,12 @@
-/* TOTK_FLIGHT: flight recorder for play sessions (default off).
+/* TOTK_FLIGHT: flight recorder for play sessions (default on since 2026-10-20; TOTK_FLIGHT=0 off).
    The last ~20 s of finished frame records stay in a fixed ring; on a hitch (automatic) or F9 (player) the ring is
    copied to <root>/<YYYYMMDD-HHMMSS>-<reason>/ together with a screenshot and the per-pass GPU timings of the next
    frames, so a stutter can be explained after the fact. Off: one cached flag read per frame, nothing else.
-   TOTK_FLIGHT=1 on; TOTK_FLIGHT_DIR output root (default ~/Library/Logs/MacNativeGames/flight); TOTK_FLIGHT_MS
+   TOTK_FLIGHT=0 off; TOTK_FLIGHT_KEEP event folders kept (default 60); TOTK_FLIGHT_DIR output root (default ~/Library/Logs/MacNativeGames/flight); TOTK_FLIGHT_MS
    automatic hitch threshold in ms (default 50, 0 = hotkey only).
    Included by hle_nvn.c only (the definitions live here): the frame hooks below are the whole interface. */
 #pragma once
+#include <dirent.h>
 #include <errno.h>
 #include <os/signpost.h>
 #include <pthread.h>
@@ -102,6 +103,31 @@ static int tfl_claim_dir(char *out, size_t cap, const char *stamp, const char *r
     }
     return -1;
 }
+/* TOTK_FLIGHT: on by default, so the event folders are capped: keep the newest TOTK_FLIGHT_KEEP (default 60, ~4 MB each,
+   mostly the screenshot). Only folders this recorder names (YYYYMMDD-HHMMSS-reason) and only the files it writes are
+   removed. Runs on the writer thread after an event. */
+static int tfl_keep = 60;
+static int tfl_is_event(const char *n) {
+    if (strlen(n) < 17 || n[8] != '-' || n[15] != '-') return 0;
+    for (int i = 0; i < 15; i++) if (i != 8 && (n[i] < '0' || n[i] > '9')) return 0;
+    return 1;
+}
+static int tfl_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static void tfl_prune(void) {
+    if (tfl_keep <= 0) return;
+    DIR *d = opendir(tfl_root); if (!d) return;
+    char *names[512]; int n = 0; struct dirent *e;
+    while ((e = readdir(d)) && n < 512) if (tfl_is_event(e->d_name)) names[n++] = strdup(e->d_name);
+    closedir(d);
+    qsort(names, (size_t)n, sizeof *names, tfl_cmp);   /* the timestamp prefix sorts oldest first */
+    static const char *const files[] = {"event.txt", "frames.csv", "passes.tsv", "shot.png"};
+    for (int i = 0; i < n - tfl_keep; i++) {
+        char p[1200];
+        for (size_t f = 0; f < sizeof files / sizeof *files; f++) { snprintf(p, sizeof p, "%s/%s/%s", tfl_root, names[i], files[f]); unlink(p); }
+        snprintf(p, sizeof p, "%s/%s", tfl_root, names[i]); rmdir(p);   /* stays if anything else is in it */
+    }
+    for (int i = 0; i < n; i++) free(names[i]);
+}
 static void tfl_write_event(tfl_job *j) {
     char dir[1024], p[1200];
     if (tfl_claim_dir(dir, sizeof dir, j->stamp, j->reason)) { TFL_LOG("cannot create an event folder under %s: %s", tfl_root, strerror(errno)); return; }
@@ -168,6 +194,7 @@ static void *tfl_writer(void *unused) {
         tfl_job *j = tfl_q_head; tfl_q_head = j->next; if (!tfl_q_head) tfl_q_tail = NULL; tfl_q_n--;
         pthread_mutex_unlock(&tfl_q_mu);
         tfl_write_event(j);
+        tfl_prune();   /* TOTK_FLIGHT: keep the newest TOTK_FLIGHT_KEEP event folders */
         free(j->frames); free(j);
     }
     return NULL;
@@ -245,7 +272,8 @@ static void totk_flight_frame_end(void) {
 }
 __attribute__((constructor)) static void tfl_start(void) {
     const char *e = getenv("TOTK_FLIGHT");
-    if (!e || atoi(e) <= 0) return;
+    if (e && atoi(e) <= 0) return;   /* TOTK_FLIGHT: on by default; =0 turns it off */
+    const char *kp = getenv("TOTK_FLIGHT_KEEP"); if (kp && *kp) tfl_keep = atoi(kp);
     const char *ms = getenv("TOTK_FLIGHT_MS"); tfl_auto_ms = ms && *ms ? atof(ms) : 50; if (!(tfl_auto_ms >= 0)) tfl_auto_ms = 50;
     const char *dir = getenv("TOTK_FLIGHT_DIR");
     if (dir && *dir == '~' && dir[1] == '/') snprintf(tfl_root, sizeof tfl_root, "%s%s", tfl_env("HOME", "/tmp"), dir + 1);
