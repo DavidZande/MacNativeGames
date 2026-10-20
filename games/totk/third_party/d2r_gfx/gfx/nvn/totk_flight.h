@@ -227,7 +227,7 @@ static void totk_flight_record(const tfl_rec *in) {
     tfl_ring[tfl_head % TFL_RING] = r; tfl_head++;
     pthread_mutex_unlock(&tfl_ring_mu);
     /* TOTK_FLIGHT: a frame behind the loading screen is not a hitch the player sees. */
-    if (tfl_auto_ms > 0 && !r.ls && r.fr > tfl_auto_ms && (!tfl_last_auto || now - tfl_last_auto >= TFL_AUTO_NS)) {
+    if (tfl_auto_ms > 0 && !r.ls && r.f >= 300 && r.fr > tfl_auto_ms &&   /* TOTK_FLIGHT: not during boot (the loading flag is not set yet there) */ (!tfl_last_auto || now - tfl_last_auto >= TFL_AUTO_NS)) {
         tfl_last_auto = now;
         tfl_capture("hitch");
     }
