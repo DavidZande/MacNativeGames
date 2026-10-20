@@ -9238,9 +9238,9 @@ static void wb_prefetch_end(void) { wb_prefetch_targets(R.has_rt?&R.rt:NULL,NULL
 static _Atomic uint64_t g_fb_stat_copy_balance;   // metrics: 拷贝条数与字节、版本命中复用条数 | copies issued, bytes copied, version-matched reuses
 static _Atomic uint64_t g_fb_stat_bytes, g_fb_stat_reuse;
 void mtl_fb_stats(uint64_t *copy, uint64_t *bytes, uint64_t *reuse) {
-    if (copy) *copy = atomic_exchange(&g_fb_stat_copy_balance, 0);
-    if (bytes) *bytes = atomic_exchange(&g_fb_stat_bytes, 0);
-    if (reuse) *reuse = atomic_exchange(&g_fb_stat_reuse, 0);
+    if (copy) *copy = atomic_load(&g_fb_stat_copy_balance);   // 累计值：调用方自己做帧间差（与其他 mtl_*_stats 一致；第一版用 exchange 返回增量又被调用方再减一次，账全错）
+    if (bytes) *bytes = atomic_load(&g_fb_stat_bytes);
+    if (reuse) *reuse = atomic_load(&g_fb_stat_reuse);
 }
 static int fb_reuse_on(void) {
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_RT_FEEDBACK_REUSE"); on = e && atoi(e); }   // 实验默认关：首测在系统后台负载风暴里跑出假回归（见 handoff 2026-10-20），复用收益还没被干净数据证实
@@ -9257,6 +9257,7 @@ static uint64_t wv_read(id<MTLTexture> t) {
     pthread_mutex_unlock(&g_wv_mu);
     return n ? n.unsignedLongLongValue : 0;
 }
+static _Atomic long g_wv_why;   // bump site (temporary diagnosis, TOTK_FB_DBG): 0=pass start, 1=clear quad, 2=DS clear, 3=copy in
 static void wv_bump_one(id<MTLTexture> t) {
     if (!t) return;
     pthread_mutex_lock(&g_wv_mu);
@@ -9308,15 +9309,15 @@ static void feedback_prepare(NvProg *pr) {
         int tid=ids[item];id<MTLTexture> src=sources[item];
         id<MTLTexture> saved=nil;int saved_i=-1;
         for(int i=0;i<g_fb_cached_n;i++)if(g_fb_source[i]==src){saved=g_fb_saved[i];saved_i=i;break;}
+        if(saved && !fb_reuse_on()){g_fb_tid[g_fb_n]=tid;g_fb_copy[g_fb_n++]=saved;continue;}   // 旧行为（复用关）：区间内已拷过的源直接续用
         uint64_t vnow = wv_read(src);
         if(saved){   // 本地改动（复用）：版本没变 → 拷贝完全相同，直接续用，不再 blit
-            if(fb_reuse_on() && g_fb_ver[saved_i]==vnow){g_fb_tid[g_fb_n]=tid;g_fb_copy[g_fb_n++]=saved;atomic_fetch_add(&g_fb_stat_reuse,1);continue;}
-            if(fb_reuse_on()){   // 版本变了：原槽位重拷同一张暂存贴图（内容刷新即可，不动池、不新开贴图）
-                if(saved_i<0)MDIE("feedback snapshot slot");NSUInteger slices2=src.textureType==MTLTextureTypeCube?6:src.textureType==MTLTextureTypeCubeArray?src.arrayLength*6:src.arrayLength;
-                [blit() copyFromTexture:src sourceSlice:0 sourceLevel:0 toTexture:saved destinationSlice:0 destinationLevel:0 sliceCount:slices2 levelCount:src.mipmapLevelCount];
-                g_fb_ver[saved_i]=vnow;atomic_fetch_add(&g_fb_stat_copy_balance,1);atomic_fetch_add(&g_fb_stat_bytes,(uint64_t)saved.allocatedSize);
-                g_fb_tid[g_fb_n]=tid;g_fb_copy[g_fb_n++]=saved;continue;
-            }
+            if(g_fb_ver[saved_i]==vnow){g_fb_tid[g_fb_n]=tid;g_fb_copy[g_fb_n++]=saved;atomic_fetch_add(&g_fb_stat_reuse,1);continue;}
+            /* 版本变了：原槽位重拷同一张暂存贴图（内容刷新即可，不动池、不新开贴图） */
+            NSUInteger slices2=src.textureType==MTLTextureTypeCube?6:src.textureType==MTLTextureTypeCubeArray?src.arrayLength*6:src.arrayLength;
+            [blit() copyFromTexture:src sourceSlice:0 sourceLevel:0 toTexture:saved destinationSlice:0 destinationLevel:0 sliceCount:slices2 levelCount:src.mipmapLevelCount];
+            g_fb_ver[saved_i]=vnow;atomic_fetch_add(&g_fb_stat_copy_balance,1);atomic_fetch_add(&g_fb_stat_bytes,(uint64_t)saved.allocatedSize);
+            g_fb_tid[g_fb_n]=tid;g_fb_copy[g_fb_n++]=saved;continue;
         }
         id<MTLTexture> copy=nil;
         for(id<MTLTexture> t in g_fb_pool){int used=feedback_reserved(t);for(int i=0;i<g_fb_cached_n;i++)if(g_fb_saved[i]==t)used=1;
