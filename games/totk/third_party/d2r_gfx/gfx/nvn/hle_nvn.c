@@ -2017,7 +2017,9 @@ static void *x_thread(void *unused) {
         pthread_mutex_lock(&g_xq_mu);
         while (g_xq_done == g_xq_in) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
         xjob j = g_xq[g_xq_done % XQ];
+        uint64_t queued = g_xq_in - g_xq_done;   // entries still waiting behind this one
         pthread_mutex_unlock(&g_xq_mu);
+        uint64_t x0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), xc0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
         if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap); free(j.h); }
         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
         else {
@@ -2027,6 +2029,12 @@ static void *x_thread(void *unused) {
             if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); set_time_constraint_comp_x(per, per / 2); }
             present_exec(j.win, j.idx, j.period, j.crop, j.frame);
         }
+        /* Local change: per-job wall / CPU in the timeline (>= 1 ms; TL_XRUN), so a slow rotate / wedge of the
+           translation thread is attributable to the job itself and not lost between sub_out (the game thread) and
+           the next tick. b = job kind | cpu ns << 8. */
+        { uint64_t xw = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - x0;
+          if (xw >= 1000000ull && totk_tl_on()) totk_tl_at(TL_XRUN, x0, xw | (uint64_t)queued << 56,
+              (uint64_t)j.kind | (clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - xc0) << 8); }
         pthread_mutex_lock(&g_xq_mu);
         if (j.kind == XJ_SUBMIT) { g_xsub_fence[j.sub % XF] = mtl_last_fence(); g_xsub_done = j.sub; }
         g_xq_done++; atomic_store(&g_xq_done_a, g_xq_done);
@@ -2913,6 +2921,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         // Accounting: number of synchronous creations on the submit thread this frame + a timestamp on the same clock as UIMSG (offline, frames are split into front end / loading / in-run by the loading screen intervals)
         static uint64_t plib, ppso; uint64_t lib_, pso_; mtl_create_stats(&lib_, &pso_);
         trow(f, "@lib_new", (double)(lib_ - plib)); trow(f, "@pso_new", (double)(pso_ - ppso));
+        {   // 本地改动（反馈快照复用）：本帧实际发出的快照拷贝、复用条数和拷贝字节 —— GPU 多余拷贝是否被版本检查省掉的直接账
+            extern void mtl_fb_stats(uint64_t *, uint64_t *, uint64_t *);
+            static uint64_t pfc, pfb, pfr; uint64_t fc_, fb_, fr_; mtl_fb_stats(&fc_, &fb_, &fr_);
+            trow(f, "@fb_copy", (double)(fc_ - pfc)); trow(f, "@fb_reuse", (double)(fr_ - pfr)); trow(f, "@fb_mb", (fb_ - pfb) / 1048576.0);
+            pfc = fc_; pfb = fb_; pfr = fr_;
+        }
         {   // 长帧日志：本帧各项先记进环，等 8 帧后 GPU 时间到了再决定打不打（见下） | long-frame log: this frame's items are first recorded into the ring; whether to print is decided 8 frames later, once the GPU time has arrived (see below)
             static uint64_t plns, ppns, pup, prup, pub; uint64_t lns, pns, up, rup, ub; mtl_create_ns(&lns, &pns); mtl_pkg_stats(&up, &rup); ub = mtl_upload_bytes();
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->ls = g_nvn_loadscreen_up ? g_nvn_loadscreen_up() : 0; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);

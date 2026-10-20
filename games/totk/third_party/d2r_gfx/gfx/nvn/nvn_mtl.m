@@ -996,6 +996,9 @@ static int g_sub_chunks; static uint64_t g_chunk_mark, g_stat_draw; static void 
 static int g_nupd, g_nshadow; static inline int upd_guard(uint64_t lo, uint64_t hi);   // renamed uniform updates, defined with mtl_sub_update
 static void feedback_cache_clear(void);
 static void wb_prefetch_end(void);
+static int fb_reuse_on(void);                       // TOTK_RT_FEEDBACK_REUSE (defined with feedback_prepare)
+static void wv_bump_one(id<MTLTexture> t);          // texture content version bumps, see the reuse note there
+static void wv_bump_pass(MTL4RenderPassDescriptor *d);
 void mtl_sub_begin(void) {
     feedback_cache_clear();
     g_fc_begin0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -1204,6 +1207,7 @@ static inline void es_begin(id e);   // render state cache, defined with the sta
 static inline void blit_close(void) { if (g_blit) { m4_end(g_blit); g_blit = nil; } }
 #include "nvn_render_stream.h"
 static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { blit_close();
+    if (fb_reuse_on()) wv_bump_pass(d);   // TOTK_RT_FEEDBACK_REUSE: 本通道要 store / clear 的贴图内容从此变了（快照按版本过期）
     if (rs_stream_pass()) { id e = rs_pass_begin(d, g_vt, g_ft, g_cb, bar_start_mode(), (uint64_t)bar_vis()); es_begin(e); return e; }   // TOTK: encode stage (nvn_render_stream.h)
     rs_sync();   // a pass encoded by A itself (stream off, or a diagnostic frame): B must have finished the previous pass on this command buffer
     pt_mark(g_cb, 'R', d); id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; es_begin(e);
@@ -5593,7 +5597,7 @@ static int feedback_reserved(id<MTLTexture> t) {
     for (fb_scope *p = g_fb_scope; p; p = p->prev) for (int i = 0; i < p->n; i++) if (p->copy[i] == t) return 1;
     return 0;
 }
-static int g_fb_cached_n;static id<MTLTexture> g_fb_source[128],g_fb_saved[128];
+static int g_fb_cached_n;static id<MTLTexture> g_fb_source[128],g_fb_saved[128];static uint64_t g_fb_ver[128];
 static void feedback_cache_clear(void) {for(int i=0;i<g_fb_cached_n;i++){g_fb_source[i]=nil;g_fb_saved[i]=nil;}g_fb_cached_n=0;}
 static id<MTLTexture> feedback_texture(int tid) { for(int i=0;i<g_fb_n;i++)if(g_fb_tid[i]==tid)return g_fb_copy[i];return nil; }
 static inline __attribute__((always_inline)) void *tex_fast(int tid) {
@@ -9121,6 +9125,7 @@ static void clear_quad(const p_clear_color *c) {
     int f = R.rt.has_cview[c->index] && R.rt.cview[c->index].set_format ? R.rt.cview[c->index].format : t->d.format;
     if (cls_of(f)) MDIE("partial color clear of integer render target format %#x not implemented", f);
     id<MTL4RenderCommandEncoder> en = rp_begin(); if (!en) return;
+    if (fb_reuse_on()) wv_bump_one(attachment_texture(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index]));   // 中道清四边形也改内容
     NSUInteger tw = g_pass.tw, th = g_pass.th; MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) { long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
         if (x1 > (long)tw) x1 = (long)tw; if (y1 > (long)th) y1 = (long)th; if (x1 <= x0 || y1 <= y0) return;
@@ -9170,6 +9175,7 @@ static void clear_ds_quad(const p_clear_ds *c) {
     gpu_path_on("TOTK_GPU_MIDCLEAR", "mid-pass / masked / scissored depth-stencil clear");
     if (g_enc && ((c->depth_mask && !g_pass.hd) || (c->stencil_mask && !g_pass.hs))) rp_end();
     id<MTL4RenderCommandEncoder> en = rp_begin(); if (!en) return;
+    if (fb_reuse_on() && c->depth_mask) wv_bump_one(tex_mtl(R.rt.depth));   // 深度被清了
     NSUInteger tw = g_pass.tw, th = g_pass.th; MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) { int64_t x0 = MAX(R.sc.x, 0), y0 = MAX(R.sc.y, 0), x1 = MIN((int64_t)R.sc.x + R.sc.w, (int64_t)tw), y1 = MIN((int64_t)R.sc.y + R.sc.h, (int64_t)th);
         if (x1 <= x0 || y1 <= y0) return; sc = (MTLScissorRect){x0, y0, x1 - x0, y1 - y0}; }
@@ -9224,6 +9230,51 @@ static void prepare_draw_textures(NvProg *pr) {
 }
 /* Metal texture sampling cannot read an attachment while that same pass writes it. */
 static void wb_prefetch_end(void) { wb_prefetch_targets(R.has_rt?&R.rt:NULL,NULL); }
+/* 本地改动（反馈快照复用，TOTK_RT_FEEDBACK_REUSE，默认开）：反馈贴图的快照拷贝按"内容版本"复用 —— 自上次拷贝以来
+   没有写回该贴图（写入点：渲染通道带 store / clear 的开始处、通道内的清四边形、拷入、清贴图；派发（可能有存储图写入）
+   一律丢快照），内容就没变过，直接复用上一张拷贝、不再整张重拷。旧实现每个屏障区间重拷所有反馈贴图，实测每帧多花
+   3–3.6 ms GPU（idle 72 FPS 与 94 FPS 对照的差距主要来自这里）。版本表键按贴图"根贴图"（视图殊途同归）弱持有：
+   贴图销毁条目自动消失，避免指针复用假命中；别名贴图（不同根指同一显存）按错过期 FAIL-SAFE（宁重拷，没错拿）。 */
+static _Atomic uint64_t g_fb_stat_copy_balance;   // metrics: 拷贝条数与字节、版本命中复用条数 | copies issued, bytes copied, version-matched reuses
+static _Atomic uint64_t g_fb_stat_bytes, g_fb_stat_reuse;
+void mtl_fb_stats(uint64_t *copy, uint64_t *bytes, uint64_t *reuse) {
+    if (copy) *copy = atomic_exchange(&g_fb_stat_copy_balance, 0);
+    if (bytes) *bytes = atomic_exchange(&g_fb_stat_bytes, 0);
+    if (reuse) *reuse = atomic_exchange(&g_fb_stat_reuse, 0);
+}
+static int fb_reuse_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_RT_FEEDBACK_REUSE"); on = e && atoi(e); }   // 实验默认关：首测在系统后台负载风暴里跑出假回归（见 handoff 2026-10-20），复用收益还没被干净数据证实
+    return on;
+}
+static pthread_mutex_t g_wv_mu = PTHREAD_MUTEX_INITIALIZER;
+static NSMapTable<id<MTLTexture>, NSNumber *> *g_wv_map;
+static id<MTLTexture> wv_root(id<MTLTexture> t) { id<MTLTexture> r = t; while (r.parentTexture) r = r.parentTexture; return r; }
+static uint64_t wv_read(id<MTLTexture> t) {
+    if (!t) return 0;
+    pthread_mutex_lock(&g_wv_mu);
+    if (!g_wv_map) g_wv_map = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory valueOptions:NSMapTableStrongMemory];
+    NSNumber *n = [g_wv_map objectForKey:wv_root(t)];
+    pthread_mutex_unlock(&g_wv_mu);
+    return n ? n.unsignedLongLongValue : 0;
+}
+static void wv_bump_one(id<MTLTexture> t) {
+    if (!t) return;
+    pthread_mutex_lock(&g_wv_mu);
+    if (!g_wv_map) g_wv_map = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory valueOptions:NSMapTableStrongMemory];
+    id key = wv_root(t);
+    NSNumber *n = [g_wv_map objectForKey:key];
+    [g_wv_map setObject:@((n ? n.unsignedLongLongValue : 0) + 1) forKey:key];
+    pthread_mutex_unlock(&g_wv_mu);
+}
+/* 通道开始处一次推齐：写入即变（store / clear），保持读入的旧内容不再新鲜。 */
+static void wv_bump_pass(MTL4RenderPassDescriptor *d) {
+    if (!d) return;
+    for (NSUInteger i = 0; i < 8; i++) { id<MTLTexture> t = d.colorAttachments[i].texture;
+        if (t && (d.colorAttachments[i].storeAction != MTLStoreActionDontCare || d.colorAttachments[i].loadAction == MTLLoadActionClear)) wv_bump_one(t); }
+    id<MTLTexture> dt = d.depthAttachment.texture ?: d.stencilAttachment.texture;
+    if (dt && (d.depthAttachment.storeAction != MTLStoreActionDontCare || d.depthAttachment.loadAction == MTLLoadActionClear
+        || d.stencilAttachment.storeAction != MTLStoreActionDontCare || d.stencilAttachment.loadAction == MTLLoadActionClear)) wv_bump_one(dt);
+}
 static void feedback_reset(void) {
     if(g_fb_n){for(int i=0;i<g_fb_n;i++)g_fb_copy[i]=nil;g_fb_n=0;args_dirty_all();}
 }
@@ -9255,8 +9306,18 @@ static void feedback_prepare(NvProg *pr) {
     if(flush)rp_flush();
     for(int item=0;item<count;item++) {
         int tid=ids[item];id<MTLTexture> src=sources[item];
-        id<MTLTexture> saved=nil;for(int i=0;i<g_fb_cached_n;i++)if(g_fb_source[i]==src){saved=g_fb_saved[i];break;}
-        if(saved){g_fb_tid[g_fb_n]=tid;g_fb_copy[g_fb_n++]=saved;continue;}
+        id<MTLTexture> saved=nil;int saved_i=-1;
+        for(int i=0;i<g_fb_cached_n;i++)if(g_fb_source[i]==src){saved=g_fb_saved[i];saved_i=i;break;}
+        uint64_t vnow = wv_read(src);
+        if(saved){   // 本地改动（复用）：版本没变 → 拷贝完全相同，直接续用，不再 blit
+            if(fb_reuse_on() && g_fb_ver[saved_i]==vnow){g_fb_tid[g_fb_n]=tid;g_fb_copy[g_fb_n++]=saved;atomic_fetch_add(&g_fb_stat_reuse,1);continue;}
+            if(fb_reuse_on()){   // 版本变了：原槽位重拷同一张暂存贴图（内容刷新即可，不动池、不新开贴图）
+                if(saved_i<0)MDIE("feedback snapshot slot");NSUInteger slices2=src.textureType==MTLTextureTypeCube?6:src.textureType==MTLTextureTypeCubeArray?src.arrayLength*6:src.arrayLength;
+                [blit() copyFromTexture:src sourceSlice:0 sourceLevel:0 toTexture:saved destinationSlice:0 destinationLevel:0 sliceCount:slices2 levelCount:src.mipmapLevelCount];
+                g_fb_ver[saved_i]=vnow;atomic_fetch_add(&g_fb_stat_copy_balance,1);atomic_fetch_add(&g_fb_stat_bytes,(uint64_t)saved.allocatedSize);
+                g_fb_tid[g_fb_n]=tid;g_fb_copy[g_fb_n++]=saved;continue;
+            }
+        }
         id<MTLTexture> copy=nil;
         for(id<MTLTexture> t in g_fb_pool){int used=feedback_reserved(t);for(int i=0;i<g_fb_cached_n;i++)if(g_fb_saved[i]==t)used=1;
           if(!used && t.textureType==src.textureType && t.pixelFormat==src.pixelFormat && t.width==src.width && t.height==src.height && t.depth==src.depth && t.arrayLength==src.arrayLength && t.mipmapLevelCount==src.mipmapLevelCount){copy=t;break;}}
@@ -9273,7 +9334,11 @@ static void feedback_prepare(NvProg *pr) {
           copy=[g_dev newTextureWithDescriptor:d];if(!copy)MDIE("feedback texture copy");res_add(copy);if(!g_fb_pool)g_fb_pool=[NSMutableArray array];[g_fb_pool addObject:copy];}
         NSUInteger slices=src.textureType==MTLTextureTypeCube?6:src.textureType==MTLTextureTypeCubeArray?src.arrayLength*6:src.arrayLength;
         [blit() copyFromTexture:src sourceSlice:0 sourceLevel:0 toTexture:copy destinationSlice:0 destinationLevel:0 sliceCount:slices levelCount:src.mipmapLevelCount];
-        if(g_fb_cached_n==128)MDIE("too many feedback snapshots in one barrier interval");g_fb_source[g_fb_cached_n]=src;g_fb_saved[g_fb_cached_n++]=copy;
+        atomic_fetch_add(&g_fb_stat_copy_balance,1);atomic_fetch_add(&g_fb_stat_bytes,(uint64_t)copy.allocatedSize);
+        if(g_fb_cached_n==128){   // 本地改动：满了就全部退掉（有版本保护，下次按需重拷），不再直接致命退出（128 是旧行为的上限，不是安全边界知识）
+            feedback_cache_clear();
+        }
+        g_fb_source[g_fb_cached_n]=src;g_fb_saved[g_fb_cached_n]=copy;g_fb_ver[g_fb_cached_n]=vnow;g_fb_cached_n++;
         g_fb_tid[g_fb_n]=tid;g_fb_copy[g_fb_n++]=copy;
     }
     registry_unlock();if(g_fb_n){args_dirty_all();static int logged;if(logged++<5)MLOG("[feedback] %d attachment inputs copied for %.16s",g_fb_n,pr->sh[1]?pr->sh[1]->key:"-");}
@@ -10553,6 +10618,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("C ser=%llu", c->tex->serial);
     if (!t) return;
+    if (fb_reuse_on()) wv_bump_one(t);   // 拷入也改内容
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
@@ -10642,6 +10708,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     id<MTLTexture> s = tex_mtl(c->src), d = tex_mtl(c->dst);
     PD("T src=%llu dst=%llu %dx%dx%d→%dx%dx%d flags=%#x", c->src->serial, c->dst->serial, c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth, c->flags);
     if (!s || !d) return;
+    if (fb_reuse_on()) wv_bump_one(d);   // 拷入也改内容
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
     PD("t src=%llu lv%u sl%u xyz=%d,%d,%d dst=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d", c->src->serial, sl, sz0, c->sr.xoffset, c->sr.yoffset, c->sr.zoffset,
@@ -10677,6 +10744,7 @@ static void clear_tex(const p_clear_tex *c) {
     if(c->tex)wb_prefetch_invalidate_at((uintptr_t)c->tex->mem,c->tex->L.size,6);
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
+    if (fb_reuse_on() && t) wv_bump_one(t);   // 清贴图也改内容
     PD("X ser=%llu 视图格式 %#x 区域 %d,%d,%d %dx%dx%d 掩码 %#x %s %g,%g,%g,%g", c->tex->serial, c->has_view && c->view.set_format ? c->view.format : -1, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->mask,
        c->is_uint ? "ui" : "f", c->is_uint ? (double)c->c.u[0] : c->c.f[0], c->is_uint ? (double)c->c.u[1] : c->c.f[1], c->is_uint ? (double)c->c.u[2] : c->c.f[2], c->is_uint ? (double)c->c.u[3] : c->c.f[3]);
     if (!t) return;
@@ -10944,7 +11012,8 @@ void mtl_exec(const uint8_t *p) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) MDIE("corrupt command record at %p: op %u size %u (call depth %d)", (const void *)p, (unsigned)h.op, (unsigned)h.size, g_ret_n);
         g_exec_cur = p;   // 写回前瞻的扫描起点：结束通道的那条操作（含） | Scan start point of the store lookahead: the operation that ends the render pass (inclusive)
-        switch(h.op){case OP_BARRIER:case OP_SET_RT:case OP_CLEAR_COLOR:case OP_CLEAR_DS:case OP_CLEAR_TEX:case OP_DISPATCH:case OP_COPY_B2B:case OP_COPY_B2T:case OP_COPY_T2B:case OP_COPY_T2T:feedback_cache_clear();break;default:break;}
+        switch(h.op){case OP_DISPATCH:feedback_cache_clear();break;   // 本地改动：派发可能有存储图写贴图，一律丢快照；写回/清屏/拷贝的版本在对应操作处推进（TOTK_RT_FEEDBACK_REUSE），屏障只当边界看不再强制丢
+            case OP_BARRIER:case OP_SET_RT:case OP_CLEAR_COLOR:case OP_CLEAR_DS:case OP_CLEAR_TEX:case OP_COPY_B2B:case OP_COPY_B2T:case OP_COPY_T2B:case OP_COPY_T2T:if(!fb_reuse_on())feedback_cache_clear();break;default:break;}
         if (p == g_defer_pend) { for (int gi = 0; gi < 4; gi++) if (g_defer_slots[gi].active && g_defer_slots[gi].p_end_op == p) g_defer_slots[gi].in_p = 0; g_defer_pend = NULL; }
         sdx_seq(p);
         if (h.op == OP_SET_RT) rt_toggle_poll();
@@ -11171,6 +11240,7 @@ void dm_gfx_shot_at(long k, const char *path) {
 /* TOTK: frame-keyed screenshots taken at the game's present call (nvnQueuePresentTexture), independent of the display
    link / drawable pacing (an asleep or locked display stalls presents; the game keeps running). DM_NVN_SHOT_FRAME=1 with
    DM_NVN_SHOT=frame,...:path. */
+static void shot_staged(id<MTLTexture> src, const char *path, int screen, const int crop[4]);
 void mtl_shot_at_present(const tex_t *t) {
     static long shots[16]; static int nshot = -1; static const char *shot_path; static char done[16]; static int by_frame;
     if (nshot < 0) {
@@ -11181,14 +11251,14 @@ void mtl_shot_at_present(const tex_t *t) {
     pthread_mutex_lock(&g_shotq_mu);   // dm_gfx_shot_at requests (game-frame keyed, see there)
     for (int i = 0; i < g_nshotq;) if ((uint64_t)cur >= g_shotq[i].frame) {
         id<MTLTexture> src = tex_mtl(t);
-        if (src) { mtl_finish_gpu(); shot(src, g_shotq[i].path, 1, NULL); MLOG("[shot] F%ld %s", cur, g_shotq[i].path); } else MLOG("【红】截图：出图纹理不可用，丢弃 %s", g_shotq[i].path);
+        if (src) { shot_staged(src, g_shotq[i].path, 1, NULL); MLOG("[shot] F%ld %s", cur, g_shotq[i].path); } else MLOG("【红】截图：出图纹理不可用，丢弃 %s", g_shotq[i].path);
         g_shotq[i] = g_shotq[--g_nshotq];
     } else i++;
     pthread_mutex_unlock(&g_shotq_mu);
     if (!nshot) return;
     for (int i = 0; i < nshot; i++) if (!done[i] && cur >= shots[i]) {
         done[i] = 1; id<MTLTexture> src = tex_mtl(t); if (!src) { MLOG("【红】截图：出图纹理不可用"); continue; }
-        char path[1024]; snprintf(path, sizeof path, shot_path, (int)shots[i]); mtl_finish_gpu(); shot(src, path, 1, NULL);
+        char path[1024]; snprintf(path, sizeof path, shot_path, (int)shots[i]); shot_staged(src, path, 1, NULL);
     }
 }
 static void shot_body(id<MTLTexture> src, const char *path, int screen, const int crop[4]);
@@ -11196,6 +11266,22 @@ static void shot_body(id<MTLTexture> src, const char *path, int screen, const in
    thread, which has no autorelease pool, so without this pool every shot kept its ~8 MB buffer (TOTK, 2026-10-15:
    255 shots in one session reached the 5000 MiB GPU budget). */
 static void shot(id<MTLTexture> src, const char *path, int screen, const int crop[4]) { @autoreleasepool { shot_body(src, path, screen, crop); } }
+/* 本地改动：截图原先在上屏工作线程里同步做「等 GPU做完 + 回读 + PNG 编码」，而这个上屏工作正是游戏在
+   nvnWindowAcquireTexture 里经 x_wait_job 等的上一步 —— 每张截图卡住一帧 ~545 ms（图形锁 ~530 ms；bench 的每个
+   阶段截图都成了"确定性卡帧"，2026-10-19 破案：卡这些帧的全是截图）。当场只做一次拷贝进一张私有暂存贴图（提交
+   了但不等），回读与编码挪到后台串行队列。 */
+static void shot_staged(id<MTLTexture> src, const char *path, int screen, const int crop[4]) {
+    static dispatch_queue_t aq;
+    if (!aq) aq = dispatch_queue_create("totk.gfx-shot", DISPATCH_QUEUE_SERIAL);
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> out = [g_dev newTextureWithDescriptor:d];
+    if (!out) { MLOG("【红】截图：暂存贴图建不出 %s", path); return; }
+    id<MTLCommandBuffer> cb = q_cb();
+    if (!cb || !present_encode(cb, src, out, NULL, 0)) { MLOG("【红】截图：暂存拷贝编码失败 %s", path); return; }
+    cb_commit(cb);
+    dispatch_async(aq, ^{ @autoreleasepool { cb_wait(cb); shot_body(out, path, screen, crop); } });
+}
 static void shot_body(id<MTLTexture> src, const char *path, int screen, const int crop[4]) {
     static int out_w = -1, out_h;
     if (out_w < 0) {
