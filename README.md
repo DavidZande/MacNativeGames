@@ -18,6 +18,7 @@ this repository. All credit for the port itself goes to upstream and the project
 | UI | Flickering / corrupted HUD letters (glyph data overwritten before the GPU read it) | 10/40 bad frames → 0/40 | `TOTK_STORAGE_SNAPSHOT=0` | [ui-flicker](docs/ui-flicker-20261019.md) |
 | Play-time hitches | Partial texture copies instead of whole mip levels, "hot" CPU-written textures, batched GPU write-back | frames > 50 ms: 28 → ~16 per minute; post-spawn stalls 23 → 3–4 | `TOTK_TEXELS_RECT=0`, `TOTK_PKG_HOT=0`, `TOTK_WB_BATCH=0` | [play-hitches](docs/play-hitches-20261019.md) |
 | Shader stalls | No pipeline compiled on the render thread at world entry (was up to 1 s per pipeline, one 8.7 s frame) | cold cache: 0 of 1,782 built in place | `TOTK_PSO_OMIT_SYNC=1` (old) | [follow-ups](docs/perf-followups-20261020.md) |
+| Startup / shader cache | Translated shaders precompiled with Xcode's Metal compiler and loaded from disk, instead of compiled from source at every launch and kept only in macOS's shared shader cache (which gets cleared) | after a cache clear, 1080p: essential-shader wait **74 → 17 s** in the app (0.3–1.7 s in the benchmark), first picture 113 → 25 s, background compiling during play 3.5 min → none; GPU time unchanged | `TOTK_RT_METALLIB=0` | [next-performance-ideas](docs/next-performance-ideas-20261020.md) |
 | Loading | RomFS read cache: the world-entry burst of ~3,500 tiny files read through 256 KiB tiles | read time −30–35 % | `TOTK_ROMFS_CACHE=0` | [world-entry-io](docs/world-entry-io-20261020.md) |
 
 ### Full list of improvements
@@ -33,6 +34,7 @@ contributors.
 - Decals read the G-buffer through Metal framebuffer fetch instead of texture copies (+11 % standing, +16 % panning,
   ~1.1 GB less memory).
 - Cheaper per-draw work on the game's main thread (replay share of the main thread 55 % → 45 %).
+- The render thread keeps its real-time CPU priority when the frame period changes around loading screens (upstream).
 - Uncapped frame rate by default; the 60 FPS setting presents every tick (ignores the game's drop to 30) and uses fine
   pacing on 120 Hz screens (worst frame 72 → 55 ms, dropped frames ~0).
 
@@ -46,6 +48,11 @@ contributors.
   stalls in play) and depth-omitted passes queue instead of building in place (was up to 1 s per pipeline, one 8.7 s
   freeze when entering the world).
 - Smarter pipeline prediction: cached programs only, the state's own variant, no wasted depth-less guesses (upstream).
+- Shaders precompiled once with Xcode's Metal compiler and loaded from disk: macOS's shared shader cache gets cleared
+  now and then, and the launch after that compiled ~25,000 shaders again (a 74 s wait before the first picture, then
+  minutes of background compiling during play). Now the essential shaders are ready in seconds, shaders new to a
+  session are precompiled in the background after the next start, and GPU time per frame is unchanged. Needs the
+  optional Metal Toolchain (see *Faster startup* below); without it the game compiles from source as before.
 
 **Fewer hitches while playing and loading areas**
 - Texture updates copy only the changed rectangle instead of whole mip levels, and textures the CPU rewrites every
@@ -82,6 +89,12 @@ contributors.
 - `scripts/bench.py` (uncapped benchmark on an isolated profile copy), `scripts/dev_rebuild.sh` (~15 s game-binary
   rebuild), `perf.csv`, a per-frame timeline (`DM_NVN_TSV`), a guest CPU profiler, wait / lock statistics, stall stack
   dumps and a RomFS read trace. Investigation records are in [`docs/`](docs/).
+- Flight recorder (`TOTK_FLIGHT`, on): keeps the last ~20 s of per-frame timings in memory and, on a frame over 50 ms or
+  when you press **F9**, writes them with a screenshot and per-pass GPU timings to
+  `~/Library/Logs/MacNativeGames/flight/` (newest 60 kept). Attach a folder to an issue when you report a stutter.
+- `TOTK_SUBMIT_SANITIZER=1` (debug, slow): finds GPU buffers the game rewrites after submitting them.
+- `TOTK_VRR=1` (experimental, off): the display refresh follows the frame rate. Known problem: after a dip it can stay
+  at 40 Hz, which caps the game at 40 FPS.
 
 Benchmarks use the fork's `games/totk/scripts/bench.py` (uncapped, offscreen, isolated copy of your profile, see
 [uncapped-benchmarks](docs/uncapped-benchmarks.md)). It and `scripts/dev_rebuild.sh` assume the workspace layout
@@ -90,13 +103,18 @@ Benchmarks use the fork's `games/totk/scripts/bench.py` (uncapped, offscreen, is
 **Maintainers:** [UPSTREAMING.md](UPSTREAMING.md) maps each improvement to its commits, dependencies, evidence and
 switches, with a suggested order for taking them upstream.
 
+**Faster startup (optional, recommended):** install Apple's Metal Toolchain once,
+`xcodebuild -downloadComponent MetalToolchain` (~840 MB). The game then precompiles new shaders by itself in the
+background; to precompile your whole existing shader cache right away (about 20 minutes on all cores, ~600 MB), run
+`python3 games/totk/scripts/bake_metallibs.py`.
+
 Known open item: the first frames right after spawning can still take ~150–200 ms (a submit-side stall, not disk reads).
 
 ### 中文简介
 
 本仓库是 [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames) 的性能分支，针对 Apple 芯片上的《王国之泪》做了渲染与卡顿修复：
 帧栅栏晚一帧应答（繁忙区域 60 帧上限下 54 → 60 FPS）、TBDR 通道优化、地面贴花读 G-buffer 的修正（改用 Metal 片上读取，
-帧率提升 11–16%）、界面文字闪烁修复、游玩卡顿与着色器编译卡顿修复、RomFS 读取缓存等。仅在 1.0.0、M1 Pro 上测试。
+帧率提升 11–16%）、界面文字闪烁修复、游玩卡顿与着色器编译卡顿修复、RomFS 读取缓存、着色器用 Xcode 的 Metal 编译器预编译后从磁盘加载（系统着色器缓存被清空后启动等待 74 秒 → 17 秒）、游玩卡顿记录器（F9）等。仅在 1.0.0、M1 Pro 上测试。
 构建与使用方法与上游相同（见下文）。每项改动都可用环境变量关闭，详见上表。
 
 ---

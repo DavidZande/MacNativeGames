@@ -25,7 +25,8 @@ Paths below: `nvn/` = `games/totk/third_party/d2r_gfx/gfx/nvn/`, others are unde
 | 3 | Decal feedback (copies) + framebuffer fetch | fixes ground/stone patches; fetch +11–16 % FPS | fetch needs the copy path as fallback | medium |
 | 4 | TBDR pass optimizations + omit-pass pipeline fix | +9–12 % FPS | the pipeline fix only matters with the depth/stencil omission | large |
 | 5 | RomFS read cache | world-entry read time −30–35 % | none | small, self-contained |
-| 6 | Shader seeding additions | fewer first-use compiles | overlaps upstream's own background compile — compare first | medium |
+| 6 | Precompiled runtime shaders (`.metallib`) | after a cache clear: startup wait 74 → 17 s, no compiling during play | none (uses the iOS loading path) | small |
+| 7 | Shader seeding additions | fewer first-use compiles | overlaps upstream's own background compile — compare first | medium |
 
 ## 1. One-frame-late frame fence + glyph storage snapshot
 
@@ -112,7 +113,20 @@ position-keyed tiles (64 MB LRU) with read-ahead for a forward-moving reader. Bu
 `TOTK_FS_TRACE=<file>` logs reads. The worst post-spawn frames are a submit-side stall, not disk reads; this does not
 fix them. Record: `docs/world-entry-io-20261020.md`.
 
-## 6. Shader seeding (compare with upstream first)
+## 6. Precompiled runtime shaders
+
+`2cb11a7`, `nvn/nvn_rt_metallib.h` (new) + hooks in `nvn/nvn_mtl.m` (`shader_load`, `warm_prime`, `warm_prime_only`),
+`scripts/bake_metallibs.py`. On macOS every translated shader was compiled from MSL at each launch and relied on the
+system's shared Metal cache, which gets cleared or rotated (one per user, ~1 GB, shared by all apps); the launch after
+that compiled ~25,000 libraries again. The game now loads `<key>.metallib` next to `<key>.metal`, as the iOS port
+already does, compiled by Xcode's `metal` with the runtime's options (default language version, safe math). The
+output carries the source's modification time and is used only while it matches, so a retranslated source falls back
+to source compiling and is baked again. After the warm-up the game bakes new sources on 2 background-QoS threads;
+without the Metal Toolchain nothing changes. Measured at 1080p: the essential-shader wait went from 74 s to 17 s in
+the app (0.3–1.7 s in the benchmark), the first picture from 113 s to 25 s; per-frame GPU time is identical on and
+off. `TOTK_RT_METALLIB=0` off. Record: `docs/next-performance-ideas-20261020.md` (last section).
+
+## 7. Shader seeding (compare with upstream first)
 
 Upstream has since built its own background compile, parallel warm-up and shared shader list, so these overlap:
 `20dd61c` / `352fa67` / `689f5da` (background translation, `TOTK_ASYNC_XLATE`), `5fb8417` (`TOTK_ASYNC_SHLOAD`),
@@ -124,12 +138,16 @@ Upstream has since built its own background compile, parallel warm-up and shared
 - `175f820` / `65e9cd0` / `bcca286`: the 60 FPS cap presents every tick and uses fine pacing on 120 Hz screens.
 - `25e8dc3`: futex-style guest waits (FPS-neutral).
 - `b484570`: cheaper per-draw lookups on the main thread.
+- `4619e69` / `c4479ba` / `de225fd`: flight recorder (`TOTK_FLIGHT`): last ~20 s of frame timings written on a > 50 ms
+  frame or F9, with a screenshot and per-pass GPU timings. `51ce4ab`: `TOTK_SUBMIT_SANITIZER` (debug) and `TOTK_VRR`
+  (experimental; `c25dc76` turned it off again: it can lock the game at 40 FPS after a dip).
 - `4e4d754`: Mac app quality of life (settings window, save backups, full screen, audio smoothing, macOS 27
   address-space fallback, RomFS kept outside the signed app).
 
 Already upstream, no action needed: Opus slot reuse (#18 / #40), present texture residency (#30), compile-options
 race (`35606fe`), predictor cached lookups (#28 / `c5b3ae7`), serial-history bitmaps (#34), cloth/hair clock
-(`290ec9f`), stale optional target (`e8b5259`).
+(`290ec9f`), stale optional target (`e8b5259`), present thread's CPU time across period changes (`e0216b2`, from
+nxnative `04ea8f8`).
 
 ## Measuring
 
