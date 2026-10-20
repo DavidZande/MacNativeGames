@@ -1,4 +1,45 @@
-# MacNativeGames
+# MacNativeGames — performance fork
+
+**This is a fork of [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames)** with a series of
+rendering and stutter fixes for *Tears of the Kingdom* on Apple silicon. Building and playing work exactly as upstream
+describes below: bring your own game file and `prod.keys`, run `build_app.py`, get a Mac app. Nothing from the game is in
+this repository. All credit for the port itself goes to upstream and the projects it acknowledges.
+
+> **Tested on 1.0.0 only**, on a MacBook Pro M1 Pro (16 GB), macOS 27.2. Versions 1.1.2, 1.2.1 and 1.4.3 use the same
+> rendering code but have not been tested here. Every change below has an environment switch to turn it off.
+
+### What this fork changes
+
+| Area | Change | Measured (1.0.0, M1 Pro, 900p) | Off switch | Record |
+|---|---|---|---|---|
+| Frame pacing | The game's frame fence answered one frame late, so the Metal replay (upstream's translation thread, now on by default) overlaps the next game frame | busy area, 60 FPS cap: ~29 → **60 FPS** | `TOTK_FENCE_LAG=0` | [practical-performance](docs/practical-performance-20261019.md) |
+| GPU passes | Tile load/store elision, unused depth/stencil omitted, fewer pass splits and barriers | uncapped **+9–12 % FPS**, −27 % tile memory traffic | `DM_NVN_TBDR=0` (all), `TOTK_DS_OMIT=0` | [tbdr-barrier-sync](docs/tbdr-barrier-sync-optimizations-20261019.md) |
+| Decals / ground | Decal passes that read the G-buffer they draw into get correct input (fixes the moving black/yellow patches on stone); where provable, through Metal framebuffer fetch instead of copies | patches gone; vs. copies **80.9 → 89.8 FPS** standing, **70.9 → 82.3** panning, ~1.1 GB less memory | `TOTK_RT_FEEDBACK_FETCH=0` (copies), `TOTK_RT_FEEDBACK_SNAPSHOT=0` (neither) | [shadow-feedback](docs/shadow-feedback-20261019.md), [follow-ups](docs/perf-followups-20261020.md) |
+| UI | Flickering / corrupted HUD letters (glyph data overwritten before the GPU read it) | 10/40 bad frames → 0/40 | `TOTK_STORAGE_SNAPSHOT=0` | [ui-flicker](docs/ui-flicker-20261019.md) |
+| Play-time hitches | Partial texture copies instead of whole mip levels, "hot" CPU-written textures, batched GPU write-back | frames > 50 ms: 28 → ~16 per minute; post-spawn stalls 23 → 3–4 | `TOTK_TEXELS_RECT=0`, `TOTK_PKG_HOT=0`, `TOTK_WB_BATCH=0` | [play-hitches](docs/play-hitches-20261019.md) |
+| Shader stalls | No pipeline compiled on the render thread at world entry (was up to 1 s per pipeline, one 8.7 s frame) | cold cache: 0 of 1,782 built in place | `TOTK_PSO_OMIT_SYNC=1` (old) | [follow-ups](docs/perf-followups-20261020.md) |
+| Loading | RomFS read cache: the world-entry burst of ~3,500 tiny files read through 256 KiB tiles | read time −30–35 % | `TOTK_ROMFS_CACHE=0` | [world-entry-io](docs/world-entry-io-20261020.md) |
+
+Also included from upstream and its contributors after this fork branched: bounded texture serial history for long
+sessions (PR #34), hair and cloth animating at the right speed above 30 FPS, released Metal objects after GPU
+write-backs, the Opus decoder registry, and several crash fixes.
+
+Benchmarks use the fork's `games/totk/scripts/bench.py` (uncapped, offscreen, isolated copy of your profile, see
+[uncapped-benchmarks](docs/uncapped-benchmarks.md)). It and `scripts/dev_rebuild.sh` assume the workspace layout
+`~/Documents/TearsOfKingdom/` (game file, keys, `TOTK_build/`); `TOTK_TREE` / `TOTK_APP` override the paths.
+
+Known open item: the first frames right after spawning can still take ~150–200 ms (a submit-side stall, not disk reads).
+
+### 中文简介
+
+本仓库是 [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames) 的性能分支，针对 Apple 芯片上的《王国之泪》做了渲染与卡顿修复：
+帧栅栏晚一帧应答（繁忙区域 60 帧上限下约 29 → 60 FPS）、TBDR 通道优化、地面贴花读 G-buffer 的修正（改用 Metal 片上读取，
+帧率提升 11–16%）、界面文字闪烁修复、游玩卡顿与着色器编译卡顿修复、RomFS 读取缓存等。仅在 1.0.0、M1 Pro 上测试。
+构建与使用方法与上游相同（见下文）。每项改动都可用环境变量关闭，详见上表。
+
+---
+
+# Upstream README
 
 # English
 
