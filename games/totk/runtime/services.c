@@ -63,6 +63,23 @@ static uint8_t *reserve_fixed(uint64_t at,uint64_t size){
  mach_vm_address_t a=at;   /* FIXED without OVERWRITE: fails instead of replacing an existing mapping */
  return mach_vm_map(mach_task_self(),&a,size,0,VM_FLAGS_FIXED,MEMORY_OBJECT_NULL,0,FALSE,VM_PROT_NONE,VM_PROT_ALL,VM_INHERIT_DEFAULT)==KERN_SUCCESS?(uint8_t *)(uintptr_t)a:NULL;
 }
+#if !TARGET_OS_IPHONE
+#define GUEST_ALIGN (2ULL<<20)
+/* From upstream PR #138: reserve size bytes in the first free gap from prev that holds it (2 MiB aligned), walking the
+   real map instead of a 1 GiB stride. The end of the map is not reported, so the last gap is only tried (FIXED fails
+   there when it reaches past the end). */
+static uint8_t *reserve_in_gap_from(uint64_t size,uint64_t prev){
+ for(;;){
+  mach_vm_address_t r=prev;mach_vm_size_t rsize=0;vm_region_basic_info_data_64_t info;mach_msg_type_number_t n=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t obj=MACH_PORT_NULL;
+  int more=mach_vm_region(mach_task_self(),&r,&rsize,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&info,&n,&obj)==KERN_SUCCESS;
+  if(obj!=MACH_PORT_NULL)mach_port_deallocate(mach_task_self(),obj);
+  uint64_t start=(prev+GUEST_ALIGN-1)&~(GUEST_ALIGN-1),end=more&&r<GUEST_ADDRESS_LIMIT?r:GUEST_ADDRESS_LIMIT;
+  if(end>start&&end-start>=size){uint8_t *p=reserve_fixed(start,size);if(p)return p;}
+  if(!more||r>=GUEST_ADDRESS_LIMIT||!rsize||r+rsize<=prev)return NULL;
+  prev=r+rsize;
+ }
+}
+#endif
 static void memory_init(void) {
  if(alias_space)return;
 #if TARGET_OS_IPHONE
@@ -79,9 +96,19 @@ static void memory_init(void) {
  if(!low_space){
   if(alias_space)mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)alias_space,ALIAS_SIZE);
   for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE+ALIAS_SIZE<=GUEST_ADDRESS_LIMIT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,LOW_SIZE+ALIAS_SIZE);
+  alias_space=low_space?low_space+LOW_SIZE:NULL;
+  /* PR #138 (upstream): ASLR can leave only holes smaller than stack+heap+alias, or one the 1 GiB stride above misses
+     (2 of 100 starts failed on an M4). Only then: one reservation in an exact gap, else stack+heap and the alias region
+     separately, stack+heap below the alias region (the order GetInfo's ASLR span and QueryMemory assume). */
+  const char *how="combined fallback";
+  if(!low_space&&(low_space=reserve_in_gap_from(LOW_SIZE+ALIAS_SIZE,LOW_SEARCH_FROM))){alias_space=low_space+LOW_SIZE;how="exact gap";}
+  if(!low_space){
+   uint8_t *lo=reserve_in_gap_from(LOW_SIZE,LOW_SEARCH_FROM);
+   if(lo&&(alias_space=reserve_in_gap_from(ALIAS_SIZE,(uintptr_t)lo+LOW_SIZE))){low_space=lo;how="separate regions";}
+   else if(lo)mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)lo,LOW_SIZE);
+  }
   if(!low_space)runtime_fail("reserve guest stack, heap and alias regions below 2^39");
-  alias_space=low_space+LOW_SIZE;
-  fprintf(stderr,"[totk] guest memory: stack+heap at %p, %llu GiB alias region at %p (combined fallback)\n",(void *)low_space,(unsigned long long)(ALIAS_SIZE>>30),(void *)alias_space);
+  fprintf(stderr,"[totk] guest memory: stack+heap at %p, %llu GiB alias region at %p (%s)\n",(void *)low_space,(unsigned long long)(ALIAS_SIZE>>30),(void *)alias_space,how);
  }
 #endif
  heap=low_space+HEAP_OFF;
