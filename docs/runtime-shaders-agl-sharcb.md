@@ -9,7 +9,7 @@ not an outstanding task. Counts below are the original cache snapshot, not the
 current cache inventory. Full Ghidra analysis of 1.0.0 has since completed; the
 decompiler availability note below describes only the original investigation.
 Later pipeline warm-up, uncapped performance and remaining work are recorded
-in the [current findings](practical-performance-20261019.md).
+in the [current findings](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/practical-performance-20261019.md).
 
 ## Short answer
 

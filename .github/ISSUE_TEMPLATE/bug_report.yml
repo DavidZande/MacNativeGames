@@ -1,19 +1,12 @@
 name: Bug report
 description: Something does not build, crashes, renders wrongly or runs slowly.
 body:
-  - type: markdown
-    attributes:
-      value: |
-        Do not attach or link game files, keys, firmware or a built app; such issues are removed. Logs are fine,
-        but remove anything that looks like a key first. See [LEGAL.md](https://github.com/DavidZande/MacNativeGames/blob/performance/LEGAL.md).
   - type: checkboxes
     id: legal
     attributes:
-      label: Confirmation
+      label: Before you post
       options:
-        - label: I own the game and dumped the game file and keys myself from my own console.
-          required: true
-        - label: This issue contains no game files, keys or firmware, and no links to them.
+        - label: I own the game, and this issue contains no game files, keys or firmware, nor links to them.
           required: true
   - type: input
     id: version
@@ -25,11 +18,11 @@ body:
   - type: textarea
     id: what
     attributes:
-      label: What happened, and what did you expect?
+      label: What happened?
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
-      label: Build or runtime log (optional)
+      label: Log (optional)
       render: text

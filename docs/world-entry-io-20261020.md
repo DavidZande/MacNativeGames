@@ -1,7 +1,7 @@
 # World-entry I/O stall and session findings — 2026-10-20
 
-Companion to [play-hitches-20261019.md](play-hitches-20261019.md) (fixed hitches) and the master
-[local-session-handoff](../../local-session-handoff.md). Everything here was measured on the M1 Pro bench
+Companion to [play-hitches-20261019.md](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/play-hitches-20261019.md) (fixed hitches).
+Everything here was measured on the M1 Pro bench
 (900p-unl, `TOTK_build/totk` build of branch `mac-local-improvements`); bench IDs are relative to
 `~/Documents/TearsOfKingdom/bench/`.
 

@@ -44,7 +44,7 @@ line continues after the existing detailed memory log reaches its 400-line cap.
 
 This change was pulled into the local fork as `5133055` (upstream PR #34).
 The later M1 Pro / 1.0.0 performance and cache trials are recorded separately in
-the [current findings](practical-performance-20261019.md); the M3 long-session
+the [current findings](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/practical-performance-20261019.md); the M3 long-session
 observation above is not a soak test of that later build.
 
 This PR is independent of pipeline prediction PR #29 and asynchronous loading

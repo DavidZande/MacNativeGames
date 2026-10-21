@@ -4,7 +4,7 @@
 
 ## Current local status — 2026-10-19
 
-The consolidated [practical findings](practical-performance-20261019.md) now cover
+The consolidated [practical findings](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/practical-performance-20261019.md) now cover
 David's M1 Pro / TOTK 1.0.0 work, with links to raw evidence, binary identities,
 the packaged-app state and remaining work. This is separate from the historical
 M4 / 1.4.3 results below.
@@ -16,9 +16,9 @@ M4 / 1.4.3 results below.
   720p + MetalFX reached 92.02 FPS, with a resolution/quality tradeoff.
 - Allocation logging was removed from the default path without a demonstrated
   steady FPS gain. Video mapping batching and non-GPU stall fixes remain open.
-- [Expanded compute warm-up](compute-pipeline-warmup.md) added startup cost;
+- [Expanded compute warm-up](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/compute-pipeline-warmup.md) added startup cost;
   its extra pipeline coverage was not exercised by the route. It remains off.
-- [Binding caches](binding-fastpaths-experiment.md) passed correctness checks
+- [Binding caches](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/binding-fastpaths-experiment.md) passed correctness checks
   but showed no reliable FPS improvement in quick A/B tests. Both remain off.
 - GPU timestamp capture now identifies individual pass candidates. The guest
   event-pacing loop was traced only at startup and is not a demonstrated cause

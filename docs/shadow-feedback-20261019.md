@@ -52,7 +52,7 @@ Installed `Tears of the Kingdom.app` still contains the verified glyph storage s
 5546778015ac0d00fc09655d971bf945842958bc7f94d9559fc8f1a5d06d8201
 ```
 
-Previous app: `TOTK_build/ui-glyph-release/previous.app`. See [UI fix record](ui-flicker-20261019.md) for its successful GPU probes, negative control, 45 Python tests, gameplay capture and signing checks. Keep this working text fix intact.
+Previous app: `TOTK_build/ui-glyph-release/previous.app`. See [UI fix record](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/ui-flicker-20261019.md) for its successful GPU probes, negative control, 45 Python tests, gameplay capture and signing checks. Keep this working text fix intact.
 
 Latest development binary: `TOTK_build/totk/build/totk-native`, successfully built with the **untested feedback cache optimization**. SHA-256:
 

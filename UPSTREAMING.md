@@ -46,7 +46,7 @@ GPU read them: corrupted label letters in 10 of 40 frames. Submit-time snapshots
 | `41de26e` (glyph snapshot part; also contains #3's copy path) | `nvn/nvn_mtl.m`, `nvn/hle_nvn.c`, `runtime/gpu_path_probe.m` | `TOTK_STORAGE_SNAPSHOT=0` |
 
 **Evidence.** Busy area with the 60 FPS cap: 54 → 60.1 standing, 60.2 panning, 0 anomalies in ~7,700 frames. Records:
-`docs/practical-performance-20261019.md`, `docs/ui-flicker-20261019.md` (8,712 GPU storage probe checks, negative
+[`docs/practical-performance-20261019.md`](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/practical-performance-20261019.md), [`docs/ui-flicker-20261019.md`](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/ui-flicker-20261019.md) (8,712 GPU storage probe checks, negative
 control fails as expected).
 
 ## 2. Play-time hitch fixes
@@ -62,7 +62,7 @@ control fails as expected).
 | Write-back runs inside an autorelease pool (same leak as upstream `635fb31`) | `4b18416` | — | no growth |
 
 Combined: frames > 50 ms 28 → ~16 per minute of play. Probes: `tests/texels_rect`, `tests/dirty_race`. Record:
-`docs/play-hitches-20261019.md`.
+[`docs/play-hitches-20261019.md`](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/play-hitches-20261019.md).
 
 ## 3. Decal feedback: copies, then framebuffer fetch
 
@@ -90,7 +90,7 @@ are proven, 11 refused (e.g. `.gather` reads) and keep copies.
 **Note for PR #91** (unwritten vertex outputs start at (0, 0, 0, 1)): it adds an initial vector store to every
 written output; `fbf_vs_screen` in `nvn_rt_fetch.h` currently refuses vector writes, so it would need to accept that
 leading initialisation, or every variant falls back to copies. Records: `docs/shadow-feedback-20261019.md`,
-`docs/perf-followups-20261020.md`.
+[`docs/perf-followups-20261020.md`](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/perf-followups-20261020.md).
 
 ## 4. TBDR pass optimizations
 
@@ -101,7 +101,7 @@ shared-storage texture aliasing flicker. `4b18416` fixes a third: later draws in
 to 1.08 s each; `TOTK_PSO_OMIT_SYNC=1` old behaviour).
 
 Result: +8.7–11.6 % FPS, tile traffic 755 → 552 MB/frame, passes 111 → 101/frame. `DM_NVN_TBDR=0` turns the pass
-rewriting off. Record: `docs/tbdr-barrier-sync-optimizations-20261019.md`. This is the hardest to port and the one
+rewriting off. Record: [`docs/tbdr-barrier-sync-optimizations-20261019.md`](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/tbdr-barrier-sync-optimizations-20261019.md). This is the hardest to port and the one
 most worth re-validating on other versions.
 
 ## 5. RomFS read cache
@@ -124,7 +124,7 @@ output carries the source's modification time and is used only while it matches,
 to source compiling and is baked again. After the warm-up the game bakes new sources on 2 background-QoS threads;
 without the Metal Toolchain nothing changes. Measured at 1080p: the essential-shader wait went from 74 s to 17 s in
 the app (0.3–1.7 s in the benchmark), the first picture from 113 s to 25 s; per-frame GPU time is identical on and
-off. `TOTK_RT_METALLIB=0` off. Record: `docs/next-performance-ideas-20261020.md` (last section).
+off. `TOTK_RT_METALLIB=0` off. Record: [`docs/next-performance-ideas-20261020.md`](https://github.com/DavidZande/MacNativeGames/blob/notes-2026-10-21/docs/next-performance-ideas-20261020.md) (last section).
 
 ## 7. Shader seeding (compare with upstream first)
 
