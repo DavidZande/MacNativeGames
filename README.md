@@ -2,7 +2,6 @@
 
 > [!IMPORTANT]
 > Unofficial fan project, not affiliated with or endorsed by Nintendo. No game content, firmware or keys are included.
-> Use it only with a game you own, dumped from your own console. See [LEGAL.md](LEGAL.md).
 
 A fork of [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames), which runs *Tears of the Kingdom*
 natively on Apple silicon Macs. This fork adds rendering and stutter fixes. All credit for the port goes to upstream.
@@ -79,13 +78,13 @@ Built on [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile), [nxnative](ht
 Ryujinx, [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross), deko3d, bcdec, libopus and libvpx.
 
 This project's code is MIT ([LICENSE](LICENSE)); third-party code keeps its own license
-([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). Legal notice: [LEGAL.md](LEGAL.md).
 
 ---
 
 ## 中文
 
-非官方爱好项目，与任天堂无关。本仓库不含游戏内容、固件或密钥，只能用于你自己拥有、并从自己主机导出的游戏（见 [LEGAL.md](LEGAL.md)）。
+非官方爱好项目，与任天堂无关。本仓库不含游戏内容、固件或密钥。
 
 这是 [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames) 的性能分支，为 Apple 芯片 Mac 上的《王国之泪》加入渲染与卡顿修复（见上表），每项都可用环境变量关闭。仅在 1.0.0、M1 Pro 上测试。构建方法同上：
 
