@@ -1,9 +1,18 @@
 # MacNativeGames — performance fork
 
+> [!IMPORTANT]
+> **Unofficial fan project, not affiliated with or endorsed by Nintendo.** This repository contains no game code, game
+> data, firmware or keys, and its tools download none. You need your own legally purchased copy of the game, with the
+> game file and keys dumped by yourself from your own console. The app you build is for your personal use only: do not
+> share it. Trademarks belong to their owners. Full notice: **[LEGAL.md](LEGAL.md)**.
+>
+> **非官方爱好项目，与任天堂无关，也未获其认可。** 本仓库不含任何游戏代码、数据、固件或密钥，工具也不会下载它们。你需要自己购买的正版游戏，并亲自从自己的主机导出游戏文件和密钥。生成的 App 仅供个人使用，请勿分享。详见 [LEGAL.md](LEGAL.md#chinese)。
+
 **This is a fork of [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames)** with a series of
 rendering and stutter fixes for *Tears of the Kingdom* on Apple silicon. Building and playing work exactly as upstream
-describes below: bring your own game file and `prod.keys`, run `build_app.py`, get a Mac app. Nothing from the game is in
-this repository. All credit for the port itself goes to upstream and the projects it acknowledges.
+describes below: bring the game file and `prod.keys` dumped from your own console and copy of the game, run
+`build_app.py`, get a Mac app for your own use. Nothing from the game is in this repository. All credit for the port
+itself goes to upstream and the projects it acknowledges.
 
 > **Tested on 1.0.0 only**, on a MacBook Pro M1 Pro (16 GB), macOS 27.2. Versions 1.1.2, 1.2.1 and 1.4.3 use the same
 > rendering code but have not been tested here. Every change below has an environment switch to turn it off.
@@ -127,7 +136,7 @@ Known open item: the first frames right after spawning can still take ~150–200
 
 [English](#english) | [中文](#chinese)
 
-Play your own copy of **The Legend of Zelda: Tears of the Kingdom** natively on an Apple silicon Mac. Bring your game file (XCI or NSP) and your `prod.keys`; one script turns them into a Mac app. This project currently supports **Mac only**. It is not an emulator: the game's own ARM64 code runs directly on the Apple chip (rewritten only where macOS requires it), the Switch system services are answered by a small host, and the game's NVN graphics are rebuilt on Metal 4. Nothing from the game is in this repository, and the project is not affiliated with Nintendo.
+Play your own legally purchased copy of **The Legend of Zelda: Tears of the Kingdom** natively on an Apple silicon Mac. Bring the game file (XCI or NSP) and `prod.keys` that you dumped yourself from your own console; one script turns them into a Mac app. This project currently supports **Mac only**. It is not an emulator: the game's own ARM64 code runs directly on the Apple chip (rewritten only where macOS requires it), the Switch system services are answered by a small host, and the game's NVN graphics are rebuilt on Metal 4. Nothing from the game is in this repository, and the project is not affiliated with or endorsed by Nintendo (see [LEGAL.md](LEGAL.md)).
 
 Update history:
 
@@ -160,7 +169,7 @@ Shaders are automatically collected, compiled and cached as you play. Returning 
 - A Mac with Apple silicon and **macOS 26** or later (the graphics use Metal 4). 16 GB of memory or more is recommended.
 - About **25 GB** of free disk space for the work folder, in addition to your game file. Keep the output app on the **same APFS volume** to share the large data files through cloning. If cloning is unavailable or the app is on another volume, allow roughly **17 GB more** for the app copy.
 - Your Tears of the Kingdom **base game 1.0.0** (`0100F2C0115B6000`) as an **XCI or NSP**, and your `prod.keys`. To build **1.1.2 or 1.4.3**, supply its separate cumulative update as NSP or NSZ with `--update`; no intermediate update is required. NSZ is decompressed and its NCA hashes are verified before extraction. DLC and combined packages are unsupported.
-- For NSP: its common ticket must be included unless the NCAs are rights-free. NSPs do not contain system shared fonts: supply an unpacked firmware NCA directory with `--firmware`, or previously extracted fonts with `--shared-fonts`. The six fonts must match this project’s verified hashes; valid fonts already in the work folder are reused.
+- For NSP: its common ticket must be included unless the NCAs are rights-free. NSPs do not contain system shared fonts: supply the firmware NCA directory dumped from your own console with `--firmware`, or previously extracted fonts with `--shared-fonts`. The six fonts must match this project’s verified hashes; valid fonts already in the work folder are reused.
 
 ## Build the app
 
@@ -185,7 +194,7 @@ python3.14 build_app.py ~/Games/totk.nsp -k ~/keys/prod.keys --firmware ~/Games/
 python3.14 build_app.py ~/Games/totk.nsp -k ~/keys/prod.keys --shared-fonts /path/to/TOTK_build/totk/extracted/firmware/shared-fonts
 ```
 
-`--firmware` accepts a directory of `.nca` files (unpack a firmware archive first), or an installed firmware `registered` directory. `--shared-fonts` accepts the extracted directory containing `0-standard.bfttf` through `5-nintendo-extension.bfttf`. No fonts or keys are downloaded. For an XCI, fonts are read from its system update partition by default; if that partition is missing, use one of these font options too. Both input formats produce a macOS `.app`.
+`--firmware` accepts a directory of `.nca` files from a firmware dump of your own console, or an installed firmware `registered` directory. `--shared-fonts` accepts the extracted directory containing `0-standard.bfttf` through `5-nintendo-extension.bfttf`. No fonts or keys are downloaded. For an XCI, fonts are read from its system update partition by default; if that partition is missing, use one of these font options too. Both input formats produce a macOS `.app`.
 
 The app appears next to the game file (`Tears of the Kingdom.app`; `-o` chooses another place). Before full shader preparation was added, a local clean base-1.0.0 build took about 6 minutes on an M4 Mac mini (this is not a timing estimate for the current build; hardware, disk and network conditions affect the time): about a minute each to rewrite the main code module and to decrypt the 17 GB of game data, and two to three minutes for macOS to check the finished app once. Building needs no .NET and no cmake, and the finished game needs no Python: its shader translator is a native program that comes with this repository (`games/totk/prebuilt`). Every intermediate file is in a work folder next to the game file (`TOTK_build`, or `--work`); running the script again reuses what is already done.
 
@@ -282,6 +291,8 @@ replace the M4 / 1.4.3 validation records.
 ## License
 
 MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The MIT license covers this project's own code only, not the game or anything built from it. Trademarks and disclaimers:
+[LEGAL.md](LEGAL.md).
 
 ---
 
@@ -293,7 +304,7 @@ MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license: [THIRD_PAR
 
 [英文说明](#english) | [中文说明](#chinese)
 
-在 Apple 芯片的 Mac 上原生运行你自己拥有的**《塞尔达传说 王国之泪》**。准备好游戏文件（XCI 或 NSP）和你的 `prod.keys`，一个脚本就把它们做成一个 Mac App。项目目前**只支持 Mac**。这不是模拟器：游戏自己的 ARM64 代码直接跑在苹果芯片上（只改写 macOS 不允许的地方），Switch 的系统服务由一个小宿主应答，游戏的 NVN 图形在 Metal 4 上重建。本仓库不含任何游戏内容，项目与任天堂无关。
+在 Apple 芯片的 Mac 上原生运行你自己拥有的**《塞尔达传说 王国之泪》**。准备好你亲自从自己的主机导出的游戏文件（XCI 或 NSP）和 `prod.keys`，一个脚本就把它们做成一个 Mac App。项目目前**只支持 Mac**。这不是模拟器：游戏自己的 ARM64 代码直接跑在苹果芯片上（只改写 macOS 不允许的地方），Switch 的系统服务由一个小宿主应答，游戏的 NVN 图形在 Metal 4 上重建。本仓库不含任何游戏内容，项目与任天堂无关，也未获其认可（见 [LEGAL.md](LEGAL.md#chinese)）。
 
 更新历史：
 
@@ -325,7 +336,7 @@ MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license: [THIRD_PAR
 - Apple 芯片的 Mac，**macOS 26** 或更高（图形用 Metal 4）。建议使用 16 GB 或更多内存。
 - 除游戏文件外，为工作目录预留约 **25 GB** 空闲空间。成品 App 与工作目录放在**同一个 APFS 卷**上时，大型数据文件可通过克隆共享磁盘空间；无法克隆或输出到其他卷时，还需为 App 副本另留约 **17 GB**。
 - 你的《王国之泪》**本体 1.0.0**（`0100F2C0115B6000`），格式为 **XCI 或 NSP**，以及你的 `prod.keys`。构建 **1.1.2 或 1.4.3** 时，通过 `--update` 提供单独的累计更新 NSP 或 NSZ；无需先安装中间版本。NSZ 会先解压并校验其中的 NCA 哈希。DLC 和合并包不支持。
-- 使用 NSP 时：除不依赖票据的 NCA 外，包内必须包含通用票据。NSP 不含系统共享字体，需要通过 `--firmware` 指定已解包的固件 NCA 目录，或通过 `--shared-fonts` 提供以前提取的字体。六个字体必须符合本项目已验证的哈希；工作目录中已有且校验通过的字体会自动复用。
+- 使用 NSP 时：除不依赖票据的 NCA 外，包内必须包含通用票据。NSP 不含系统共享字体，需要通过 `--firmware` 指定从你自己主机导出的固件 NCA 目录，或通过 `--shared-fonts` 提供以前提取的字体。六个字体必须符合本项目已验证的哈希；工作目录中已有且校验通过的字体会自动复用。
 
 ## 打包 App
 
@@ -350,7 +361,7 @@ python3.14 build_app.py ~/Games/totk.nsp -k ~/keys/prod.keys --firmware ~/Games/
 python3.14 build_app.py ~/Games/totk.nsp -k ~/keys/prod.keys --shared-fonts /path/to/TOTK_build/totk/extracted/firmware/shared-fonts
 ```
 
-`--firmware` 接受包含 `.nca` 文件的目录（固件压缩包需先解压），也接受已安装固件的 `registered` 目录。`--shared-fonts` 接受包含 `0-standard.bfttf` 至 `5-nintendo-extension.bfttf` 的提取目录。工具不会下载字体或密钥。XCI 默认从其系统更新分区提取字体；如果该分区缺失，也可以使用上述字体选项。两种输入格式最终都生成 macOS `.app`。
+`--firmware` 接受包含 `.nca` 文件的目录（来自你从自己主机导出的固件），也接受已安装固件的 `registered` 目录。`--shared-fonts` 接受包含 `0-standard.bfttf` 至 `5-nintendo-extension.bfttf` 的提取目录。工具不会下载字体或密钥。XCI 默认从其系统更新分区提取字体；如果该分区缺失，也可以使用上述字体选项。两种输入格式最终都生成 macOS `.app`。
 
 App 出现在游戏文件旁边（`Tears of the Kingdom.app`；`-o` 指定别处）。加入完整着色器准备前，本地一次本体 1.0.0 全新构建在 M4 Mac mini 上约 6 分钟（这不是当前构建的耗时预估；耗时受硬件、磁盘和网络影响）：改写主代码模块、解密 17 GB 的游戏数据各约 1 分钟，macOS 把做好的 App 检查一遍要 2–3 分钟。打包不需要 .NET 和 cmake，做好的游戏运行时也不需要 Python：着色器翻译器是本仓库自带的原生程序（`games/totk/prebuilt`）。所有中间文件都在游戏文件旁边的工作目录里（`TOTK_build`，或用 `--work` 指定），再运行一次会复用已经做好的部分。
 
@@ -441,3 +452,4 @@ macOS 能识别的手柄（如 DualSense、Xbox 手柄）会映射为 Switch Pro
 ## 许可证
 
 MIT（见 [LICENSE](LICENSE)）。第三方代码保留各自的许可证：[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+MIT 许可证只适用于本项目自己的代码，不适用于游戏或由游戏生成的任何内容。商标与免责声明见 [LEGAL.md](LEGAL.md#chinese)。

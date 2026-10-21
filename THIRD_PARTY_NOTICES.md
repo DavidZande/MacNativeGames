@@ -2,6 +2,8 @@
 
 Code in this repository that comes from other projects keeps its license; the license file sits next to the code.
 
+No Nintendo code, data, firmware or keys are included; see [LEGAL.md](LEGAL.md).
+
 | Code | From | License | File |
 |---|---|---|---|
 | `games/totk/third_party/d2r` (NSO rewriter, verification tools) | [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile), adapted | MIT | `games/totk/third_party/d2r/LICENSE` |
