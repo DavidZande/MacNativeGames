@@ -36,7 +36,7 @@ typedef struct Mixer {
     int *offset;                                   /* first mix buffer of each mix id */
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
     AudioComponentInstance unit; int unit_ok;
-    float ring[RING_FRAMES * 2]; _Atomic uint64_t wr, rd, underruns, overruns;
+    float ring[RING_FRAMES * 2]; _Atomic uint64_t wr, rd, underruns, overruns, trims, trimmed_frames;
     int smooth, priming, rate; float gain;          /* local change: TOTK_AUDIO_SMOOTH (pull) */
     os_workgroup_t wg;                             /* the output device's real-time workgroup */
     EffectState *effect; int *effect_order; unsigned effect_reported;
@@ -56,6 +56,15 @@ static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTi
     (void)flags; (void)ts; (void)bus;
     Mixer *m = ctx; float *out = io->mBuffers[0].mData;
     uint64_t rd = atomic_load(&m->rd), wr = atomic_load_explicit(&m->wr, memory_order_acquire), have = wr - rd;
+    /* After a device stall (Bluetooth, CoreAudio) the producer, paced by the wall clock, keeps the backlog it built up:
+       drop all but the target once it passes the target + 30 ms, so the delay does not stay (upstream 987d31c, adapted to
+       the smooth path's 40 ms target; counted in the output level line). */
+    uint64_t keep = m->smooth ? (uint64_t)(m->rate / 25) : (uint64_t)m->frame * 4u;
+    if (keep < frames) keep = frames;
+    if (m->unit_ok && m->frame && !(m->smooth && m->priming) && have > keep + (uint64_t)m->frame * 6u) {
+        atomic_fetch_add(&m->trims, 1); atomic_fetch_add(&m->trimmed_frames, have - keep);
+        rd = wr - keep; have = keep;
+    }
     if (m->smooth) {
         /* Local change, TOTK_AUDIO_SMOOTH (default on): after an underrun, wait until ~40 ms are buffered again instead
            of playing each late fragment as it arrives (crackle), and ramp the gain down / up over ~2 ms instead of cutting
@@ -513,8 +522,9 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
       for (int k = 0; k < 2 * frames; k++) { double x = lr[k]; sum += x * x; if (fabs(x) > peak) peak = fabs(x); }
       count += 2 * (uint64_t)frames; frames_total += (uint64_t)frames;
       if (frames_total >= (uint64_t)r->param.sample_rate * 5) {
-          fprintf(stderr, "[totk-audio] output level: rms %.4f peak %.4f over %.1f s, underruns %llu, overruns %llu\n", sqrt(sum / (double)count), peak,
-                  frames_total / (double)r->param.sample_rate, (unsigned long long)atomic_load(&m->underruns), (unsigned long long)atomic_load(&m->overruns));
+          fprintf(stderr, "[totk-audio] output level: rms %.4f peak %.4f over %.1f s, underruns %llu, overruns %llu, backlog trims %llu (%llu frames)\n", sqrt(sum / (double)count), peak,
+                  frames_total / (double)r->param.sample_rate, (unsigned long long)atomic_load(&m->underruns), (unsigned long long)atomic_load(&m->overruns),
+                  (unsigned long long)atomic_load(&m->trims), (unsigned long long)atomic_load(&m->trimmed_frames));
           sum = peak = 0; count = frames_total = 0;
       } }
     output_push(m, lr, frames);
