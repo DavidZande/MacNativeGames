@@ -33,8 +33,8 @@ Known issue: the first frames after spawning can still take ~150–200 ms.
 
 - Apple silicon Mac, macOS 26 or later, 16 GB memory recommended, ~25 GB free disk space.
 - Python 3.14.
-- Your game, base version 1.0.0, as XCI or NSP, and your `prod.keys`. Optionally the 1.1.2 or 1.4.3 update.
-- For an NSP: the system fonts, from your console's firmware (`--firmware`) or a previous build (`--shared-fonts`).
+- The game, base version 1.0.0, as XCI or NSP, and a keys file. Optionally the 1.1.2 or 1.4.3 update.
+- For an NSP: the system fonts (`--firmware` or `--shared-fonts`).
 
 ## Build
 

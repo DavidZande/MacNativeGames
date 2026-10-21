@@ -6,7 +6,7 @@ body:
     attributes:
       label: Before you post
       options:
-        - label: I own the game, and this issue contains no game files, keys or firmware, nor links to them.
+        - label: This issue contains no copyrighted files and no links to them.
           required: true
   - type: input
     id: version
