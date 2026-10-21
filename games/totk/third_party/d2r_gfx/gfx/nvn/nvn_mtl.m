@@ -634,6 +634,7 @@ uint64_t dm_mtl_l3_sample(uint32_t tick) {
     return g_dev ? g_dev.currentAllocatedSize : 0;
 }
 
+static _Atomic uint64_t g_pool_gen = 1;   // TOTK: bumped under g_mu by every memory pool add / removal (bind_vertex_streams' address cache)
 static _Atomic uint64_t g_reg_gen = 1;   // 内存池 / 贴图 / 采样器登记的变更代号：参数缓冲复用以它为失效条件之一 | Change generation of memory pool / texture / sampler registration: one of the invalidation conditions for argument buffer reuse
 /* TOTK safety guard: twice a full-game run kernel-panicked macOS inside IOGPUFamily right after the driver returned
    kIOReturnNoMemory. A zero-copy buffer makes the whole range resident, so ranges with inaccessible pages (sparse
@@ -691,7 +692,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     pidx_ent ent = {lo, hi, a, (__bridge void *)buf, buf.gpuAddress, mem, 0};
     if (pool_res_all()) { res_add(buf); ent.res = 1; g_pool_res_n++; g_pool_res_bytes += hi - lo; }
     if (!pidx_insert(&g_pools, &ent)) MDIE("内存池表扩容失败（%d 个）", g_pools.n);
-    pidx_query_invalidate(&g_pool_queries);
+    pidx_query_invalidate(&g_pool_queries); atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
     g_pool_adds++; g_pool_bytes += hi - lo;
     [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
@@ -705,7 +706,7 @@ void mtl_pool_del(const void *mem) {
     pthread_mutex_lock(&g_mu);
     pidx_ent ent;
     if (pidx_remove(&g_pools, mem, &ent)) {
-        pidx_query_invalidate(&g_pool_queries);
+        pidx_query_invalidate(&g_pool_queries); atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
         __unsafe_unretained id<MTLBuffer> buf = (__bridge id<MTLBuffer>)ent.buf;
         lo = ent.lo; hi = ent.hi; g_pool_bytes -= hi - lo;
         if (ent.res) { res_remove(buf); g_pool_res_n--; g_pool_res_bytes -= hi - lo; }
@@ -2095,7 +2096,10 @@ static void chunk_maybe_split(void) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     mtl_sub_split();
 }
+static int g_nlc; static void lc_land(void); static int lc_on(void);   // TOTK: lazy clears waiting for a pass (see lc_push)
+static uint64_t g_lc_pushed, g_lc_taken, g_lc_landed;   // groups that waited / attachments a later pass took as its load action / clear-only passes still opened
 uint64_t mtl_sub_commit(void) {
+    lc_land();   // TOTK: clears still waiting (the command list ended with them)
     cg_flush();   // TOTK: cube-face-set groups still pending at the end of the submission (reason 4 in the stats line)
     defer_fallback();   // 推迟合并通道：提交结束仍有未回放的 P 绘制（正常路径不会到这里） | Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
     rp_flush();
@@ -2421,6 +2425,12 @@ static int texture_plan_on(void) {
 }
 static uint64_t g_vertex_streams_bound, g_vertex_streams_omitted;
 static int g_vertex_streams_negative;
+/* TOTK, vertex stream address cache (from nxnative 697df75): every draw resolved each bound stream's guest address
+   through mtl_gpu_addr (g_mu and a pool table lookup). Per replay thread, a stream slot keeps the GPU address it
+   resolved while its guest address and the pool generation (g_pool_gen) are unchanged; the pool is resident already
+   (pool_res stays set until the pool is removed, which bumps the generation). TOTK_VBUF_CACHE=0 turns it off. */
+static uint64_t g_vbuf_reuse, g_vbuf_resolve; static int g_vbuf_negative;   // probe negative control 25: the pool generation is ignored
+static int vbuf_cache_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VBUF_CACHE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_VBUF_CACHE=0: vertex stream addresses resolved on every draw"); } return v; }
 static int vertex_streams_on(void) {
     int v=atomic_load(&g_vertex_streams_on);
     if(v<0){const char *e=getenv("TOTK_VERTEX_STREAMS");v=!(e && !atoi(e));atomic_store(&g_vertex_streams_on,v);}
@@ -3938,6 +3948,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     MLOG("[arg-epoch] enabled=%d hits=%llu extra=%llu verified=%llu", arg_epoch_on(), (unsigned long long)g_arg_epoch_hits, (unsigned long long)g_arg_epoch_extra, (unsigned long long)g_arg_epoch_verified);
     MLOG("[tex-slots] enabled=%d hits=%llu misses=%llu verified=%llu", tex_slots_on(), (unsigned long long)g_tex_slots_hits, (unsigned long long)g_tex_slots_misses, (unsigned long long)g_tex_slots_verified);
     MLOG("[arg-bind-cache] enabled=%d sets=%llu skips=%llu",arg_bind_cache_on(),(unsigned long long)g_arg_bind_sets,(unsigned long long)g_arg_bind_skips);
+    MLOG("[lazy-clear] enabled=%d waited=%llu taken=%llu landed=%llu", lc_on(), (unsigned long long)g_lc_pushed, (unsigned long long)g_lc_taken, (unsigned long long)g_lc_landed);
+    MLOG("[vbuf-cache] enabled=%d reused=%llu resolved=%llu", vbuf_cache_on(), (unsigned long long)g_vbuf_reuse, (unsigned long long)g_vbuf_resolve);
     { uint64_t hits, misses, checked;
       pthread_mutex_lock(&g_mu); hits=g_pool_queries.hits; misses=g_pool_queries.misses; checked=g_pool_query_checked; pthread_mutex_unlock(&g_mu);
       MLOG("[pool-query-cache] enabled=%d hits=%llu misses=%llu checked=%llu",pool_query_on(),(unsigned long long)hits,(unsigned long long)misses,(unsigned long long)checked); }
@@ -4673,6 +4685,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only);
 static id<MTL4RenderCommandEncoder> rp_begin(void) { return rp_begin_ex(0); }
 static int rt_none(void); static void noatt_dims(NSUInteger *w, NSUInteger *h);
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
+    if (g_nlc && !clear_only && !g_enc) lc_land();   // TOTK: a pass that did not take the waiting clears (draw_inner's lc_take) lands them first
     if (g_enc) return g_enc;
     chunk_maybe_split();
     memset(g_zskip_cand_ok, 0, sizeof g_zskip_cand_ok);
@@ -8658,6 +8671,97 @@ static int prog_samples_ser(const prog_t *pg, uint64_t tex[6][128], uint64_t img
             if (h && h_ser(h) == ser) return 1; } }
     return 0;
 }
+/* TOTK, lazy clears (from nxnative f5646ef): a set of targets that gets only clears before the game sets other targets
+   used to open a pass of its own just to land them (rp_flush), storing the cleared attachments, and the next pass that
+   attached them loaded them back. Such clears now wait (g_lc): the next pass that attaches the same texture level and
+   layer through the same view takes them as its load action (lc_take). The rest land as before, oldest first, each
+   group in a clear-only pass (lc_land), before anything could see their textures: a draw whose program samples one, a
+   pass opened for other targets (rp_begin_ex), any op other than targets, clears, state, uniform updates and buffer
+   copies (lc_keeps), the end of the command list and the submission's commit. A newer clear of the same subresource
+   replaces an older one. Off with TBDR mode or clear hoisting, which move clear-only passes their own way.
+   TOTK_LAZY_CLEAR=0 turns it off. */
+typedef struct { p_set_rt rt; uint8_t clear_c[8]; MTLClearColor cc[8]; uint8_t clear_d, clear_s; double cd; uint32_t cs; } lc_group;
+enum { LC_MAX = 8 };
+static lc_group g_lc[LC_MAX];
+static int g_lc_probe_reads = -1, g_lc_negative;   // mtl_probe_lazy_clear: what lc_sampled answers (-1 = the program decides); negative control 24: texture ops do not land waiting clears
+static int lc_on(void) {
+    static int v = -1; if (v < 0) { const char *e = getenv("TOTK_LAZY_CLEAR"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_LAZY_CLEAR=0: clears with no draw open a pass of their own as before"); }
+    return v && !tbdr_on() && !totk_hoist_on() && !wb_prefetch_on();   // wb_prefetch_targets copies the old targets out right after SetRenderTargets
+}
+static int lc_same(const p_set_rt *a, int ka, const p_set_rt *b, int kb) {   // the same subresource through the same view (k = 8: depth / stencil)
+    uint64_t s1, s2; int l1, l2, x1, x2; rt_sub(a, ka, &s1, &l1, &x1); rt_sub(b, kb, &s2, &l2, &x2);
+    if (!s1 || s1 != s2 || l1 != l2 || x1 != x2) return 0;
+    int h1 = ka == 8 ? a->has_dview : a->has_cview[ka], h2 = kb == 8 ? b->has_dview : b->has_cview[kb];
+    return h1 == h2 && (!h1 || !memcmp(ka == 8 ? &a->dview : &a->cview[ka], kb == 8 ? &b->dview : &b->cview[kb], sizeof(view_t)));
+}
+static int lc_slot_ok(const p_set_rt *r, int j) {   // a colour slot that can take a clear: attached, not block-compressed (block-render passes), not a repeat of an earlier slot
+    if (!r->color[j]) return 0;
+    int bw = 1, bh = 1; nvn_fmt_bpb(r->color[j]->d.format, &bw, &bh); if (bw > 1 || bh > 1) return 0;
+    for (int i = 0; i < j; i++) if (lc_same(r, i, r, j)) return 0;
+    return 1;
+}
+// Land every waiting clear, oldest first, each group in a clear-only pass (rp_flush's way)
+static void lc_land(void) {
+    if (!g_nlc) return;
+    if (g_enc) rp_end();
+    int n = g_nlc; g_nlc = 0;
+    __typeof__(R) save = R;
+    for (int gi = 0; gi < n; gi++) { const lc_group *g = &g_lc[gi]; int any = g->clear_d || g->clear_s; for (int i = 0; i < 8; i++) any |= g->clear_c[i];
+        if (!any || !g_cb) continue;
+        R.rt = g->rt; R.has_rt = 1; memcpy(R.clear_c, g->clear_c, sizeof R.clear_c); memcpy(R.cc, g->cc, sizeof R.cc);
+        R.clear_d = g->clear_d; R.clear_s = g->clear_s; R.cd = g->cd; R.cs = g->cs;
+        rp_begin_ex(1); rp_end(); g_lc_landed++; }
+    R = save;
+}
+// SetRenderTargets with clears pending and no draw since: the clears wait instead of opening a pass
+static void lc_push(void) {
+    if (g_nlc == LC_MAX) lc_land();
+    lc_group *g = &g_lc[g_nlc];
+    g->rt = R.rt; memcpy(g->clear_c, R.clear_c, sizeof g->clear_c); memcpy(g->cc, R.cc, sizeof g->cc); g->clear_d = R.clear_d; g->clear_s = R.clear_s; g->cd = R.cd; g->cs = R.cs;
+    for (int gi = 0; gi < g_nlc; gi++) { lc_group *o = &g_lc[gi];   // older clears of the same subresources are replaced
+        for (int i = 0; i < 8; i++) if (o->clear_c[i]) for (int j = 0; j < 8; j++) if (g->clear_c[j]) {
+            uint64_t s1, s2; int l1, l2, x1, x2; rt_sub(&o->rt, i, &s1, &l1, &x1); rt_sub(&g->rt, j, &s2, &l2, &x2);
+            if (s1 && s1 == s2 && l1 == l2 && x1 == x2) { o->clear_c[i] = 0; break; } }
+        if ((o->clear_d || o->clear_s) && (g->clear_d || g->clear_s)) {
+            uint64_t s1, s2; int l1, l2, x1, x2; rt_sub(&o->rt, 8, &s1, &l1, &x1); rt_sub(&g->rt, 8, &s2, &l2, &x2);
+            if (s1 && s1 == s2 && l1 == l2 && x1 == x2) { if (g->clear_d) o->clear_d = 0; if (g->clear_s) o->clear_s = 0; } } }
+    g_nlc++; g_lc_pushed++;
+    memset(R.clear_c, 0, sizeof R.clear_c); R.clear_d = R.clear_s = 0;
+}
+static int lc_sampled(const prog_t *pg) {   // the program reads a texture with a waiting clear (prog_samples_ser: an untranslated stage counts as reading everything)
+    if (g_lc_probe_reads >= 0) return g_lc_probe_reads;
+    if (!pg) return 1;
+    for (int gi = 0; gi < g_nlc; gi++) { const lc_group *g = &g_lc[gi];
+        for (int k = 0; k < 8; k++) if (g->clear_c[k] && g->rt.color[k] && prog_samples_ser(pg, S.tex, S.img, g->rt.color[k]->serial)) return 1;
+        if ((g->clear_d || g->clear_s) && g->rt.depth && prog_samples_ser(pg, S.tex, S.img, g->rt.depth->serial)) return 1; }
+    return 0;
+}
+// A draw about to open a pass: its attachments take the waiting clears of the same subresources (the newest; a clear
+// pending in R since the last SetRenderTargets is newer still), the rest land first
+static void lc_take(void) {
+    if (lc_sampled(S.prog)) { lc_land(); return; }
+    for (int gi = g_nlc - 1; gi >= 0; gi--) { lc_group *g = &g_lc[gi];
+        for (int i = 0; i < 8; i++) if (g->clear_c[i])
+            for (int j = 0; j < R.rt.n && j < 8; j++) if (lc_slot_ok(&R.rt, j) && lc_same(&g->rt, i, &R.rt, j)) {
+                if (!R.clear_c[j]) { R.clear_c[j] = 1; R.cc[j] = g->cc[i]; }
+                g->clear_c[i] = 0; g_lc_taken++; break; }
+        if ((g->clear_d || g->clear_s) && R.rt.depth && lc_same(&g->rt, 8, &R.rt, 8)) {
+            if (g->clear_d) { if (!R.clear_d) { R.clear_d = 1; R.cd = g->cd; } g->clear_d = 0; }
+            if (g->clear_s) { if (!R.clear_s) { R.clear_s = 1; R.cs = g->cs; } g->clear_s = 0; }
+            g_lc_taken++; } }
+    lc_land();
+}
+static int lc_keeps(uint32_t op) {   // ops a waiting clear can wait across: they neither read nor write textures
+    switch (op) {
+        case OP_SET_RT: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_DRAW: case OP_DRAW_IDX: case OP_BEGIN: case OP_JUMP: case OP_CALL:
+        case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+        case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
+        case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
+        case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: case OP_RENDER_COND: case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL:
+        case OP_UPDATE_UB: case OP_COPY_B2B: return 1;
+        default: return g_lc_negative && op != OP_END;
+    }
+}
 static int g_defer_env_ab, g_defer_env_off;   // 环境开关：每次提交开始（defer_reset）读一次，热路径不调 getenv | Environment switches: read once at the start of each submit (defer_reset); the hot path does not call getenv
 static void defer_env(void) { const char *x = getenv("DM_NVN_DEFER_AB"), *e = getenv("DM_NVN_DEFER"); g_defer_env_ab = x && !strcmp(x, "1"); g_defer_env_off = e && !strcmp(e, "0"); }
 static int defer_on(void) {
@@ -10084,13 +10188,20 @@ static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs) {
     uint16_t mask=vertex_streams_on()?vertex_stream_mask(vs):UINT16_MAX;
     uint64_t bound=0,omitted=0;
     if(g_vertex_streams_negative)mask&=~(1u<<5);
+    static _Thread_local struct { uint64_t addr, gpu, gen; } vc[16];   // see vbuf_cache_on
+    uint64_t gen=vbuf_cache_on()?atomic_load_explicit(&g_pool_gen,memory_order_acquire):0;   // taken before resolving: a pool change meanwhile forces a fresh lookup next time
     for(unsigned stream=0;stream<16;stream++) {
-        if(!S.vbuf[stream].address)continue;
+        uint64_t addr=S.vbuf[stream].address;
+        if(!addr)continue;
         if(!(mask&(1u<<stream))){omitted++;continue;}
-        void *mb;uint64_t mo,gpu;
-        if(mtl_gpu_addr(S.vbuf[stream].address,1,&mb,&mo,&gpu)) {
-            enc_r_vbuf(en,16+stream,gpu);use_rec("buf",S.vbuf[stream].address,S.vbuf[stream].size,0,NULL);bound++;
+        uint64_t gpu;
+        if(gen&&(vc[stream].gen==gen||g_vbuf_negative)&&vc[stream].addr==addr){gpu=vc[stream].gpu;g_vbuf_reuse++;}
+        else {
+            void *mb;uint64_t mo;g_vbuf_resolve++;
+            if(!mtl_gpu_addr(addr,1,&mb,&mo,&gpu))continue;
+            if(gen){vc[stream].addr=addr;vc[stream].gpu=gpu;vc[stream].gen=gen;}
         }
+        enc_r_vbuf(en,16+stream,gpu);use_rec("buf",addr,S.vbuf[stream].size,0,NULL);bound++;
     }
     g_vertex_streams_bound+=bound;g_vertex_streams_omitted+=omitted;
     static id<MTLBuffer> zero;static uint64_t zero_gpu;
@@ -10208,6 +10319,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     if (pr && pr->missing) { g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet
+    if (g_nlc && !g_enc) lc_take();   // TOTK: waiting clears become this pass's load actions, or land before anything of this draw (before pass_ds_need sees R's clears)
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
     { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { g_draw_skip[15]++; return; } if (fit) g_pso_dirty = 1; }
     if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
@@ -11322,6 +11434,7 @@ void mtl_exec(const uint8_t *p) {
         if (g_cg_pending && !cg_op_safe(h.op)) { g_cg.reason[1]++; cg_flush(); }   // TOTK: cube-face-set groups pend only across state / binding ops (nvn_cube_group.h)
         if (g_hoist_n && hoist_take(p)) { if (g_fz.active && p == g_fz.rt2_op) { g_fz.phase = 2; g_rt_merged = 0; PD("F %llu 合并通道进入后一个通道的绘制", g_stat_pass); } p += h.size; continue; }   // 已提前执行的纯清除通道 / 已并入的后一个通道开头   // 进入后一个通道：前一个通道的同目标续用到此为止，后一个通道读前一个通道附件由 fz_p2_draw 证本像素，不再按续用规则切开 | A pure-clear render pass already executed early / the start of a later pass already merged in   // Entering the later pass: the same-target continuation of the earlier pass ends here; the later pass reading the earlier pass's attachment is proven to be same-pixel by fz_p2_draw, and is no longer split by the continuation rule
         const void *a = p + 8;
+        if (g_nlc && !lc_keeps(h.op) && !(h.op == OP_END && g_ret_n)) lc_land();   // TOTK: see lc_keeps (a sub-list's end returns to its caller)
         switch (h.op) {
             case OP_END: g_exec_cur = NULL;
                 if (g_hoist_n && !g_ret_n && !g_nrest) {
@@ -11377,7 +11490,8 @@ void mtl_exec(const uint8_t *p) {
                    attachment) and in the clear ops still end the continued pass where needed. TOTK_RT_CONTINUE=0 turns it off. */
                 static int rt_cont = -1; if (rt_cont < 0) { const char *e = getenv("TOTK_RT_CONTINUE"); rt_cont = !(e && !strcmp(e, "0")); }
                 if (g_enc && g_enc_mode != 1 && !pend && R.has_rt && (tbdr_on() || rt_cont) && rt_same(&R.rt, r)) { g_rt_merged = 1; if (!g_rt_merge_n++) MLOG("同目标续用：首例 通道 %llu", g_stat_pass); PD("M %llu 同目标续用通道", g_stat_pass); R.rt = *r; break; }
-                rp_flush(); wb_prefetch_targets(R.has_rt?&R.rt:NULL,r); R.rt = *r; R.has_rt = 1; break;
+                if (pend && !g_enc && g_cb && lc_on()) lc_push(); else rp_flush();   // TOTK: clears with no draw wait for the next pass that attaches their targets (lc_push)
+                wb_prefetch_targets(R.has_rt?&R.rt:NULL,r); R.rt = *r; R.has_rt = 1; break;
             }
             case OP_CLEAR_COLOR: {
                 const p_clear_color *c = a;
@@ -13467,6 +13581,74 @@ int mtl_probe_ds_clear(void) {
     for (id o in @[color, depth, rc, rd, rs]) defer_obj_release(o); return checked;
 }
 
+/* TOTK lazy clears (lc_push / lc_land / lc_take) through the replay, read back from the GPU:
+   1. clears of two target sets with no draw land at the end of the list, and a newer clear of the same texture
+      replaces the older one (two clear-only passes for three waiting groups);
+   2. a waiting clear lands before a ClearTexture of the same texture (the ClearTexture value stays);
+   3. a pass for the same target takes the waiting clear as its load action (no clear-only pass), and a program that
+      samples the cleared texture lands it instead.
+   TOTK_PROBE_NEGATIVE=24: texture ops do not land waiting clears first, so check 2 must fail. */
+static void lc_probe_read(id<MTLTexture> t, id<MTLBuffer> b, NSUInteger W, NSUInteger H) { enc_b_copy_texture_buffer(blit(), t, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(W, H, 1), b, 0, W * 4, W * H * 4); }
+static void lc_probe_want(id<MTLBuffer> b, NSUInteger W, NSUInteger H, const uint8_t in[4], const uint8_t out[4], NSUInteger edge, const char *what, int *checked) {
+    const uint8_t *p = b.contents;
+    for (NSUInteger y = 0; y < H; y++) for (NSUInteger x = 0; x < W; x++) { const uint8_t *w = x < edge && y < edge ? in : out;
+        for (int k = 0; k < 4; k++) if (abs(p[(y * W + x) * 4 + k] - w[k]) > 1) MDIE("lazy clear probe: %s pixel (%lu,%lu) channel %d = %u want %u", what, (unsigned long)x, (unsigned long)y, k, p[(y * W + x) * 4 + k], w[k]);
+        (*checked)++; }
+}
+int mtl_probe_lazy_clear(void) {
+    mtl_init(); const NSUInteger W = 16, H = 16; int checked = 0;
+    if (!lc_on()) MDIE("lazy clear probe: lazy clears are off (TOTK_LAZY_CLEAR, TBDR mode or clear hoisting)");
+    g_lc_negative = getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 24;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:W height:H mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite; d.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> mt[3]; tex_t t[3] = {{0}};
+    for (int i = 0; i < 3; i++) { mt[i] = [g_dev newTextureWithDescriptor:d]; if (!mt[i]) MDIE("lazy clear probe textures"); res_add(mt[i]);
+        t[i].serial = 0xffffffc0 + i; t[i].d.width = W; t[i].d.height = H; t[i].d.depth = 1; t[i].d.levels = 1; t[i].d.target = 1; t[i].d.format = 0x25; serial_put(t[i].serial, mt[i]); }
+    id<MTLBuffer> rb[3]; for (int i = 0; i < 3; i++) rb[i] = probe_buf(W * H * 4);
+    uint64_t list[512]; size_t n = 0;   // command records (8-byte aligned)
+#define LC_REC(op_, val_) do { __typeof__(val_) v_ = (val_); op_hdr h_ = {(op_), (uint32_t)(8 + ((sizeof v_ + 7) & ~(size_t)7))}; \
+        memset((uint8_t *)list + n, 0, h_.size); memcpy((uint8_t *)list + n, &h_, 8); memcpy((uint8_t *)list + n + 8, &v_, sizeof v_); n += h_.size; } while (0)
+#define LC_RT(i_) do { p_set_rt r_; memset(&r_, 0, sizeof r_); r_.n = 1; r_.color[0] = &t[i_]; LC_REC(OP_SET_RT, r_); } while (0)
+#define LC_CLR(r_, g_, b_) LC_REC(OP_CLEAR_COLOR, ((p_clear_color){0, 0xf, {(r_), (g_), (b_), 1}}))
+#define LC_END() do { op_hdr e_ = {OP_END, 8}; memcpy((uint8_t *)list + n, &e_, 8); n += 8; } while (0)
+    op_hdr end = {OP_END, 8};
+    const uint8_t red[4] = {255, 0, 0, 255}, green[4] = {0, 255, 0, 255}, blue[4] = {0, 0, 255, 255}, white[4] = {255, 255, 255, 255};
+    // 1. A red, B green, A blue: A's red is replaced, two clear-only passes at the end of the list
+    mtl_sub_begin(); mtl_exec((const uint8_t *)&end); memset(&R, 0, sizeof R);
+    uint64_t pushed0 = g_lc_pushed, landed0 = g_lc_landed;
+    n = 0; LC_RT(0); LC_CLR(1, 0, 0); LC_RT(1); LC_CLR(0, 1, 0); LC_RT(0); LC_CLR(0, 0, 1); LC_RT(1); LC_END();
+    mtl_exec((const uint8_t *)list);
+    if (g_lc_pushed - pushed0 != 3 || g_lc_landed - landed0 != 2) MDIE("lazy clear probe: check 1 waited %llu / landed %llu groups, want 3 / 2", (unsigned long long)(g_lc_pushed - pushed0), (unsigned long long)(g_lc_landed - landed0));
+    rp_end(); lc_probe_read(mt[0], rb[0], W, H); lc_probe_read(mt[1], rb[1], W, H); mtl_sub_commit(); mtl_finish();
+    lc_probe_want(rb[0], W, H, blue, blue, 0, "check 1 texture A", &checked); lc_probe_want(rb[1], W, H, green, green, 0, "check 1 texture B", &checked);
+    // 2. C red, then (other targets) ClearTexture of all of C white: the red lands first
+    mtl_sub_begin(); mtl_exec((const uint8_t *)&end); memset(&R, 0, sizeof R);
+    p_clear_tex ct; memset(&ct, 0, sizeof ct); ct.tex = &t[2]; ct.r.width = W; ct.r.height = H; ct.r.depth = 1; ct.mask = 0xf; ct.c.f[0] = ct.c.f[1] = ct.c.f[2] = ct.c.f[3] = 1;
+    n = 0; LC_RT(2); LC_CLR(1, 0, 0); LC_RT(1); LC_REC(OP_CLEAR_TEX, ct); LC_END();
+    mtl_exec((const uint8_t *)list);
+    rp_end(); lc_probe_read(mt[2], rb[2], W, H); mtl_sub_commit(); mtl_finish();
+    lc_probe_want(rb[2], W, H, white, white, 0, "check 2 texture C", &checked);
+    // 3. A green waits, a pass for A takes it (no clear-only pass); then B red waits and a program sampling B lands it
+    mtl_sub_begin(); mtl_exec((const uint8_t *)&end); memset(&R, 0, sizeof R);
+    uint64_t taken0 = g_lc_taken; landed0 = g_lc_landed;
+    R.has_rt = 1; R.rt.n = 1; R.rt.color[0] = &t[0]; R.clear_c[0] = 1; R.cc[0] = MTLClearColorMake(0, 1, 0, 1); lc_push();
+    g_lc_probe_reads = 0; lc_take();
+    if (g_nlc || g_lc_taken - taken0 != 1 || g_lc_landed != landed0 || !R.clear_c[0]) MDIE("lazy clear probe: check 3 take: waiting %d, taken %llu, landed %llu, load clear %d", g_nlc, (unsigned long long)(g_lc_taken - taken0), (unsigned long long)(g_lc_landed - landed0), R.clear_c[0]);
+    rp_begin(); rp_end();
+    R.rt.color[0] = &t[1]; R.clear_c[0] = 1; R.cc[0] = MTLClearColorMake(1, 0, 0, 1); lc_push(); R.rt.color[0] = &t[1];
+    g_lc_probe_reads = 1; lc_take(); g_lc_probe_reads = -1;
+    if (g_nlc || g_lc_taken - taken0 != 1 || g_lc_landed - landed0 != 1 || R.clear_c[0]) MDIE("lazy clear probe: check 3 sampled: waiting %d, taken %llu, landed %llu, load clear %d", g_nlc, (unsigned long long)(g_lc_taken - taken0), (unsigned long long)(g_lc_landed - landed0), R.clear_c[0]);
+    lc_probe_read(mt[0], rb[0], W, H); lc_probe_read(mt[1], rb[1], W, H); mtl_sub_commit(); mtl_finish();
+    lc_probe_want(rb[0], W, H, green, green, 0, "check 3 texture A", &checked); lc_probe_want(rb[1], W, H, red, red, 0, "check 3 texture B", &checked);
+#undef LC_REC
+#undef LC_RT
+#undef LC_CLR
+#undef LC_END
+    g_lc_negative = 0; memset(&R, 0, sizeof R);
+    for (int i = 0; i < 3; i++) { serial_del(t[i].serial); defer_obj_release(mt[i]); defer_obj_release(rb[i]); }
+    return checked;
+}
+
 /* Keep a game submission open while more than one staging batch is uploaded. Check both payload
    ordering and bounded batch memory, including retirement before the game fence is committed. */
 int mtl_probe_upload_batch(void) {
@@ -14361,6 +14543,13 @@ int mtl_probe_vertex_streams(void) {
         if(g_vertex_streams_bound-bound!=expected_bind && !g_vertex_streams_negative)MDIE("vertex stream probe unexpected binding count");checked++;
         uint64_t skips=g_arg_bind_skips;bind_vertex_streams(en,vs);
         if(cache_mode && !g_arg_bind_cache_negative && g_arg_bind_skips==skips)MDIE("argument binding probe did not skip repeated addresses");checked++;
+        if(vbuf_cache_on()) {   // the second bind reused the resolved addresses; a pool change forces fresh lookups (negative control 25: it does not)
+            g_vbuf_negative=getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE"))==25;
+            uint64_t reuse=g_vbuf_reuse;bind_vertex_streams(en,vs);if(g_vbuf_reuse==reuse)MDIE("vertex stream cache probe did not reuse resolved addresses");checked++;
+            uint64_t resolve=g_vbuf_resolve;atomic_fetch_add(&g_pool_gen,1);bind_vertex_streams(en,vs);
+            if(g_vbuf_resolve-resolve!=expected_bind)MDIE("vertex stream cache probe: %llu fresh lookups after a pool change, want %u",(unsigned long long)(g_vbuf_resolve-resolve),expected_bind);checked++;
+            g_vbuf_negative=0;
+        }
         enc_r_draw(en,MTLPrimitiveTypeTriangle,0,3);enc_r_end(en);
         enc_b_copy_texture_buffer(blit(),texture,0,0,MTLOriginMake(0,0,0),MTLSizeMake(16,16,1),rb,0,64,1024);mtl_sub_commit();mtl_finish();
         for(unsigned i=0;i<1024;i++){int expected=scenario==2?0:(int[]){64,128,191,255}[i%4];if(abs((int)((uint8_t *)rb.contents)[i]-expected)>1)MDIE("vertex stream probe GPU mismatch mode%d scenario%d byte%u",mode,scenario,i);checked++;}
