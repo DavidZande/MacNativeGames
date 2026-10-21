@@ -46,6 +46,7 @@ void mtl_sub_counter(uint64_t addr, uint32_t type);                       // 完
 uint64_t mtl_sub_commit(void);
 int mtl_probe_vertex_streams(void);
 int mtl_probe_lazy_clear(void);
+int mtl_probe_tex_gen(void);
 int mtl_probe_arg_epoch(void);
 int mtl_probe_tex_slots(void);
 int mtl_probe_pool_retire(void);

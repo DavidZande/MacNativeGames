@@ -725,19 +725,79 @@ static pidx_ent *pool_query(uintptr_t addr, uint64_t len) { // caller holds g_mu
     }
     return p;
 }
-int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+/* TOTK, per-thread pool cache (from upstream 373725b, f08266c): the replay resolves dozens of buffer addresses per draw;
+   each lookup took g_mu and searched the index (upstream: 0.5 ms of the submit thread a frame in a shrine, about half of
+   it the lock). Each thread keeps the last pools it resolved, valid while g_pool_gen (bumped under g_mu on every pool
+   add / remove) is unchanged, and looks at the slot of its last hit first. Only a pool no other pool overlaps is kept,
+   so a hit is the pool the locked search returns; it is already resident (pool_res ran), and only its removal takes it
+   out of the residency set, which bumps the generation. TOTK_POOL_TLS=0 or flag pool_tls 0 turns it off;
+   TOTK_POOL_TLS_CHECK=1 or flag pool_tls_check 1 compares every hit with the locked search. */
+#define POOL_TLS_N 8
+typedef struct { uintptr_t lo, hi, base; void *buf; uint64_t gpu, gen; } pool_tls_ent;
+static _Thread_local pool_tls_ent g_ptls[POOL_TLS_N];
+static _Thread_local unsigned g_ptls_next, g_ptls_last;   // next slot to fill; slot of the last hit (looked at first)
+static _Atomic int g_pool_tls_on = -1, g_pool_tls_check;
+static uint64_t g_pool_tls_hits, g_pool_tls_misses, g_pool_tls_verified;   // statistics (the replay thread does nearly all lookups)
+static int pool_tls_on(void) {
+    int v = atomic_load_explicit(&g_pool_tls_on, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_POOL_TLS"); int want = !(e && !atoi(e)), expected = -1;
+        atomic_compare_exchange_strong(&g_pool_tls_on, &expected, want); v = atomic_load(&g_pool_tls_on);
+        if (!v) MLOG("TOTK_POOL_TLS=0: every pool lookup takes the pool lock");
+        e = getenv("TOTK_POOL_TLS_CHECK"); if (e && atoi(e)) atomic_store(&g_pool_tls_check, 1); }
+    return v;
+}
+static const pool_tls_ent *pool_tls_find(uintptr_t a, uint64_t len) {
+    uintptr_t end = a + (uintptr_t)len;
+    if (end < a) return NULL;
+    uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
+    const pool_tls_ent *e = &g_ptls[g_ptls_last];
+    if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) return e;   // a < hi: an address at the end may also start the next pool
+    for (unsigned i = 0; i < POOL_TLS_N; i++) {
+        e = &g_ptls[i];
+        if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) { g_ptls_last = i; return e; }
+    }
+    return NULL;
+}
+static void pool_tls_keep(const pidx_ent *p) {   // caller holds g_mu; p was just made resident
+    int i = (int)(p - g_pools.e);
+    if (i < 0 || i >= g_pools.n) return;
+    if (i > 0 && g_pools.maxhi[i - 1] > p->lo) return;          // an earlier pool reaches into this one
+    if (i + 1 < g_pools.n && g_pools.e[i + 1].lo < p->hi) return; // a later pool starts inside this one
+    g_ptls[g_ptls_next++ % POOL_TLS_N] = (pool_tls_ent){p->lo, p->hi, p->base, p->buf, p->gpu, atomic_load_explicit(&g_pool_gen, memory_order_relaxed)};
+}
+// The locked search; with keep, a pool it finds is remembered by this thread.
+static int pool_lookup_locked(uint64_t addr, uint64_t len, void **buf, uint64_t *base, uint64_t *gpu, int keep) {
     pthread_mutex_lock(&g_mu);
     pidx_ent *p = pool_query((uintptr_t)addr, len);
-    if (p) { pool_res(p); *buf = p->buf; *off = addr - p->base; }
+    if (p) { pool_res(p); *buf = p->buf; *base = p->base; *gpu = p->gpu; if (keep) pool_tls_keep(p); }
     pthread_mutex_unlock(&g_mu);
     return p != NULL;
 }
+static int pool_lookup(uint64_t addr, uint64_t len, void **buf, uint64_t *base, uint64_t *gpu) {
+    if (!pool_tls_on()) return pool_lookup_locked(addr, len, buf, base, gpu, 0);
+    const pool_tls_ent *e = pool_tls_find((uintptr_t)addr, len);
+    if (!e) { g_pool_tls_misses++; return pool_lookup_locked(addr, len, buf, base, gpu, 1); }
+    g_pool_tls_hits++;
+    if (atomic_load_explicit(&g_pool_tls_check, memory_order_relaxed)) {
+        void *b2; uint64_t base2, gpu2;
+        if (!pool_lookup_locked(addr, len, &b2, &base2, &gpu2, 0) || b2 != e->buf || base2 != e->base || gpu2 != e->gpu)
+            MDIE("pool lookup cache disagrees at %#llx+%#llx", (unsigned long long)addr, (unsigned long long)len);
+        g_pool_tls_verified++;
+    }
+    *buf = e->buf; *base = e->base; *gpu = e->gpu;
+    return 1;
+}
+int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+    uint64_t base, gpu;
+    if (!pool_lookup(addr, len, buf, &base, &gpu)) return 0;
+    *off = addr - base;
+    return 1;
+}
 int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu) {
-    pthread_mutex_lock(&g_mu);
-    pidx_ent *p = pool_query((uintptr_t)addr, len);
-    if (p) { pool_res(p); *buf = p->buf; *off = addr - p->base; *gpu = p->gpu + *off; }
-    pthread_mutex_unlock(&g_mu);
-    return p != NULL;
+    uint64_t base, pgpu;
+    if (!pool_lookup(addr, len, buf, &base, &pgpu)) return 0;
+    *off = addr - base; *gpu = pgpu + *off;
+    return 1;
 }
 
 // ---------- 提交 ----------
@@ -2524,6 +2584,8 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "vertex_streams")) { atomic_store(&g_vertex_streams_on, v != 0); MLOG("[flag] vertex_streams = %d", v != 0); return; }
     if (!strcmp(name, "arg_bind_cache")) { atomic_store(&g_arg_bind_cache_on, v != 0); MLOG("[flag] arg_bind_cache = %d", v != 0); return; }
     if (!strcmp(name, "pool_query_cache")) { atomic_store(&g_pool_query_on, v != 0); MLOG("[flag] pool_query_cache = %d", v != 0); return; }
+    if (!strcmp(name, "pool_tls")) { (void)pool_tls_on(); atomic_store(&g_pool_tls_on, v != 0); MLOG("[flag] pool_tls = %d", v != 0); return; }
+    if (!strcmp(name, "pool_tls_check")) { atomic_store(&g_pool_tls_check, v != 0); MLOG("[flag] pool_tls_check = %d", v != 0); return; }
     if (!strcmp(name, "pool_query_check")) { atomic_store(&g_pool_query_check, v != 0); MLOG("[flag] pool_query_check = %d", v != 0); return; }
     if (!strcmp(name, "texture_plan")) { (void)texture_plan_on(); atomic_store(&g_texture_plan_on, v != 0); MLOG("[flag] texture_plan = %d", v != 0); return; }
     if (!strcmp(name, "texture_plan_check")) { (void)texture_plan_on(); atomic_store(&g_texture_plan_check, v != 0); MLOG("[flag] texture_plan_check = %d", v != 0); return; }
@@ -3953,6 +4015,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     { uint64_t hits, misses, checked;
       pthread_mutex_lock(&g_mu); hits=g_pool_queries.hits; misses=g_pool_queries.misses; checked=g_pool_query_checked; pthread_mutex_unlock(&g_mu);
       MLOG("[pool-query-cache] enabled=%d hits=%llu misses=%llu checked=%llu",pool_query_on(),(unsigned long long)hits,(unsigned long long)misses,(unsigned long long)checked); }
+    MLOG("[pool-tls] enabled=%d hits=%llu misses=%llu verified=%llu",pool_tls_on(),(unsigned long long)g_pool_tls_hits,(unsigned long long)g_pool_tls_misses,(unsigned long long)g_pool_tls_verified);
     MLOG("[shadow-index] enabled=%d hit=%llu miss=%llu verified=%llu",shadow_index_on(),(unsigned long long)g_shadow_index_hits,(unsigned long long)g_shadow_index_misses,(unsigned long long)g_shadow_index_verified);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
@@ -4039,17 +4102,20 @@ static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw,
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
 // DM_NVN_PASSDUMP=frame number, or start-end (inclusive at both ends)
 static long g_pd_at = -1, g_pd_n;
-static int passdump(void) {
+static int g_pd_armed = -1;   // TOTK (from upstream f08266c): 0 when neither DM_NVN_PASSDUMP nor a "passdump" command asked for a dump: passdump() is called per binding
+static int passdump_slow(void);
+static inline int passdump(void) { return g_pd_armed == 0 ? 0 : passdump_slow(); }
+static int passdump_slow(void) {
 #ifdef NVN_RT_RANGE_TEST
     if (g_rr_checking) return 0;
 #endif
-    static long a0 = -2, a1; if (a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP"); a0 = e ? atol(e) : -1; a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : a0; }
+    static long a0 = -2, a1; if (a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP"); a0 = e ? atol(e) : -1; a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : a0; if (a0 < 0 && g_pd_at < 0) g_pd_armed = 0; }
     long f = (long)atomic_load(&g_cur_frame);
     if (g_pd_at >= 0 && f >= g_pd_at && f < g_pd_at + g_pd_n) return 1;   // TOTK: "passdump <frames>" from TOTK_INPUT_FILE
     return a0 >= 0 && f >= a0 && f <= a1;
 }
 /* TOTK: TOTK_INPUT_FILE command "passdump <n>": full pass dump (as DM_NVN_PASSDUMP_ALL) of the n frames after the next one. */
-void dm_gfx_passdump_next(long n) { g_pd_n = n > 0 && n < 16 ? n : 1; g_pd_at = (long)atomic_load(&g_cur_frame) + 2; MLOG("[pass] 按输入文件转储帧 %ld 起 %ld 帧", g_pd_at, g_pd_n); }
+void dm_gfx_passdump_next(long n) { g_pd_n = n > 0 && n < 16 ? n : 1; g_pd_at = (long)atomic_load(&g_cur_frame) + 2; g_pd_armed = 1; MLOG("[pass] 按输入文件转储帧 %ld 起 %ld 帧", g_pd_at, g_pd_n); }
 #define PD(...) do { if (passdump()) { fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 static void pd_xfer(const char *what, uint64_t src, uint64_t dst, uint64_t n) { PD("X %llu %s src=%#llx dst=%#llx n=%#llx", g_stat_pass, what, (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n); }
 static void pd_update_bytes(const void *data, uint64_t dst, uint64_t n, uint64_t seq) {
@@ -5940,7 +6006,17 @@ static struct {
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; int render_disabled; int raster_discard;
     float blend_color[4]; int64_t copy_stride;
+    uint64_t tex_gen[6];   // TOTK: a fresh value of g_tex_gen_seq whenever tex[stage] changes (TEX_CHANGED); saved / restored with S
 } S;
+/* TOTK, texture slot generation (from upstream f08266c): stage_sig compared the stage's 128 texture handles with its last
+   copy on every draw (a 1 KiB memcmp; upstream 0.13 ms a frame in a shrine). Every write to S.tex now gives that stage a
+   fresh, never reused number, so equal numbers mean equal handles also after S is saved and restored (state_reset zeroes
+   both). TOTK_TEX_GEN=0 compares the handles as before; TOTK_TEX_GEN_CHECK=1 compares them as well and stops on a difference. */
+static uint64_t g_tex_gen_seq;
+static int g_tex_gen_negative;   // probe negative control 26: binds keep the old generation
+#define TEX_CHANGED(st) (g_tex_gen_negative ? 0 : (S.tex_gen[st] = ++g_tex_gen_seq))
+static int tex_gen_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_TEX_GEN"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_TEX_GEN=0: texture slots compared handle by handle on every draw"); } return v; }
+static int tex_gen_check(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_TEX_GEN_CHECK"); v = e && atoi(e); } return v; }
 // No render target set: no colour target and no depth / stencil (a pass of rasterization only, see rp_begin_ex)
 static int rt_none(void) {
     if (!R.has_rt || R.rt.depth) return 0;
@@ -6046,16 +6122,18 @@ static uint64_t stage_sig(int st) {
        so a program first translated with other bindings is re-fitted at draw time. */
     /* The depth-slot mask only changes with this stage's bound handles or a descriptor registration (g_reg_gen): it is
        kept per stage and recomputed when either changed (it was a lookup per bound slot on every draw, about 7%). */
-    { static uint64_t last_tex[6][128], last_gen[6] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull}, last_dm[6];
-      uint64_t dm; uint64_t gen = g_reg_gen;
+    { static uint64_t last_tex[6][128], last_gen[6] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull}, last_tg[6] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull}, last_dm[6];
+      uint64_t dm; uint64_t gen = g_reg_gen; int tg = tex_gen_on();
       int hi = st >= 0 && st < 6 ? g_tex_hi[st] : 128;
-      if (st >= 0 && st < 6 && gen == last_gen[st] && !memcmp(last_tex[st], S.tex[st], sizeof(uint64_t) * hi)) dm = last_dm[st];
+      if (st >= 0 && st < 6 && gen == last_gen[st] && (tg ? S.tex_gen[st] == last_tg[st] : !memcmp(last_tex[st], S.tex[st], sizeof(uint64_t) * hi))) {
+          if (tg && tex_gen_check() && memcmp(last_tex[st], S.tex[st], sizeof(uint64_t) * hi)) MDIE("texture slot generation %llu of stage %d kept, handles changed", (unsigned long long)S.tex_gen[st], st);
+          dm = last_dm[st]; }
       else {
           dm = 0; int locked = registry_lock();
           for (int r = 0; r < hi; r++) if (S.tex[st][r]) { const treg_t *t = bound_tex(S.tex[st][r]); if (!t) continue;
               int f = t->has_v && t->v.set_format ? t->v.format : t->t.d.format; if (f >= 0x32 && f <= 0x36) dm ^= 0x9E3779B97F4A7C15ull * (uint64_t)(r + 1); }
           registry_unlock();
-          if (st >= 0 && st < 6 && locked) { memcpy(last_tex[st], S.tex[st], sizeof(uint64_t) * hi); last_gen[st] = gen; last_dm[st] = dm; }
+          if (st >= 0 && st < 6 && locked) { if (!tg || tex_gen_check()) memcpy(last_tex[st], S.tex[st], sizeof(uint64_t) * hi); last_gen[st] = gen; last_tg[st] = S.tex_gen[st]; last_dm[st] = dm; }
       }
       if (dm) sg ^= dm | 1ull << 63; }
     return sg;
@@ -6487,6 +6565,18 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
 static struct { pso_key k; id<MTLRenderPipelineState> ps; int used, done; } g_pp[PSO_PEND_MAX];
 static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
+/* TOTK, prediction rescans (from upstream PR #166): a scan that stopped at a budget leaves the rest of the submission
+   unscanned; the next miss of the submission scans again from there (keys already compiling are skipped, so each scan
+   moves on), up to TOTK_PSO_RESCANS times (default 32; 0: one scan per submission, as before). A burst of new pipelines
+   on entering a new area then compiles in parallel instead of mostly one after another or, with TOTK_ASYNC_PSO, its draws
+   are skipped for fewer frames. */
+static int pso_rescans(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_RESCANS"); v = e ? atoi(e) : 32; if (v < 0) v = 0; } return v; }
+static int g_pp_more, g_pp_rescans; static uint64_t g_pp_rescans_total;   // last scan stopped at a budget; scans after the first in this submission; all of them
+static void pso_predict_rest(void);
+static void pso_predict_miss(void) {   // a pipeline miss: the submission's first scan, or one more after a scan that stopped at a budget
+    if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; g_pp_rescans = 0; g_pp_more = 0; pso_predict_rest(); }
+    else if (g_pp_more && g_pp_rescans < pso_rescans()) { g_pp_rescans++; g_pp_rescans_total++; pso_predict_rest(); }
+}
 static void pso_predict_rest(void);
 // Statistics line (pso_predict_rest, every 100 scans; ported from upstream c5b3ae7): guesses refused because the table was
 // full, time draws waited for a background compile, scans and which budget ended them.
@@ -6600,7 +6690,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
         int r = pso_pend_poll(&k, &ps);
         if (r == 0) { g_async_pso_skipped++; return nil; }   /* still compiling: skip this draw */
         if (r < 0) {
-            if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }
+            pso_predict_miss();
             pso_pend_kick(&k, vs, fs);
             if (pso_pend_find(&k) >= 0) { g_async_pso_kicked++; g_async_pso_skipped++;
                 static unsigned said; if (said++ < 5 || said % 500 == 0) MLOG("[async-pso] queued %llu, draws skipped %llu, ready %llu", g_async_pso_kicked, g_async_pso_skipped, g_async_pso_ready);
@@ -6624,7 +6714,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (!ps && !g_pso_lmap) ps = pso_pend_take(&k);
     if (ps) g_pp_taken++;
     else {
-        if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
+        pso_predict_miss();   // first miss in this submission (or the last scan stopped early): kick the later ones out to compile in parallel first, then build this one here
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, g_pso_fsfn, g_pso_lmap != NULL);
         uint64_t t_in = bp_now();
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
@@ -7936,7 +8026,7 @@ static int state_op(uint32_t op, const void *a) {
         case OP_BIND_VBUF: { const p_bind_vbuf *b = a; memcpy(&S.vbuf[b->first], b->r, sizeof *b->r * b->n); break; }
         case OP_BIND_UBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index < 16 && memcmp(&S.ubo[b->stage][b->index], b, sizeof *b)) { S.ubo[b->stage][b->index] = *b; args_dirty_stage(b->stage); } break; }
         case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index < 16 && memcmp(&S.ssbo[b->stage][b->index], b, sizeof *b)) { S.ssbo[b->stage][b->index] = *b; args_dirty_stage(b->stage); } break; }
-        case OP_BIND_TEX: { const p_bind_handles *b = a; if (b->stage < 6 && b->first + b->n <= 128 && memcmp(&S.tex[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.tex[b->stage][b->first], b->h, 8 * b->n); args_dirty_stage(b->stage); if (b->first + b->n > g_tex_hi[b->stage]) g_tex_hi[b->stage] = b->first + b->n; } break; }
+        case OP_BIND_TEX: { const p_bind_handles *b = a; if (b->stage < 6 && b->first + b->n <= 128 && memcmp(&S.tex[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.tex[b->stage][b->first], b->h, 8 * b->n); TEX_CHANGED(b->stage); args_dirty_stage(b->stage); if (b->first + b->n > g_tex_hi[b->stage]) g_tex_hi[b->stage] = b->first + b->n; } break; }
         case OP_BIND_SAMP: { const p_bind_handles *b = a; if (b->stage < 6 && b->first + b->n <= 128 && memcmp(&S.samp[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.samp[b->stage][b->first], b->h, 8 * b->n); args_dirty_stage(b->stage); } break; }
         case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage < 6 && b->first >= 0 && b->first + b->n <= 32) { if (memcmp(&S.img[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.img[b->stage][b->first], b->h, 8 * b->n); args_dirty_stage(b->stage); } } else RED_ONCE(31, "图像槽越界 阶段 %d 起 %d 数 %d", b->stage, b->first, b->n); break; }
         case OP_STENCIL: {
@@ -8015,7 +8105,7 @@ static void pso_predict_rest(void) {
     enum { QN = 160 }; static int max_ops = -1, max_keys, max_us;
     if (max_ops < 0) {
         const char *e = getenv("TOTK_PSO_PREDICT_SCAN"); int ops = e ? atoi(e) : 8192;
-        e = getenv("TOTK_PSO_PREDICT_KEYS"); max_keys = e ? atoi(e) : 32; if (max_keys < 1) max_keys = 1; if (max_keys > QN) max_keys = QN;
+        e = getenv("TOTK_PSO_PREDICT_KEYS"); max_keys = e ? atoi(e) : 64; if (max_keys < 1) max_keys = 1; if (max_keys > QN) max_keys = QN;
         e = getenv("TOTK_PSO_PREDICT_US"); max_us = e ? atoi(e) : 2000; if (max_us < 1) max_us = 1;
         max_ops = ops < 1 ? 1 : ops;
         MLOG("[totk] pipeline prediction: after a submission's first pipeline miss, scans at most %d commands, %d keys, %d us", max_ops, max_keys, max_us);
@@ -8049,6 +8139,8 @@ static void pso_predict_rest(void) {
                 if (!pred_guess_wanted(v, dfull, sfull, fs)) continue;
                 pso_key k; pso_key_fill(&k, vs, fs, cf, PRED_DEPTH[v] ? dfull : 0, PRED_STENCIL[v] ? sfull : 0, samples, 0);
                 if (hm_get_id(&g_pso, &k)) continue;
+                pthread_mutex_lock(&g_pp_mu); int pending = pso_pend_find(&k) >= 0; pthread_mutex_unlock(&g_pp_mu);
+                if (pending) continue;   // kicked by an earlier scan of this submission: not a key of this scan's budget
                 int dup = 0; for (int i = 0; i < (v ? nb : na) && !dup; i++) dup = !memcmp(&(v ? qb : qa)[i].k, &k, sizeof k);
                 if (dup) continue;
                 if (!v && na < max_keys) { qa[na].k = k; qa[na].vs = (__bridge void *)vs; qa[na].fs = (__bridge void *)fs; na++; pso_pend_kick(&k, vs, fs); }
@@ -8064,13 +8156,14 @@ static void pso_predict_rest(void) {
     memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("并行预编：本次提交余下 %d 次绘制，丢给后台 %d 条管线", draws, (int)g_pp_kicked - kicked0);
     g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
+    g_pp_more = stop != 0;
     if (g_pp_scans % 100 == 0) {
         pthread_mutex_lock(&g_pp_mu); uint64_t full = g_pp_full, waits = g_pp_waits, wait_ns = g_pp_wait_ns; int busy = 0;
         for (int i = 0; i < PSO_PEND_MAX; i++) busy += g_pp[i].used; pthread_mutex_unlock(&g_pp_mu);
-        MLOG("[pso-predict] to submission %llu: %llu scans (%.2f ms each; ended by commands %llu, keys %llu, time %llu), %llu pipelines started in the background, %llu taken by draws (%llu waits, %.1f ms), %llu refused (table full), %d slots in use",
+        MLOG("[pso-predict] to submission %llu: %llu scans (%.2f ms each; ended by commands %llu, keys %llu, time %llu), %llu pipelines started in the background, %llu taken by draws (%llu waits, %.1f ms), %llu built on the submit thread, %llu rescans, %llu refused (table full), %d slots in use",
              (unsigned long long)g_sub_serial, (unsigned long long)g_pp_scans, g_pp_scan_ns / 1e6 / (double)g_pp_scans,
              (unsigned long long)g_pp_stop[0], (unsigned long long)g_pp_stop[1], (unsigned long long)g_pp_stop[2],
-             (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6, (unsigned long long)full, busy);
+             (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6, (unsigned long long)g_inplace_pso_n, (unsigned long long)g_pp_rescans_total, (unsigned long long)full, busy);
     }
 }
 
@@ -10395,7 +10488,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         if (!strncmp(f->key, "ebcfcd1fa0a77dbc", 16) && !g_enc && R.rt.n == 1 && R.rt.color[0] && !R.clear_c[0]) {
             uint64_t h = 0; for (int i = 0; i < f->rf.nb && !h; i++) if (f->rf.b[i].kind == NVN_RB_TEX && f->rf.b[i].reg < 128) h = S.tex[1][f->rf.b[i].reg];
             if (h) { fx_from = R.rt.color[0]->serial; fx_to = h; PD("N %llu 跳过 FXAA：ser=%llu 的读者改读 ser=%llu", g_stat_pass, (unsigned long long)fx_from, (unsigned long long)h_ser(h)); return; } }
-        else if (fx_from && !strncmp(f->key, "52aac1f2306b8fc5", 16)) { for (int r = 0; r < 128; r++) if (S.tex[1][r] && h_ser(S.tex[1][r]) == fx_from) S.tex[1][r] = fx_to; fx_from = 0; } } }
+        else if (fx_from && !strncmp(f->key, "52aac1f2306b8fc5", 16)) { for (int r = 0; r < 128; r++) if (S.tex[1][r] && h_ser(S.tex[1][r]) == fx_from) S.tex[1][r] = fx_to; TEX_CHANGED(1); fx_from = 0; } } }
     { static uint64_t bloomq_frame; if (bloomq_frame != atomic_load(&g_cur_frame)) { bloomq_frame = atomic_load(&g_cur_frame); bloomq_reset(); }
       if (bloomq_enabled() && tbdr_on() && !g_defer_replaying && pr->sh[1]) {
         NvShader *f = pr->sh[1]; uint64_t tgt = 0; int lv, sl;
@@ -10424,7 +10517,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         } else if (g_bloomq.state == 2 && !strncmp(f->key, "cc264583f2000c81", 16)) {
             if (bloomq_target(&tgt, &lv, &sl) && tgt == g_bloomq.b0_ser) { g_bloomq.state = 3; PD("C %llu 泛光 1/4 跳过 B0 上采样", g_stat_pass); return; }
         } else if (g_bloomq.state == 3 && !strncmp(f->key, "2e2d6700a2569795", 16)) {
-            if (g_bloomq.b1_h) { for (int r = 0; r < 128; r++) if (S.tex[1][r] && h_ser(S.tex[1][r]) == g_bloomq.b0_ser) S.tex[1][r] = g_bloomq.b1_h; PD("D %llu 泛光 1/4 叠加改读 B1", g_stat_pass); g_bloomq_last_b0 = g_bloomq.b0_ser; g_bloomq_last_b1h = g_bloomq.b1_h; g_bloomq_last_b1s = g_bloomq.b1_ser; bloomq_reset(); }
+            if (g_bloomq.b1_h) { for (int r = 0; r < 128; r++) if (S.tex[1][r] && h_ser(S.tex[1][r]) == g_bloomq.b0_ser) S.tex[1][r] = g_bloomq.b1_h; TEX_CHANGED(1); PD("D %llu 泛光 1/4 叠加改读 B1", g_stat_pass); g_bloomq_last_b0 = g_bloomq.b0_ser; g_bloomq_last_b1h = g_bloomq.b1_h; g_bloomq_last_b1s = g_bloomq.b1_ser; bloomq_reset(); }
             else { RED_ONCE(63, "泛光 1/4 状态缺少 B1 句柄"); bloomq_reset(); }
         } else if (!g_bloomq.state && g_bloomq_last_b1h && h_ser(g_bloomq_last_b1h) == g_bloomq_last_b1s && !strncmp(f->key, "2e2d6700a2569795", 16)) {   // B1 句柄仍指同一张贴图（换分辨率重建后不认） | The B1 handle still points to the same texture (not recognized after a rebuild on resolution change)
             // 本帧泛光链没跑（运行时外推的外推帧跳过了它：输入 469 区域外是上一帧 LDR，不能跑）就到了泛光叠加：照最近一次改读 B1，叠上一帧的泛光。
@@ -10432,6 +10525,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             // The bloom overlay is reached without the bloom chain having run this frame (the extrapolated frame of runtime extrapolation skipped it: outside the region the input 469 is the previous frame's LDR, so it cannot run): redirect the read to B1 as last time, overlaying the previous frame's bloom.
             // Without the redirect it would read B0 -- with bloom 1/4 on, B0's upsample is always skipped and never written, so what is read is uninitialized video memory (on M4 Pro the units in the region turn entirely green; elsewhere it is mostly 0, i.e. missing bloom)
             int hit = 0; for (int r = 0; r < 128; r++) if (S.tex[1][r] && h_ser(S.tex[1][r]) == g_bloomq_last_b0) { S.tex[1][r] = g_bloomq_last_b1h; hit = 1; }
+            if (hit) TEX_CHANGED(1);
             if (hit) { PD("D %llu 泛光链没跑：叠加沿用上一帧 B1", g_stat_pass); static uint64_t n; if (n++ % 600 == 0) MLOG("泛光 1/4：泛光链没跑的帧叠加沿用上一帧 B1（第 %llu 次）", (unsigned long long)n); }
         } else if (g_bloomq.state) { RED_ONCE(61, "泛光 1/4 起点：链中途出现别的绘制，本帧泛光不完整"); bloomq_reset(); }
       }
@@ -13595,6 +13689,39 @@ static void lc_probe_want(id<MTLBuffer> b, NSUInteger W, NSUInteger H, const uin
         for (int k = 0; k < 4; k++) if (abs(p[(y * W + x) * 4 + k] - w[k]) > 1) MDIE("lazy clear probe: %s pixel (%lu,%lu) channel %d = %u want %u", what, (unsigned long)x, (unsigned long)y, k, p[(y * W + x) * 4 + k], w[k]);
         (*checked)++; }
 }
+/* TOTK texture slot generation (TEX_CHANGED, stage_sig): the depth-slot part of a stage's signature follows the bound
+   handles through binds of a depth and a colour texture, a whole-S save and restore, and a registry change; with the
+   generation off (TOTK_TEX_GEN=0) the same answers come from the handle compare. TOTK_PROBE_NEGATIVE=26: binds keep the
+   old generation, so the signature must go stale. */
+int mtl_probe_tex_gen(void) {
+    mtl_init(); int checked = 0;
+    g_tex_gen_negative = getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 26;
+    op_hdr end = {OP_END, 8}; mtl_sub_begin(); mtl_exec((const uint8_t *)&end); state_reset(); memset(&R, 0, sizeof R);
+    tex_t dt = {0}, ct = {0}; dt.serial = 0xffffffb0; ct.serial = 0xffffffb1;
+    dt.d.width = ct.d.width = 16; dt.d.height = ct.d.height = 16; dt.d.depth = ct.d.depth = 1; dt.d.levels = ct.d.levels = 1; dt.d.target = ct.d.target = 1;
+    dt.d.format = 0x34; ct.d.format = 0x25;
+    mtl_reg_tex(61, &dt, NULL); mtl_reg_tex(62, &ct, NULL);
+    p_bind_handles b; memset(&b, 0, sizeof b); b.stage = 2; b.first = 3; b.n = 1;
+    uint64_t none = stage_sig(2);
+    b.h[0] = 61; state_op(OP_BIND_TEX, &b); uint64_t sd = stage_sig(2);
+    if (sd == none) MDIE("tex-gen probe: a depth texture in slot 3 did not change the signature");
+    checked++;
+    b.h[0] = 62; state_op(OP_BIND_TEX, &b); uint64_t sc = stage_sig(2);
+    if (sc == sd) MDIE("tex-gen probe: rebinding slot 3 to a colour texture kept the depth signature");
+    if (sc != none) MDIE("tex-gen probe: a colour texture gave a depth signature");
+    checked += 2;
+    __typeof__(S) *save = malloc(sizeof S); memcpy(save, &S, sizeof S);   // the slot holds the colour texture
+    b.h[0] = 61; state_op(OP_BIND_TEX, &b); if (stage_sig(2) != sd) MDIE("tex-gen probe: rebinding the depth texture lost its signature");
+    memcpy(&S, save, sizeof S); if (stage_sig(2) != sc) MDIE("tex-gen probe: restoring S kept the depth signature of the newer bind");
+    memcpy(&S, save, sizeof S); b.h[0] = 61; state_op(OP_BIND_TEX, &b); if (stage_sig(2) != sd) MDIE("tex-gen probe: a bind after a restore kept the restored signature");
+    checked += 3;
+    tex_t dt2 = ct; dt2.d.format = 0x36; mtl_reg_tex(62, &dt2, NULL);   // same handle, the registry now gives it a depth format
+    b.h[0] = 62; state_op(OP_BIND_TEX, &b); if (stage_sig(2) == none) MDIE("tex-gen probe: a registry change did not reach the signature");
+    checked++;
+    free(save); g_tex_gen_negative = 0;
+    mtl_reg_tex(61, NULL, NULL); mtl_reg_tex(62, NULL, NULL); state_reset(); mtl_sub_commit(); mtl_finish();
+    return checked;
+}
 int mtl_probe_lazy_clear(void) {
     mtl_init(); const NSUInteger W = 16, H = 16; int checked = 0;
     if (!lc_on()) MDIE("lazy clear probe: lazy clears are off (TOTK_LAZY_CLEAR, TBDR mode or clear hoisting)");
@@ -13703,7 +13830,7 @@ int mtl_probe_storage_view(void) {
         view_t view={0};view.set_format=1;view.format=0x27;
         mtl_reg_tex(1,&alias,mode?&view:NULL);
         id<MTLBuffer> rb=probe_buf(4096);op_hdr end={OP_END,8};mtl_sub_begin();mtl_exec((const uint8_t *)&end);
-        if(kind==2)S.img[stage][reg]=1;else S.tex[stage][reg]=1;
+        if(kind==2)S.img[stage][reg]=1;else { S.tex[stage][reg]=1; TEX_CHANGED(stage); }
         for(int layer=0;layer<2;layer++)for(int level=0;level<2;level++) {
             memset(&R,0,sizeof R);R.has_rt=1;R.rt.n=1;R.rt.color[0]=&t;R.rt.has_cview[0]=1;
             view_t *v=&R.rt.cview[0];v->set_levels=v->set_layers=1;v->base_level=level;v->nlevels=1;v->min_layer=layer;v->nlayers=1;
@@ -14316,7 +14443,7 @@ int mtl_probe_drv_c0(void) {
     uint64_t value; memcpy(&value,bytes+0x140,8);
     if (value != 0x123456789abcdef0ull || *(const uint32_t *)(bytes+0x148)!=12345 || *(const float *)(bytes+0x610)!=2047.9375f) MDIE("drv-cache probe: changed vertex storage binding");
     checked += 3;
-    driver_bank_gpu(2,0,&bank_buffer); S.tex[0][3]=0x80000042; S.samp[0][3]=0x123;
+    driver_bank_gpu(2,0,&bank_buffer); S.tex[0][3]=0x80000042; TEX_CHANGED(0); S.samp[0][3]=0x123;
     driver_bank_gpu(2,0,&bank_buffer); bc=&g_driver_bank[0][1]; bytes=(const uint8_t *)bank_buffer.contents+bc->offset;
     if (*(const uint32_t *)(bytes+0x180)!=0x80000042 || *(const uint32_t *)(bytes+0x580)!=0x123 || *(const uint32_t *)(bytes+0x38)!=0x80000042) MDIE("drv-cache probe: changed texture/sampler handle");
     checked += 3;
@@ -14331,7 +14458,7 @@ int mtl_probe_drv_c0(void) {
     mtl_sub_begin(); mtl_exec((const uint8_t *)&end); misses=g_driver_miss; driver_bank_gpu(0,5,&bank_buffer);
     if(g_driver_miss!=misses+1) MDIE("drv-cache probe: bank survived arena epoch change"); checked++;
     mtl_sub_commit(); mtl_finish();
-    memset(&S.ssbo,0,sizeof S.ssbo); memset(&S.ubo,0,sizeof S.ubo); memset(&S.tex,0,sizeof S.tex); memset(&S.samp,0,sizeof S.samp);
+    memset(&S.ssbo,0,sizeof S.ssbo); memset(&S.ubo,0,sizeof S.ubo); memset(&S.tex,0,sizeof S.tex); for(int st=0;st<6;st++)TEX_CHANGED(st); memset(&S.samp,0,sizeof S.samp);
     serial_put(p.serial, nil); mtl_pool_del(mem); free(mem);
     return checked;
 }
