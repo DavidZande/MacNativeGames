@@ -817,7 +817,7 @@ void dm_gfx_querylog_next(long n); void dm_gfx_passdump_next(long n); void dm_gf
 // and a report hands the slot table together with its buffer (retained) to the completion callback to sum and write back; after a report a new slot is used, so later draws are not counted into the reported value.
 // (Previously always wrote 0: occlusion query = 'fully occluded', campfires / light sources got culled - the character select screen calls ResetCounter 21 times per frame)
 typedef struct { void *buf; uint32_t slot, n; } vis_slot;   // n (TOTK_ANOMALY): further consecutive slots of the same buffer counted with it (0 = just this one)
-typedef struct { int n; vis_slot s[]; } vis_list;
+typedef struct { int n, skipped; vis_slot s[]; } vis_list;   // skipped: a counted draw since the reset was skipped (draw_skipped)
 #define VIS_SLOTS 8192
 typedef struct { __strong id<MTLBuffer> buf; uint64_t fence; } vis_buf;
 static vis_buf g_vis_ring[4]; static int g_vis_ring_n, g_vis_ring_i = -1;
@@ -832,11 +832,13 @@ static int anom_vis_on(void); static void anom_vis_done(anom_vis_ent *e, int n);
 static void anom_note_xfer(char kind, uint64_t src, uint64_t dst, uint64_t n, const void *data);   // TOTK_ANOMALY: inline update / copy in the frame's sequence
 static id<MTLBuffer> g_vis; static uint32_t g_vis_n;   // 本次提交的可见性缓冲与已用槽数 | This submission's visibility buffer and number of slots used
 static int g_vis_on, g_vis_counting, g_vis_cur = -1; static uint64_t g_vis_cur_pass;
+static int g_vis_skipped;                                // a draw counted since the last reset was skipped (its shader or pipeline not ready)
+static _Atomic uint64_t g_occl_raised;                   // reports raised from 0 to 1 because of that (completion handler)
 static vis_slot *g_vs; static int g_nvs, g_vscap;      // 自上次清零以来的槽 | Slots since the last reset
 static uint64_t g_cnt_report[32], g_cnt_reset[32];       // 各计数器类型的报告 / 清零次数（诊断） | Report / reset counts per counter type (diagnostics)
-static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; }
+static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; g_vis_skipped = 0; }
 static vis_list *vis_snapshot(void) {
-    vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs;
+    vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs; l->skipped = g_vis_skipped;
     for (int i = 0; i < g_nvs; i++) { l->s[i] = g_vs[i]; CFRetain(g_vs[i].buf); }
     return l;
 }
@@ -2205,6 +2207,11 @@ uint64_t mtl_sub_commit(void) {
                 if (ops[i].qlog) MLOG("[query] F%llu dst=%#llx samples=%llu sphere=%g,%g,%g,%g%s", (unsigned long long)gpu_f, (unsigned long long)ops[i].addr, (unsigned long long)sum,
                                       ops[i].sph[0], ops[i].sph[1], ops[i].sph[2], ops[i].sph[3], atomic_load(&g_occl_vis) ? " (reported as visible: occl_visible)" : "");
                 if (atomic_load(&g_occl_vis)) sum = 1u << 20;
+                /* Upstream 311f7ec: a counted draw was skipped while its shader or pipeline was prepared (draw_skipped): a 0 may
+                   only mean that draw was not drawn, and the game would cull the object until it asks again. The game culls on
+                   zero / non-zero (one bounding-sphere proxy per object), so report it visible: at worst an occluded object is
+                   drawn for a frame. TOTK_OCCL_RAISE=0 reports the plain sum. */
+                if (!sum && l->skipped) { sum = 1; atomic_fetch_add_explicit(&g_occl_raised, 1, memory_order_relaxed); }
                 nq++; nzero += sum == 0;
                 free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
             }
@@ -10408,13 +10415,20 @@ static int mfxup_draw(NvProg *pr) {
     return 0;
 }
 #include "nvn_cube_group.h"
+/* A draw skipped because its shader or pipeline is not ready (background translation / pipeline build, untranslated
+   variants on iOS). Inside an occlusion count its 0 must not cull the object (upstream 311f7ec, see the completion handler). */
+static void draw_skipped(int why) {
+    g_draw_skip[why]++;
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_OCCL_RAISE"); on = !(e && !strcmp(e, "0")); }
+    if (on && g_vis_counting) g_vis_skipped = 1;
+}
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
-    if (pr && pr->missing) { g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet
+    if (pr && pr->missing) { draw_skipped(15); return; }   // TOTK (iOS): a stage is not translated yet; Mac: still translating in the background
     if (g_nlc && !g_enc) lc_take();   // TOTK: waiting clears become this pass's load actions, or land before anything of this draw (before pass_ds_need sees R's clears)
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
-    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { g_draw_skip[15]++; return; } if (fit) g_pso_dirty = 1; }
+    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { draw_skipped(15); return; } if (fit) g_pso_dirty = 1; }
     if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
     geometry_dump(pr, dw, di);
     if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
@@ -10619,7 +10633,7 @@ omit_reopen:;
     if (g_pso_reopen) { g_pso_reopen = 0; PD("M %llu 无深度模板通道内管线未就绪：后台编，带深度模板重开", g_stat_pass); rp_end(); omit_reopened = 1; goto omit_reopen; }
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
-    if (!ps) { g_draw_skip[9]++; static int failed_n; if (failed_n++ < 3) MLOG("[pipeline-draw] rt-depth=%p serial=%llu fmt=%#x pass-depth=%u dt=%u dw=%u fs-depth=%d", R.rt.depth, (unsigned long long)(R.rt.depth ? R.rt.depth->serial : 0), R.rt.depth ? R.rt.depth->d.format : 0, g_pass.dfmt, S.ds.dt, S.ds.dw, pr->sh[1] ? pr->sh[1]->writes_depth : 0); return; }
+    if (!ps) { draw_skipped(9); static int failed_n; if (failed_n++ < 3) MLOG("[pipeline-draw] rt-depth=%p serial=%llu fmt=%#x pass-depth=%u dt=%u dw=%u fs-depth=%d", R.rt.depth, (unsigned long long)(R.rt.depth ? R.rt.depth->serial : 0), R.rt.depth ? R.rt.depth->d.format : 0, g_pass.dfmt, S.ds.dt, S.ds.dw, pr->sh[1] ? pr->sh[1]->writes_depth : 0); return; }
     if (ps != g_enc_pso) { enc_r_pso(en, ps); g_enc_pso = ps; }
     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
     if (g_dss_dirty || cur_ds_pass != g_pass.serial) { cur_ds = dss_get(g_pass.hd, g_pass.hs); cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }

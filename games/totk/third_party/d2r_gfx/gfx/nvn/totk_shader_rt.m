@@ -171,8 +171,9 @@ static NSMutableArray *variants_of(NSString *shader);
 static NSString *index_path(NSString *shader);
 static NSString *json_string(id obj);
 void mtl_prime_library(NSString *key);   /* nvn_mtl.m */
-static void xlate_run(NSString *shader, NSString *variant, NSString *stage_name, NSString *request, BOOL existed) {
+static void xlate_run(NSString *shader, NSString *variant, NSString *stage_name, NSString *request, BOOL existed, NSData *code, NSString *code_path) {
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (code && ![code writeToFile:code_path atomically:YES]) die("write shader code %s", code_path.UTF8String);   // written here, off the submit thread (upstream 7305d4e)
     dispatch_semaphore_wait(g_xp_sem, DISPATCH_TIME_FOREVER);
     pthread_mutex_lock(&g_xp_mu); int k = 0; while (g_xp[k].busy) k++; g_xp[k].busy = 1; pthread_mutex_unlock(&g_xp_mu);
     if (!g_xp[k].in) service_spawn(&g_xp[k].in, &g_xp[k].out);
@@ -296,7 +297,15 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     NSString *code_path = [totk_rt_dir() stringByAppendingFormat:@"/%@.code", variant];
     // Graphics code drops the 0x30-byte NVN header (the translator wants SPH + instructions); compute keeps it, as in D2R's build.
     size_t skip = stage == 5 ? 0 : 0x30;
-    if (![[NSData dataWithBytes:code + skip length:c1t - skip] writeToFile:code_path atomically:YES]) die("write shader code %s", code_path.UTF8String);
+    /* The guest code goes to <variant>.code for the translator. A variant translated in the background has it written by
+       its job (xlate_run): an atomic file write took 10-30 ms on the submit thread (upstream 7305d4e). TOTK_XLATE_WRITE_SYNC=1
+       writes it here as before. */
+    NSData *code_bytes = [NSData dataWithBytes:code + skip length:c1t - skip];
+#if !TARGET_OS_IPHONE
+    static int write_sync = -1; if (write_sync < 0) { const char *e = getenv("TOTK_XLATE_WRITE_SYNC"); write_sync = e && atoi(e) > 0; }
+    if (!async_ok || write_sync)
+#endif
+    if (![code_bytes writeToFile:code_path atomically:YES]) die("write shader code %s", code_path.UTF8String);
     NSMutableDictionary *rq = [NSMutableDictionary dictionaryWithDictionary:@{@"variant": variant, @"stage": stage_name, @"code": code_path, @"c1": hex(code + c1o, c1t - c1o)}];
     [rq addEntriesFromDictionary:answers];
     if (local) rq[@"local"] = local;
@@ -307,7 +316,8 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
         if (!g_xlate_pending) g_xlate_pending = [NSMutableSet set];
         [g_xlate_pending addObject:variant];
         NSString *request = json_string(rq), *stg = stage_name;
-        dispatch_async(xlate_queue(), ^{ xlate_run(shader, variant, stg, request, existed_); });
+        NSData *job_code = write_sync ? nil : code_bytes;
+        dispatch_async(xlate_queue(), ^{ xlate_run(shader, variant, stg, request, existed_, job_code, code_path); });
         pthread_mutex_unlock(&g_rt_lock);
         return nil;
     }
