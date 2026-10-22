@@ -2088,8 +2088,10 @@ static void x_drain(void) {   // everything queued so far has run (no-op when sy
     atomic_fetch_add(&g_x_drains, 1); atomic_fetch_add(&g_x_drain_ns, now_ns() - t0);
 }
 void nvn_x_drain(void) { x_drain(); }
+uint64_t nvn_x_backlog(void);   // submissions queued for the translation thread and not replayed yet (readback diagnostic)
 static uint64_t x_sub_queued(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); return v; }
 static uint64_t x_sub_ran(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_done; pthread_mutex_unlock(&g_xq_mu); return v; }
+uint64_t nvn_x_backlog(void) { uint64_t q = x_sub_queued(), r = x_sub_ran(); return q > r ? q - r : 0; }
 /* Local change (TOTK_FENCE_LAG, default on; needs the translation thread, TOTK_ASYNC_REPLAY): the game keeps one frame in flight. Its main
    thread waits on the frame fence (game system +0x1d8, fenced by the render thread right after the frame's submit,
    main+0x87ff24) with no timeout (main+0xa91f98), so the frame's whole replay plus its GPU work sat on the main thread's

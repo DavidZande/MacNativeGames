@@ -2539,7 +2539,7 @@ static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); i
    so the result outlives a temporary texture object finalized before the submission runs); an invalidate over its
    memory waits for the GPU and writes every level back in the NVN layout, unless the CPU has written the memory since
    the rendering (then the CPU's bytes are newer). Runtime switch: TOTK_INPUT_FILE "flag writeback 0|1" (default 1). */
-typedef struct { tex_t t; uint64_t stamp; void *obj; uint64_t fence; void *prefetch; uint64_t ready; int why; } wb_ent;   // fence (TOTK): completes once the GPU has finished the newest rendering into it; why: last reason it has no producer snapshot (readback prefetch diagnostics)
+typedef struct { tex_t t; uint64_t stamp; void *obj; uint64_t fence; void *prefetch; uint64_t ready; int why; uint64_t frame; } wb_ent;   // fence (TOTK): completes once the GPU has finished the newest rendering into it; why: last reason it has no producer snapshot (readback prefetch diagnostics)
 static _Atomic unsigned g_wb_snapshots;
 static _Atomic uint64_t g_wb_snapshot_bytes;
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
@@ -2676,7 +2676,7 @@ static void wb_note(const tex_t *t) {
     uint64_t fence = g_fence + 1;
     if (e) { if(e->prefetch){atomic_fetch_sub(&g_wb_snapshots,1);atomic_fetch_sub(&g_wb_snapshot_bytes,[(__bridge id<MTLBuffer>)e->prefetch length]);defer_obj_release((__bridge id)e->prefetch);CFRelease(e->prefetch);e->prefetch=NULL;e->ready=0;} if(e->obj!=(__bridge void *)o){defer_obj_release((__bridge id)e->obj);CFRelease(e->obj);e->obj=(void *)CFBridgingRetain(o);} e->stamp = stamp; e->t = *t; e->fence = fence; e->why = 1; pthread_mutex_unlock(&g_smu); return; }
     e = calloc(1, sizeof *e); if (!e) MDIE("write-back record");
-    e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o); e->fence = fence; e->why = 1;
+    e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o); e->fence = fence; e->why = 1; e->frame = atomic_load(&g_cur_frame);
     nvn_hm_put(&g_wb, &k, e);
     pthread_mutex_unlock(&g_smu);
 }
@@ -2826,15 +2826,85 @@ static void mtl_pool_invalidate_inner(const pool_t *p, uint64_t off, uint64_t n)
 /* Runs on the game's thread (nvnMemoryPoolInvalidateMappedRange), which has no autorelease pool: without one every
    write-back's autoreleased command buffer and blit encoder lived for ever (upstream 635fb31: TOTK's AGXG16GFamilyBuffer /
    BlitContext pairs growing by the thousands per lap; Breath of the Wild 3.7 GB in 30 minutes). */
+/* TOTK diagnostic (2026-10-22, objects vanishing while the camera moves): what the game reads back from the GPU. Per
+   rendered texture layout read through nvnMemoryPoolInvalidateMappedRange: reads, written back, skipped because the CPU
+   wrote the pages since the render, superseded, and the age of the rendering in replay frames; plus invalidates that
+   overlap no rendering (buffers the GPU wrote directly) and the counter reports by type. One [readback] line per 1200
+   frames; TOTK_READBACK_LOG=0 turns it off. */
+static pthread_mutex_t g_rb_mu_early = PTHREAD_MUTEX_INITIALIZER;
+#define g_rb_mu g_rb_mu_early
+typedef struct { uint32_t w, h, fmt, lv; uint64_t reads, back, skip, sup, age_sum, age_max; } rb_row;
+/* Buffer producers: GPU writes into guest memory the replay encoded (storage buffers of dispatches, buffer copies,
+   texture-to-buffer copies), with the fence of their submission. A buffer readback (an invalidate over no rendering)
+   is matched to the newest producer overlapping it: whether that producer's GPU work had completed, and whether the
+   translation thread still had submissions queued (their producers are not encoded yet: the game reads older data). */
+typedef struct { uint64_t lo, hi, fence, frame; char key[9]; } rb_prod_ent;
+static rb_prod_ent g_rbp[1024]; static unsigned g_rbp_i;
+typedef struct { char key[9]; uint64_t reads, unfinished, backlog, bytes; } rb_buf_row;
+static rb_buf_row g_rbb[24]; static int g_rbb_n; static uint64_t g_rb_noprod, g_rb_backlog_any;
+static int rb_on(void);
+static void rb_prod(uint64_t lo, uint64_t n, const char *key) {
+    if (!rb_on() || !n) return;
+    pthread_mutex_lock(&g_rb_mu_early);
+    rb_prod_ent *e = &g_rbp[g_rbp_i++ & 1023]; e->lo = lo; e->hi = lo + n; e->fence = g_fence + 1; e->frame = atomic_load(&g_cur_frame); snprintf(e->key, sizeof e->key, "%s", key ? key : "?");
+    pthread_mutex_unlock(&g_rb_mu_early);
+}
+static rb_row g_rb[24]; static int g_rb_n; static uint64_t g_rb_calls, g_rb_plain, g_rb_plain_bytes, g_rb_f0;
+static int rb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_READBACK_LOG"); v = !(e && !strcmp(e, "0")); } return v; }
+static void rb_note(const tex_t *t, int what, uint64_t age) {   // what: 1 written back, 0 skipped (CPU wrote), 2 superseded
+    if (!rb_on()) return;
+    pthread_mutex_lock(&g_rb_mu);
+    rb_row *r = NULL; for (int i = 0; i < g_rb_n; i++) if (g_rb[i].w == t->d.width && g_rb[i].h == t->d.height && g_rb[i].fmt == t->d.format && g_rb[i].lv == t->d.levels) { r = &g_rb[i]; break; }
+    if (!r && g_rb_n < 24) { r = &g_rb[g_rb_n++]; memset(r, 0, sizeof *r); r->w = t->d.width; r->h = t->d.height; r->fmt = t->d.format; r->lv = t->d.levels; }
+    if (r) { r->reads++; if (what == 1) r->back++; else if (what == 0) r->skip++; else r->sup++; r->age_sum += age; if (age > r->age_max) r->age_max = age; }
+    pthread_mutex_unlock(&g_rb_mu);
+}
+static void rb_call(int overlaps, uint64_t lo_, uint64_t n) {
+    if (!rb_on()) return;
+    pthread_mutex_lock(&g_rb_mu);
+    g_rb_calls++; if (!overlaps) { g_rb_plain++; g_rb_plain_bytes += n; }
+    if (!overlaps) {
+        extern uint64_t nvn_x_backlog(void) __attribute__((weak)); uint64_t bl = nvn_x_backlog ? nvn_x_backlog() : 0; if (bl) g_rb_backlog_any++;
+        const rb_prod_ent *best = NULL;
+        for (unsigned k = 0; k < 1024; k++) { const rb_prod_ent *e = &g_rbp[k]; if (e->hi > lo_ && e->lo < lo_ + n && (!best || e->fence > best->fence)) best = e; }
+        if (!best) g_rb_noprod++;
+        else {
+            rb_buf_row *r = NULL; for (int i = 0; i < g_rbb_n; i++) if (!strcmp(g_rbb[i].key, best->key)) { r = &g_rbb[i]; break; }
+            if (!r && g_rbb_n < 24) { r = &g_rbb[g_rbb_n++]; memset(r, 0, sizeof *r); memcpy(r->key, best->key, sizeof r->key); }
+            if (r) { r->reads++; r->bytes += n; if (!mtl_wait(best->fence, 0)) r->unfinished++; if (bl) r->backlog++; }
+        }
+    }
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (!g_rb_f0) g_rb_f0 = f;
+    if (f >= g_rb_f0 + 1200) {
+        char line[2400]; size_t o = 0; double nf = (double)(f - g_rb_f0);
+        o += snprintf(line + o, sizeof line - o, "[readback] frames %llu-%llu: %.2f invalidates a frame, %.2f with no rendering in range (%.1f KB a frame); counter reports a frame by type:",
+                      (unsigned long long)g_rb_f0, (unsigned long long)f, g_rb_calls / nf, g_rb_plain / nf, g_rb_plain_bytes / nf / 1024);
+        static uint64_t last_rep[32];
+        for (int i = 0; i < 32; i++) { if (g_cnt_report[i] != last_rep[i]) o += snprintf(line + o, sizeof line - o, " %d=%.1f", i, (g_cnt_report[i] - last_rep[i]) / nf); last_rep[i] = g_cnt_report[i]; }
+        MLOG("%s", line);
+        MLOG("[readback]   buffer reads: %llu with no known GPU producer; %llu made while the translation thread still had submissions queued", (unsigned long long)g_rb_noprod, (unsigned long long)g_rb_backlog_any);
+        for (int i = 0; i < g_rbb_n; i++) { const rb_buf_row *r = &g_rbb[i];
+            MLOG("[readback]   buffer written by %s: %.2f reads a frame (%.1f KB), producer GPU work not finished at %llu of %llu reads, translation queue busy at %llu",
+                 r->key, r->reads / nf, r->bytes / nf / 1024, (unsigned long long)r->unfinished, (unsigned long long)r->reads, (unsigned long long)r->backlog); }
+        g_rbb_n = 0; g_rb_noprod = g_rb_backlog_any = 0;
+        for (int i = 0; i < g_rb_n; i++) { const rb_row *r = &g_rb[i];
+            MLOG("[readback]   %ux%u nvnfmt=%#x lv%u: %.2f reads a frame, written back %llu, skipped (CPU wrote since) %llu, superseded %llu; age avg %.1f max %llu frames",
+                 r->w, r->h, r->fmt, r->lv, r->reads / nf, (unsigned long long)r->back, (unsigned long long)r->skip, (unsigned long long)r->sup,
+                 r->reads ? (double)r->age_sum / (double)r->reads : 0, (unsigned long long)r->age_max); }
+        g_rb_n = 0; g_rb_calls = g_rb_plain = g_rb_plain_bytes = 0; g_rb_f0 = f;
+    }
+    pthread_mutex_unlock(&g_rb_mu);
+}
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { @autoreleasepool { mtl_pool_invalidate_inner(p, off, n); } }
 static void mtl_pool_invalidate_inner(const pool_t *p, uint64_t off, uint64_t n) {
     if (!p || !p->mem || !atomic_load(&g_wb_on)) return;
     pthread_mutex_lock(&g_smu);
-    if (!g_wb.n) { pthread_mutex_unlock(&g_smu); return; }
+    if (!g_wb.n) { pthread_mutex_unlock(&g_smu); rb_call(0, (uint64_t)(uintptr_t)(p->mem + off), n); return; }
     const uint8_t *a = p->mem + off, *z = a + n;
     int overlaps=0;
     for(uint32_t i=0;i<g_wb.cap;i++){wb_ent *e=g_wb.vals?g_wb.vals[i]:NULL;if(e&&e->t.mem<z&&e->t.mem+e->t.L.size>a){overlaps=1;break;}}
-    pthread_mutex_unlock(&g_smu);if(!overlaps)return;
+    pthread_mutex_unlock(&g_smu);rb_call(overlaps,(uint64_t)(uintptr_t)a,n);if(!overlaps)return;
     uint64_t i0=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     { extern void nvn_x_drain(void) __attribute__((weak)); if(nvn_x_drain)nvn_x_drain(); }
     uint64_t i1=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -2888,6 +2958,7 @@ static void mtl_pool_invalidate_inner(const pool_t *p, uint64_t off, uint64_t n)
         wb_ent *e = list[i]; const tex_t *t = &e->t;
         id o = (__bridge id)e->obj; id<MTLTexture> mt = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : o;
         uint32_t upf; int ubpp;
+        rb_note(t, fresh[i] == 2 ? 2 : fresh[i] ? 1 : 0, atomic_load(&g_cur_frame) - e->frame);
         if (fresh[i] == 2 || !mt) { wb_ent_free(e); continue; }   // !mt: copy evicted (pkg_evict_sweep) before the GPU rendered into it
         TILELOG(t, "invalidate %#llx+%#llx: %s", (unsigned long long)(uintptr_t)a, (unsigned long long)n, !fresh[i] ? "CPU wrote since the render, skip" : "write back");
         if (tilelog_match(t) && !fresh[i]) {   // who wrote it
@@ -11065,6 +11136,7 @@ static void dispatch(const p_dispatch *dp) {
     g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
     encode_args(ce, cs, 5, 0);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
+    for (int i = 0; i < 16; i++) if (S.ssbo[5][i].addr && S.ssbo[5][i].size) rb_prod(S.ssbo[5][i].addr, S.ssbo[5][i].size, cs->key);   // readback diagnostic: storage it may write
     if (!reuse) enc_c_end(ce);
     bright_lut(cs);   // 3D 画面加亮：游戏算完调色表之后重写 | 3D picture brightening: rewrite after the game finishes computing the color lookup table
     /* TOTK_EXPO_LOG=<file> (diagnostic): after each dispatch of the exposure kernel (ae725063), copy floats 96..127 of its
@@ -11096,6 +11168,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     upd_guard(c->src, c->src + img * nz);   // TOTK: renamed uniform updates before a GPU write to the range
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(31, "贴图→缓冲拷贝的目标不在内存池里"); return; }
     usnap_drop(c->src, img * nz);   // TOTK: a GPU write: no uniform copy of these bytes from here on
+    rb_prod(c->src, img * nz, "tex2buf");
     id<MTL4ComputeCommandEncoder> b = blit();
     if (is3d)
         enc_b_copy_texture_buffer(b, t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset), MTLSizeMake(c->r.width, c->r.height, nz), (__bridge id<MTLBuffer>)mb, mo, row, img);
@@ -11650,7 +11723,7 @@ void mtl_exec(const uint8_t *p) {
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
-                cpend_push(ad, g_fence + 1, 0, t != NVN_COUNTER_TYPE_SAMPLES_PASSED);   // TOTK: value the completion handler will write (counter word)
+                cpend_push(ad, g_fence + 1, 0, t != NVN_COUNTER_TYPE_SAMPLES_PASSED); rb_prod(ad, 16, t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? "query" : "counter");   // TOTK: value the completion handler will write (counter word)
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
                     post_op q = {3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()};
                     if ((long)atomic_load(&g_cur_frame) <= atomic_load(&g_ql_until)) {   // "querylog": the proxy draw's sphere (vertex uniform block 1)
@@ -11668,9 +11741,9 @@ void mtl_exec(const uint8_t *p) {
                     g_vis_on = 1; g_vis_counting = 1; vis_clear(); }
                 break; }
             case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
-                PD("Y copy_b2b cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); mtl_sub_copy(s_, d, n); break; }
+                PD("Y copy_b2b cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); mtl_sub_copy(s_, d, n); rb_prod(d, n, "copy"); break; }
             case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
-                PD("Y update_ub cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)((const uint8_t *)a + 16), (unsigned long long)d, (unsigned long long)n); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
+                PD("Y update_ub cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)((const uint8_t *)a + 16), (unsigned long long)d, (unsigned long long)n); mtl_sub_update((const uint8_t *)a + 16, d, n); rb_prod(d, n, "update"); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a;
                 g_cg.rt_seq++; if (g_cg_pending && !cg_rt_match(r)) { g_cg.reason[0]++; cg_flush(); }   // TOTK: a target that is not a cube face set lands the pending groups
