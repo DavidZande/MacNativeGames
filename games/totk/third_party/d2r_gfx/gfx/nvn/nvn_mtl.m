@@ -2134,6 +2134,10 @@ static void chunk_cfg(void) {
 }
 uint64_t mtl_chunk_commits(void) { return g_chunk_commits; }
 void mtl_blit_stats(uint64_t v[6]) { v[0] = g_blit_opens; v[1] = g_blit_splits; v[2] = g_upd_n; v[3] = g_upd_split; v[4] = g_copy_n; v[5] = g_copy_split; }
+/* Mid-submission commits are numbered (g_split_seq); g_split_done is the highest one the GPU has completed, so
+   TOTK_LAG_READBACK=2 can wait for the commit that ends right after a producer dispatch (see rb_lag_wait). */
+static uint64_t g_split_seq; static _Atomic uint64_t g_split_done;
+static pthread_mutex_t g_split_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_split_cv = PTHREAD_COND_INITIALIZER;
 static void mtl_sub_split(void) {
     uint64_t fc0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int fc_first = g_sub_chunks == 0;
     rs_sync();   // TOTK: the encode stage must have finished every pass of this command buffer
@@ -2143,9 +2147,10 @@ static void mtl_sub_split(void) {
     res_commit();
     uint64_t fc3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t gpu_f = atomic_load(&g_cur_frame), fence_next = g_fence + 1; gpu_tag_begin(gpu_f);
-    TotkCommitOptions *o = [TotkCommitOptions new];
+    TotkCommitOptions *o = [TotkCommitOptions new]; uint64_t split_seq = ++g_split_seq;
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         gpu_tag_done(gpu_f, f.GPUStartTime, f.GPUEndTime);
+        pthread_mutex_lock(&g_split_mu); if (split_seq > atomic_load(&g_split_done)) atomic_store(&g_split_done, split_seq); pthread_cond_broadcast(&g_split_cv); pthread_mutex_unlock(&g_split_mu);
         if (f.error) { atomic_store(&g_last_commit_error, 1); static int n; if (n++ < 8) MLOG("【红】分段命令缓冲错误 fence=%llu：%s", (unsigned long long)fence_next, f.error.description.UTF8String); }
     }];
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 0);
@@ -2838,17 +2843,27 @@ typedef struct { uint32_t w, h, fmt, lv; uint64_t reads, back, skip, sup, age_su
    texture-to-buffer copies), with the fence of their submission. A buffer readback (an invalidate over no rendering)
    is matched to the newest producer overlapping it: whether that producer's GPU work had completed, and whether the
    translation thread still had submissions queued (their producers are not encoded yet: the game reads older data). */
-typedef struct { uint64_t lo, hi, fence, frame; char key[9]; } rb_prod_ent;
-static rb_prod_ent g_rbp[1024]; static unsigned g_rbp_i;
+typedef struct { uint64_t lo, hi, fence, frame, sub, seq; char key[9]; } rb_prod_ent;   // sub: the game's submission; seq: the early commit after it (0 none)
+#define RBP_N 4096
+static rb_prod_ent g_rbp[RBP_N]; static unsigned g_rbp_i;
 typedef struct { char key[9]; uint64_t reads, unfinished, backlog, bytes; } rb_buf_row;
 static rb_buf_row g_rbb[24]; static int g_rbb_n; static uint64_t g_rb_noprod, g_rb_backlog_any;
 static int rb_on(void);
-extern int nvn_lag_readback_on(void) __attribute__((weak)), nvn_lag_readback_wait(uint64_t *ns) __attribute__((weak));
+extern int nvn_lag_readback_on(void) __attribute__((weak)), nvn_lag_readback_wait(uint64_t *ns) __attribute__((weak)), nvn_lag_readback_mode(void) __attribute__((weak)), nvn_token_done(uint64_t) __attribute__((weak));
+extern uint64_t nvn_lag_real_token(void) __attribute__((weak)), nvn_replay_sub(void) __attribute__((weak)), nvn_xsub_done(void) __attribute__((weak));
 static int rb_lag_on(void) { return nvn_lag_readback_on && nvn_lag_readback_on(); }
-static void rb_prod(uint64_t lo, uint64_t n, const char *key) {
-    if ((!rb_on() && !rb_lag_on()) || !n) return;
+static int rb_lag2_on(void) { return nvn_lag_readback_mode && nvn_lag_readback_mode() == 2; }
+/* TOTK_LAG_READBACK=2: compute shaders whose storage the game read back before the GPU had finished it. Their dispatches
+   end a command buffer at once (mtl_sub_split), so a readback waits only for that early commit. */
+static char g_rb_early[16][9]; static int g_rb_nearly;
+static int rb_early(const char *key) { for (int i = 0; i < g_rb_nearly; i++) if (!strncmp(g_rb_early[i], key, 8)) return 1; return 0; }
+static void rb_prod_seq(uint64_t lo, uint64_t n, const char *key, uint64_t seq);
+static void rb_prod(uint64_t lo, uint64_t n, const char *key) { rb_prod_seq(lo, n, key, 0); }
+static void rb_prod_seq(uint64_t lo, uint64_t n, const char *key, uint64_t seq) {
+    if ((!rb_on() && !rb_lag_on() && !rb_lag2_on()) || !n) return;
     pthread_mutex_lock(&g_rb_mu_early);
-    rb_prod_ent *e = &g_rbp[g_rbp_i++ & 1023]; e->lo = lo; e->hi = lo + n; e->fence = g_fence + 1; e->frame = atomic_load(&g_cur_frame); snprintf(e->key, sizeof e->key, "%s", key ? key : "?");
+    rb_prod_ent *e = &g_rbp[g_rbp_i++ % RBP_N]; e->lo = lo; e->hi = lo + n; e->fence = g_fence + 1; e->frame = atomic_load(&g_cur_frame); e->seq = seq;
+    e->sub = nvn_replay_sub ? nvn_replay_sub() : 0; snprintf(e->key, sizeof e->key, "%s", key ? key : "?");
     pthread_mutex_unlock(&g_rb_mu_early);
 }
 static rb_row g_rb[24]; static int g_rb_n; static uint64_t g_rb_calls, g_rb_plain, g_rb_plain_bytes, g_rb_f0;
@@ -2864,11 +2879,53 @@ static void rb_note(const tex_t *t, int what, uint64_t age) {   // what: 1 writt
 /* TOTK_LAG_READBACK (hle_nvn.c): a buffer readback over memory a GPU command writes waits for the frame fence the lagged
    wait skipped. Called on the game's thread before the bytes are read. */
 static uint64_t g_rbl_waits, g_rbl_ns, g_rbl_checked;
+static uint64_t g_rbl2_waits, g_rbl2_ns, g_rbl2_full, g_rbl2_learned;
+/* TOTK_LAG_READBACK=2: wait for the newest GPU write of this range in the submissions up to the one the lagged frame
+   wait skipped (token T): first for the replay to have encoded it (it may still be queued), then for the early commit
+   after it, or the end of its submission for producers not learned yet (and learn them). */
+static void rb_lag2_wait(uint64_t lo, uint64_t n) {
+    uint64_t T = nvn_lag_real_token ? nvn_lag_real_token() : 0;
+    if (!T || nvn_token_done(T)) return;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); rb_prod_ent best; int have = 0, hit = 0;
+    for (;;) {
+        have = hit = 0;
+        pthread_mutex_lock(&g_rb_mu);
+        for (unsigned k = 0; k < RBP_N; k++) { const rb_prod_ent *e = &g_rbp[k];
+            if (!(e->hi > lo && e->lo < lo + n)) continue; hit = 1;
+            if (!e->sub || e->sub > T) continue;
+            if (!have || e->sub > best.sub || (e->sub == best.sub && (e->seq > best.seq || e->fence > best.fence))) { best = *e; have = 1; } }
+        pthread_mutex_unlock(&g_rb_mu);
+        if (!hit) return;
+        uint64_t rs = nvn_replay_sub(); int passed = nvn_xsub_done() >= T || rs > T;
+        if (have && (best.sub == T || passed)) break;
+        if (passed) return;
+        if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0 > 200000000ull) { nvn_token_done(T); return; }
+        usleep(50);
+    }
+    if (best.seq) {
+        pthread_mutex_lock(&g_split_mu);
+        while (atomic_load(&g_split_done) < best.seq) { struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 2000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+            pthread_cond_timedwait(&g_split_cv, &g_split_mu, &dl); if (mtl_wait(best.fence, 0)) break; }
+        pthread_mutex_unlock(&g_split_mu);
+    } else {
+        int done = mtl_wait(best.fence, 0);
+        if (!done) {
+            if (strlen(best.key) == 8 && strcmp(best.key, "tex2buf") && !rb_early(best.key) && g_rb_nearly < 16) {   // a dispatch: commit right after it from now on
+                pthread_mutex_lock(&g_rb_mu); if (!rb_early(best.key) && g_rb_nearly < 16) { snprintf(g_rb_early[g_rb_nearly], 9, "%s", best.key); g_rb_nearly++; g_rbl2_learned++;
+                    MLOG("[readback] TOTK_LAG_READBACK=2: compute shader %s writes what the game reads back; its dispatches end a command buffer from now on", best.key); }
+                pthread_mutex_unlock(&g_rb_mu); }
+            mtl_wait(best.fence, 2000000000ull); g_rbl2_full++;
+        }
+    }
+    uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    pthread_mutex_lock(&g_rb_mu); g_rbl2_waits++; g_rbl2_ns += dt; pthread_mutex_unlock(&g_rb_mu);
+}
 static void rb_lag_wait(uint64_t lo, uint64_t n) {
+    if (rb_lag2_on()) { rb_lag2_wait(lo, n); return; }
     if (!rb_lag_on()) return;
     int hit = 0;
     pthread_mutex_lock(&g_rb_mu);
-    for (unsigned k = 0; k < 1024 && !hit; k++) { const rb_prod_ent *e = &g_rbp[k]; hit = e->hi > lo && e->lo < lo + n; }
+    for (unsigned k = 0; k < RBP_N && !hit; k++) { const rb_prod_ent *e = &g_rbp[k]; hit = e->hi > lo && e->lo < lo + n; }
     g_rbl_checked++;
     pthread_mutex_unlock(&g_rb_mu);
     if (!hit) return;
@@ -2882,7 +2939,7 @@ static void rb_call(int overlaps, uint64_t lo_, uint64_t n) {
     if (!overlaps) {
         extern uint64_t nvn_x_backlog(void) __attribute__((weak)); uint64_t bl = nvn_x_backlog ? nvn_x_backlog() : 0; if (bl) g_rb_backlog_any++;
         const rb_prod_ent *best = NULL;
-        for (unsigned k = 0; k < 1024; k++) { const rb_prod_ent *e = &g_rbp[k]; if (e->hi > lo_ && e->lo < lo_ + n && (!best || e->fence > best->fence)) best = e; }
+        for (unsigned k = 0; k < RBP_N; k++) { const rb_prod_ent *e = &g_rbp[k]; if (e->hi > lo_ && e->lo < lo_ + n && (!best || e->fence > best->fence)) best = e; }
         if (!best) g_rb_noprod++;
         else {
             rb_buf_row *r = NULL; for (int i = 0; i < g_rbb_n; i++) if (!strcmp(g_rbb[i].key, best->key)) { r = &g_rbb[i]; break; }
@@ -2902,6 +2959,9 @@ static void rb_call(int overlaps, uint64_t lo_, uint64_t n) {
         MLOG("[readback]   buffer reads: %llu with no known GPU producer; %llu made while the translation thread still had submissions queued; lagged-fence waits %llu of %llu checked (%.2f ms a frame)", (unsigned long long)g_rb_noprod, (unsigned long long)g_rb_backlog_any,
              (unsigned long long)g_rbl_waits, (unsigned long long)g_rbl_checked, g_rbl_ns / 1e6 / nf);
         g_rbl_waits = g_rbl_ns = g_rbl_checked = 0;
+        if (rb_lag2_on()) MLOG("[readback]   TOTK_LAG_READBACK=2: %llu waits (%.2f ms a frame), %llu of them for a whole submission; %d producer shaders commit early",
+                               (unsigned long long)g_rbl2_waits, g_rbl2_ns / 1e6 / nf, (unsigned long long)g_rbl2_full, g_rb_nearly);
+        g_rbl2_waits = g_rbl2_ns = g_rbl2_full = 0;
         for (int i = 0; i < g_rbb_n; i++) { const rb_buf_row *r = &g_rbb[i];
             MLOG("[readback]   buffer written by %s: %.2f reads a frame (%.1f KB), producer GPU work not finished at %llu of %llu reads, translation queue busy at %llu",
                  r->key, r->reads / nf, r->bytes / nf / 1024, (unsigned long long)r->unfinished, (unsigned long long)r->reads, (unsigned long long)r->backlog); }
@@ -11154,7 +11214,10 @@ static void dispatch(const p_dispatch *dp) {
     g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
     encode_args(ce, cs, 5, 0);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
-    for (int i = 0; i < 16; i++) if (S.ssbo[5][i].addr && S.ssbo[5][i].size) rb_prod(S.ssbo[5][i].addr, S.ssbo[5][i].size, cs->key);   // readback diagnostic: storage it may write
+    { int early = reuse && rb_lag2_on() && rb_early(cs->key) && g_cb && !g_enc && !g_frz_on && !tbdr_on() && !pt_active();   // TOTK_LAG_READBACK=2: commit right after it
+      uint64_t seq = early ? g_split_seq + 1 : 0;
+      for (int i = 0; i < 16; i++) if (S.ssbo[5][i].addr && S.ssbo[5][i].size) rb_prod_seq(S.ssbo[5][i].addr, S.ssbo[5][i].size, cs->key, seq);   // storage it may write
+      if (early) { if (g_blit) { enc_b_end(g_blit); g_blit = nil; } mtl_sub_split(); } }
     if (!reuse) enc_c_end(ce);
     bright_lut(cs);   // 3D 画面加亮：游戏算完调色表之后重写 | 3D picture brightening: rewrite after the game finishes computing the color lookup table
     /* TOTK_EXPO_LOG=<file> (diagnostic): after each dispatch of the exposure kernel (ae725063), copy floats 96..127 of its

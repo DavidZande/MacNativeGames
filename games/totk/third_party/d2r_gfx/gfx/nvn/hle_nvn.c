@@ -1962,6 +1962,7 @@ typedef struct { int kind, n; uint64_t *h; void *ucap; void *ssan; win_t *win; i
 #define XF 4096
 static xjob g_xq[XQ];
 static uint64_t g_xq_in, g_xq_done, g_xsub_in, g_xsub_done, g_xsub_fence[XF];
+static _Atomic uint64_t g_replay_sub;   // the submission the translation thread is replaying (0 idle; TOTK_LAG_READBACK=2)
 static pthread_mutex_t g_xq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_xq_cv = PTHREAD_COND_INITIALIZER;
 static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swapchain image's last present (TOTK has one window)
@@ -2028,7 +2029,7 @@ static void *x_thread(void *unused) {
         uint64_t queued = g_xq_in - g_xq_done;   // entries still waiting behind this one
         pthread_mutex_unlock(&g_xq_mu);
         uint64_t x0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), xc0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
-        if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap, j.ssan); free(j.h); }
+        if (j.kind == XJ_SUBMIT) { atomic_store(&g_replay_sub, j.sub); submit_exec(j.n, j.h, j.ucap, j.ssan); free(j.h); atomic_store(&g_replay_sub, 0); }
         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
         else {
             // Real-time like the game's render thread that used to replay (set at acquire): otherwise the game's ~50
@@ -2100,8 +2101,19 @@ static uint64_t x_sub_ran(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_x
    placement the lagged wait skipped. Returns 1 when it had to wait; the time is added to *ns.
    Off by default: the game reads these buffers right after its frame wait, so the wait gives back the whole lag (bench at
    the player's shrine save, 900p: 101 -> 59 FPS in the world, fence lag off 61) while the early reads drop 83% -> 20%. */
-static int lag_readback_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_LAG_READBACK"); v = e && atoi(e) > 0; if (v) LOG("[nvn] buffer readbacks wait for the lagged frame fence (TOTK_LAG_READBACK=1)"); } return v; }
-int nvn_lag_readback_on(void) { return fence_lag_active() && lag_readback_on(); }
+static _Atomic int g_lag_rb = -1;   // TOTK_LAG_READBACK at start, then the settings window's Diagnostics switch (nvn_lag_readback_set)
+static int lag_readback_on(void) { int v = atomic_load_explicit(&g_lag_rb, memory_order_relaxed); if (v < 0) { const char *e = getenv("TOTK_LAG_READBACK"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 0;
+    if (v) LOG("[nvn] buffer readbacks wait for %s (TOTK_LAG_READBACK=%d)", v == 2 ? "their producer's early commit in the frame the lagged wait skipped" : "the lagged frame fence", v); atomic_store(&g_lag_rb, v); } return v; }
+void nvn_lag_readback_set(int v) { if (v < 0 || v > 2) v = 0; atomic_store(&g_lag_rb, v); LOG("[nvn] buffer readbacks (settings): mode %d", v); }
+int nvn_lag_readback_get(void) { return lag_readback_on(); }
+/* For TOTK_LAG_READBACK=2 (nvn_mtl.m rb_lag_wait): the mode while the lag is active, the token of the frame fence the last
+   lagged wait skipped (0 without the translation thread), whether a token's GPU work is done, and the replay's progress. */
+int nvn_lag_readback_mode(void) { return fence_lag_active() ? lag_readback_on() : 0; }
+uint64_t nvn_lag_real_token(void) { uint64_t r = atomic_load(&g_lag_real); return r & 1 ? r >> 1 : 0; }
+int nvn_token_done(uint64_t k) { return fence_wait(k, 0); }
+uint64_t nvn_replay_sub(void) { return atomic_load(&g_replay_sub); }
+uint64_t nvn_xsub_done(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_done; pthread_mutex_unlock(&g_xq_mu); return v; }
+int nvn_lag_readback_on(void) { return fence_lag_active() && lag_readback_on() == 1; }
 int nvn_lag_readback_wait(uint64_t *ns) {
     if (!nvn_lag_readback_on()) return 0;
     uint64_t r = atomic_load(&g_lag_real), k = r >> 1; int tok = r & 1;
