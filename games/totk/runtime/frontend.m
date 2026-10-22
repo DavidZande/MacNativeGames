@@ -397,6 +397,7 @@ void *runtime_front_override(const char *name){
    paths as keys 3, 2 and 1, and the window follows those keys (polled while it is open, saved every second). */
 int mfx_requested(void);                    /* gfx/nvn/totk_mfx.m */
 void dm_gfx_set_flag(const char *name,int value);
+int dm_gfx_occl_visible(void);void dm_nvn_fence_lag_set(int v);int dm_nvn_fence_lag_on(void);   /* Diagnostics tab */
 int fps_overlay_hints_enabled(void);        /* gfx/nvn/fps_overlay.c */
 int mfxup_enabled(void);                    /* gfx/nvn/totk_mfx_up.m: MetalFX render upscale */
 void runtime_gamepad_config(int nintendo,double deadzone);   /* runtime/gamepad.m */
@@ -405,7 +406,7 @@ static NSUserDefaults *settings_defaults(void){
  dispatch_once(&once,^{d=[[NSUserDefaults alloc] initWithSuiteName:@"org.macnativegames.totk.settings"];
   [d registerDefaults:@{@"mode":@"docked",@"renderRes":@"900",@"metalfxUpscale":@NO,@"perfLog":@YES,@"asyncCompile":@YES,@"pauseHidden":@YES,@"padLayout":@"labels",@"padDeadzone":@0.12,@"customWidth":@1600,@"customHeight":@900,@"fpsCap":@"unlimited",@"pictureMode":@0,
    @"interpolation":@0,@"showHints":@YES,@"fpsCounter":@YES,@"shaderCounter":@YES,@"loadCounter":@YES,@"startFullscreen":@YES,
-   @"warmThreads":@0,@"aliasGiB":@8}];});
+   @"warmThreads":@0,@"aliasGiB":@8,@"fenceLag":@YES}];});
  return d;
 }
 static NSArray<NSString *> *startup_keys(void){return @[@"mode",@"renderRes",@"customWidth",@"customHeight",@"perfLog",@"asyncCompile",@"pauseHidden",@"fpsCap",@"fpsCounter",@"shaderCounter",@"loadCounter",@"warmThreads",@"aliasGiB"];}
@@ -421,6 +422,7 @@ static void settings_apply_live(void){
  if(interp>=0&&interp<=3&&mfx_requested()!=interp)dm_gfx_set_flag("mfx_interp",interp);
  if(!![d boolForKey:@"showHints"]!=!!fps_overlay_hints_enabled())runtime_shortcut_help_toggle();
  if(!![d boolForKey:@"metalfxUpscale"]!=!!mfxup_enabled())dm_gfx_set_flag("mfx_upscale",[d boolForKey:@"metalfxUpscale"]);
+ if(!getenv("TOTK_FENCE_LAG")&&!![d boolForKey:@"fenceLag"]!=!!dm_nvn_fence_lag_on())dm_nvn_fence_lag_set([d boolForKey:@"fenceLag"]);   /* an explicit TOTK_FENCE_LAG wins */
  liveApplied=1;
 }
 @interface TOTKSettings:NSObject<NSWindowDelegate>
@@ -430,7 +432,7 @@ static void settings_apply_live(void){
 @property(strong) NSPopUpButton *backups,*padLayout;
 @property(strong) NSSlider *deadzone;
 @property(strong) NSTextField *deadzoneValue;
-@property(strong) NSButton *pauseHidden,*asyncCompile,*metalfx,*perfLog,*hints,*fpsCounter,*shaderCounter,*loadCounter,*fullscreen,*restart;
+@property(strong) NSButton *pauseHidden,*asyncCompile,*metalfx,*perfLog,*hints,*fpsCounter,*shaderCounter,*loadCounter,*fullscreen,*restart,*occlVisible,*fenceLag;
 @property(strong) NSTimer *timer;
 @end
 static TOTKSettings *settings;
@@ -473,6 +475,7 @@ static NSTextField *label(NSString *text){return [NSTextField labelWithString:te
  self.fullscreen=check(@"Start in full screen",self);
  self.threads=popup(@[@"Automatic (performance cores)",@"1 (no parallel warm-up)",@"2",@"4",@"8"],self);
  self.gib=popup(@[@"4 GiB",@"8 GiB (default)",@"12 GiB"],self);
+ self.occlVisible=check(@"Draw every object the game culls by occlusion",self);self.fenceLag=check(@"Run one frame ahead of the GPU (frame fence lag)",self);
  NSButton *reset=[NSButton buttonWithTitle:@"Reset All Settings" target:self action:@selector(resetAll:)];
  NSTabView *tabs=[NSTabView new];
  NSArray *tabSpecs=@[
@@ -500,7 +503,10 @@ static NSTextField *label(NSString *text){return [NSTextField labelWithString:te
     @[label(@"Logging:"),self.perfLog],@[[NSGridCell emptyContentView],note_label(@"One line a second in ~/Library/Logs/MacNativeGames/perf.csv. Applies on next launch.")],
     @[label(@"Warm-up threads:"),self.threads],@[label(@"Memory block:"),self.gib],
     @[[NSGridCell emptyContentView],note_label(@"The game's alias memory region. 8 GiB fits macOS 27; larger values may not. Applies on next launch.")],
-    @[[NSGridCell emptyContentView],reset]])]];
+    @[[NSGridCell emptyContentView],reset]])],
+  @[@"Diagnostics",grid(@[@[note_label(@"For finding rendering problems. Both apply immediately.")],
+    @[label(@"Culling:"),self.occlVisible],@[[NSGridCell emptyContentView],note_label(@"Objects that vanish for a frame while the camera moves: if they stay with this on, the game's occlusion culling hid them. Draws more, so it costs some speed. Off again at every launch.")],
+    @[label(@"Frame pacing:"),self.fenceLag],@[[NSGridCell emptyContentView],note_label(@"On (default): faster in busy areas, but the game sees GPU results one frame later. Off: the Switch's timing. Kept for the next launch.")]])]];
  for(NSArray *t in tabSpecs){NSTabViewItem *i=[NSTabViewItem tabViewItemWithViewController:[NSViewController new]];i.label=t[0];i.view=t[1];[tabs addTabViewItem:i];}
  self.restartNote=note_label(@"Some changes apply on next launch.");
  self.restart=[NSButton buttonWithTitle:@"Restart Game" target:self action:@selector(restartGame:)];
@@ -541,6 +547,7 @@ static NSTextField *label(NSString *text){return [NSTextField labelWithString:te
  int mode=runtime_output_mode_get(),interp=mfx_requested(),hints=fps_overlay_hints_enabled();
  self.picture.enabled=mode>=0;[self.picture selectItemAtIndex:mode>=0?mode:[d integerForKey:@"pictureMode"]];
  [self.interp selectItemAtIndex:interp>=0&&interp<=3?interp:0];self.hints.state=hints;self.metalfx.state=mfxup_enabled();
+ self.occlVisible.state=dm_gfx_occl_visible();self.fenceLag.state=dm_nvn_fence_lag_on();
  if(!liveApplied)return;
  if(mode>=0&&[d integerForKey:@"pictureMode"]!=mode)[d setInteger:mode forKey:@"pictureMode"];
  if([d integerForKey:@"interpolation"]!=interp)[d setInteger:interp forKey:@"interpolation"];
@@ -577,6 +584,8 @@ static NSTextField *label(NSString *text){return [NSTextField labelWithString:te
  else if(sender==self.loadCounter)[d setBool:self.loadCounter.state==NSControlStateValueOn forKey:@"loadCounter"];
  else if(sender==self.fullscreen)[d setBool:self.fullscreen.state==NSControlStateValueOn forKey:@"startFullscreen"];
  else if(sender==self.threads)[d setInteger:[@[@0,@1,@2,@4,@8][(NSUInteger)self.threads.indexOfSelectedItem] integerValue] forKey:@"warmThreads"];
+ else if(sender==self.occlVisible)dm_gfx_set_flag("occl_visible",self.occlVisible.state==NSControlStateValueOn);
+ else if(sender==self.fenceLag){BOOL on=self.fenceLag.state==NSControlStateValueOn;[d setBool:on forKey:@"fenceLag"];dm_nvn_fence_lag_set(on);}
  else if(sender==self.gib)[d setInteger:[@[@4,@8,@12][(NSUInteger)self.gib.indexOfSelectedItem] integerValue] forKey:@"aliasGiB"];
  fprintf(stderr,"[totk] settings: changed\n");
  [self refresh];
@@ -586,7 +595,7 @@ static NSTextField *label(NSString *text){return [NSTextField labelWithString:te
  [a addButtonWithTitle:@"Reset"];[a addButtonWithTitle:@"Cancel"];
  if([a runModal]!=NSAlertFirstButtonReturn)return;
  NSUserDefaults *d=settings_defaults();for(NSString *k in d.dictionaryRepresentation.allKeys)[d removeObjectForKey:k];
- runtime_output_mode_set(0);dm_gfx_set_flag("mfx_interp",0);dm_gfx_set_flag("mfx_upscale",0);if(!fps_overlay_hints_enabled())runtime_shortcut_help_toggle();
+ runtime_output_mode_set(0);dm_gfx_set_flag("mfx_interp",0);dm_gfx_set_flag("occl_visible",0);dm_nvn_fence_lag_set(1);dm_gfx_set_flag("mfx_upscale",0);if(!fps_overlay_hints_enabled())runtime_shortcut_help_toggle();
  [self load];
 }
 /* Quit like the window's close button (a save in progress is finished first), then open the app again. */

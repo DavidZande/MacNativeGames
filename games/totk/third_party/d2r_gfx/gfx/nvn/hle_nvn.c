@@ -562,11 +562,13 @@ static int sync_chain_left(int k) {
     return lim > 0 && g_frame >= from && atomic_fetch_add(&used[k], 1) < lim;
 }
 static int fence_lag_on(void);
+static int fence_lag_active(void);
+static int async_replay(void);
 static struct { int fenced; uint64_t fence; } g_lag_prev;   /* TOTK_FENCE_LAG: the frame fence's previous placement */
 static uint64_t g_lag_waits, g_lag_early;
 static int is_frame_fence(const NVNsync *s) { return g_game_sys && (uintptr_t)s == *(const uintptr_t *)(uintptr_t)(g_game_sys + 0x1d8); }
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; int tok; uint64_t v = fence_now(&tok);
-    if (fence_lag_on() && is_frame_fence(s)) { g_lag_prev.fenced = ((sync_t *)s)->fenced; g_lag_prev.fence = ((sync_t *)s)->fence; }
+    if (async_replay() && is_frame_fence(s)) { g_lag_prev.fenced = ((sync_t *)s)->fenced; g_lag_prev.fence = ((sync_t *)s)->fence; }
     ((sync_t *)s)->fenced = tok ? 5 : 1; ((sync_t *)s)->fence = v;
     if (sync_chain_left(0)) { char w[96]; snprintf(w, sizeof w, "FenceSync sync=%p fence=%llu cond=%d flags=%d", (void *)s, (unsigned long long)v, (int)c, f); guest_chain(w); } }
 // 没围栏过的同步对象按真机行为等到超时；已围栏的只在 GPU 真正完成到该栅栏值后放行
@@ -580,7 +582,7 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     sync_t lag;   /* TOTK_FENCE_LAG: the frame fence waits for the previous frame's placement instead */
-    if (fence_lag_on() && is_frame_fence(s) && g_lag_prev.fenced) {
+    if (fence_lag_active() && is_frame_fence(s) && g_lag_prev.fenced) {
         lag = (sync_t){o->magic, g_lag_prev.fenced, g_lag_prev.fence}; o = &lag; g_lag_waits++;
         if ((g_lag_waits & 1023) == 1) LOG("[nvn] fence lag: %llu frame-fence waits answered one frame late, %llu of them before the current frame's fence", (unsigned long long)g_lag_waits, (unsigned long long)g_lag_early);
         int ctok = (((const sync_t *)s)->fenced & 4) != 0; if (!(ctok ? fence_wait(((const sync_t *)s)->fence, 0) : mtl_wait(((const sync_t *)s)->fence, 0))) g_lag_early++;
@@ -2100,9 +2102,15 @@ static int fence_lag_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_FENCE_LAG"); int want = !(e && !atoi(e)); v = want && async_replay(); LOG("[nvn] frame fence one frame late (TOTK_FENCE_LAG, =0 off): %s", v ? "on" : want ? "off (needs TOTK_ASYNC_REPLAY)" : "off"); }
     return v;
 }   // for the graphics layer (pool invalidate write-back)
+/* Whether the frame fence is answered one frame late right now: TOTK_FENCE_LAG at start, then the settings window's
+   Diagnostics switch (dm_nvn_fence_lag_set). The previous placement is recorded whenever the translation thread runs,
+   so it can be turned on and off while the game runs; off, the next wait simply waits for the current frame. */
+static _Atomic int g_lag_live = -1;
+static int fence_lag_active(void) { int v = atomic_load_explicit(&g_lag_live, memory_order_relaxed); if (v < 0) { v = fence_lag_on(); atomic_store(&g_lag_live, v); } return v; }
+void dm_nvn_fence_lag_set(int v) { (void)fence_lag_active(); v = v && async_replay(); atomic_store(&g_lag_live, v); LOG("[nvn] frame fence one frame late: %s (settings)", v ? "on" : "off"); }
 /* TOTK_FLIGHT: the effective states of the two switches that default on, for event.txt (totk_flight.h). */
 int dm_nvn_async_on(void) { return async_replay(); }
-int dm_nvn_fence_lag_on(void) { return fence_lag_on(); }
+int dm_nvn_fence_lag_on(void) { return fence_lag_active(); }
 // Fence token for FenceSync: submits enqueued so far (async) or the Metal fence (synchronous).
 static uint64_t fence_now(int *token) {
     if (!async_replay()) { *token = 0; return mtl_last_fence(); }
