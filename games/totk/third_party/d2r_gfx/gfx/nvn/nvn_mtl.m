@@ -1233,6 +1233,12 @@ static void pt_mark(id cb, char kind, MTL4RenderPassDescriptor *d) {
     if (dt) { p->depth = (uint32_t)dt.pixelFormat; if (!p->nc) { p->w = (uint32_t)dt.width; p->h = (uint32_t)dt.height; }
               p->nload += d.depthAttachment.texture && d.depthAttachment.loadAction == MTLLoadActionLoad; p->nstore += d.depthAttachment.texture && d.depthAttachment.storeAction == MTLStoreActionStore; }
 }
+/* A profiled dispatch (TOTK_PASS_GPU frames encode each dispatch in an encoder of its own, see dispatch()): its compute
+   shader key, and in the w / h columns its threadgroup count and threads per group. */
+static void pt_note_dispatch(const char *key, uint32_t groups, uint32_t threads) {
+    if (!g_pt_heap || !g_pt_n || g_pt[g_pt_n - 1].kind != 'C') return;
+    pt_ent *p = &g_pt[g_pt_n - 1]; if (key) snprintf(p->key, 9, "%s", key); p->w = groups; p->h = threads;
+}
 static void pt_note_key(const char *key) { if (g_pt_key_pending && g_pt_n && key) { memcpy(g_pt[g_pt_n - 1].key, key, 8); g_pt[g_pt_n - 1].key[8] = 0; g_pt_key_pending = 0; } }
 // Final stamp of a profiled submission and its report on completion (adds a feedback handler to o).
 static void pt_finish(id cb, TotkCommitOptions *o, uint64_t frame) {
@@ -11039,6 +11045,7 @@ static void dispatch(const p_dispatch *dp) {
         }
         rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
         id<MTLComputeCommandEncoder> ce = pg_compute();
+        if (pt_active()) pt_note_dispatch(cs->builtin, (uint32_t)(dp->x * dp->y * dp->z), 32);
         enc_c_pso(ce, ps);
         enc_c_args(ce, ((__bridge id<MTLBuffer>)ub).gpuAddress + uo, 0); enc_c_args(ce, ((__bridge id<MTLBuffer>)sb).gpuAddress + so, 1); enc_c_args(ce, ((__bridge id<MTLBuffer>)db).gpuAddress + dof, 2);   // 内嵌计算核：冷路径，直接取地址 | Built-in compute kernel: cold path, take the addresses directly
         enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(32, 1, 1));
@@ -11048,10 +11055,12 @@ static void dispatch(const p_dispatch *dp) {
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "计算着色器缺线程组大小反射"); return; }
     rp_end();
-    int reuse = disp_reuse_on() && !pg_on();
+    int prof = pt_active();   // TOTK_PASS_GPU frames: one encoder per dispatch, so each gets its own time and shader key
+    int reuse = disp_reuse_on() && !pg_on() && !prof;
     id<MTLComputeCommandEncoder> ce;
     if (reuse) ce = disp_enc();
     else { if (g_blit) { enc_b_end(g_blit); g_blit = nil; } ce = pg_compute(); }
+    if (prof) pt_note_dispatch(cs->key, (uint32_t)(dp->x * dp->y * dp->z), (uint32_t)(tg[0] * tg[1] * tg[2]));
     enc_c_pso(ce, ps);
     g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
     encode_args(ce, cs, 5, 0);
