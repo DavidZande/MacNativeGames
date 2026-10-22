@@ -406,7 +406,7 @@ static NSUserDefaults *settings_defaults(void){
  dispatch_once(&once,^{d=[[NSUserDefaults alloc] initWithSuiteName:@"org.macnativegames.totk.settings"];
   [d registerDefaults:@{@"mode":@"docked",@"renderRes":@"900",@"metalfxUpscale":@NO,@"perfLog":@YES,@"asyncCompile":@YES,@"pauseHidden":@YES,@"padLayout":@"labels",@"padDeadzone":@0.12,@"customWidth":@1600,@"customHeight":@900,@"fpsCap":@"unlimited",@"pictureMode":@0,
    @"interpolation":@0,@"showHints":@YES,@"fpsCounter":@YES,@"shaderCounter":@YES,@"loadCounter":@YES,@"startFullscreen":@YES,
-   @"warmThreads":@0,@"aliasGiB":@8,@"fenceLag":@YES,@"freshReadback":@NO}];});
+   @"warmThreads":@0,@"aliasGiB":@8,@"fenceLag":@YES,@"freshReadback":@YES}];});
  return d;
 }
 static NSArray<NSString *> *startup_keys(void){return @[@"mode",@"renderRes",@"customWidth",@"customHeight",@"perfLog",@"asyncCompile",@"pauseHidden",@"fpsCap",@"fpsCounter",@"shaderCounter",@"loadCounter",@"warmThreads",@"aliasGiB"];}
@@ -508,7 +508,7 @@ static NSTextField *label(NSString *text){return [NSTextField labelWithString:te
   @[@"Diagnostics",grid(@[@[note_label(@"For finding rendering problems. Both apply immediately.")],
     @[label(@"Culling:"),self.occlVisible],@[[NSGridCell emptyContentView],note_label(@"Objects that vanish for a frame while the camera moves: if they stay with this on, the game's occlusion culling hid them. Draws more, so it costs some speed. Off again at every launch.")],
     @[label(@"Frame pacing:"),self.fenceLag],@[[NSGridCell emptyContentView],note_label(@"On (default): faster in busy areas, but the game sees GPU results one frame later. Off: the Switch's timing. Kept for the next launch.")],
-    @[label(@"Readbacks:"),self.freshReadback],@[[NSGridCell emptyContentView],note_label(@"With frame fence lag on: results the game reads back from the GPU (likely what hides distant objects) are waited for, only up to the compute work that writes them. Costs about 10% FPS. Kept for the next launch.")]])]];
+    @[label(@"Readbacks:"),self.freshReadback],@[[NSGridCell emptyContentView],note_label(@"With frame fence lag on: results the game reads back from the GPU (likely what hides distant objects) are waited for, only up to the compute work that writes them. On by default; costs up to about 10% FPS in busy areas. Kept for the next launch.")]])]];
  for(NSArray *t in tabSpecs){NSTabViewItem *i=[NSTabViewItem tabViewItemWithViewController:[NSViewController new]];i.label=t[0];i.view=t[1];[tabs addTabViewItem:i];}
  self.restartNote=note_label(@"Some changes apply on next launch.");
  self.restart=[NSButton buttonWithTitle:@"Restart Game" target:self action:@selector(restartGame:)];
@@ -598,7 +598,7 @@ static NSTextField *label(NSString *text){return [NSTextField labelWithString:te
  [a addButtonWithTitle:@"Reset"];[a addButtonWithTitle:@"Cancel"];
  if([a runModal]!=NSAlertFirstButtonReturn)return;
  NSUserDefaults *d=settings_defaults();for(NSString *k in d.dictionaryRepresentation.allKeys)[d removeObjectForKey:k];
- runtime_output_mode_set(0);dm_gfx_set_flag("mfx_interp",0);dm_gfx_set_flag("occl_visible",0);dm_nvn_fence_lag_set(1);nvn_lag_readback_set(0);dm_gfx_set_flag("mfx_upscale",0);if(!fps_overlay_hints_enabled())runtime_shortcut_help_toggle();
+ runtime_output_mode_set(0);dm_gfx_set_flag("mfx_interp",0);dm_gfx_set_flag("occl_visible",0);dm_nvn_fence_lag_set(1);nvn_lag_readback_set(2);dm_gfx_set_flag("mfx_upscale",0);if(!fps_overlay_hints_enabled())runtime_shortcut_help_toggle();
  [self load];
 }
 /* Quit like the window's close button (a save in progress is finished first), then open the app again. */

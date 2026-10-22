@@ -2094,15 +2094,17 @@ void nvn_x_drain(void) { x_drain(); }
 uint64_t nvn_x_backlog(void);   // submissions queued for the translation thread and not replayed yet (readback diagnostic)
 static uint64_t x_sub_queued(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); return v; }
 static uint64_t x_sub_ran(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_done; pthread_mutex_unlock(&g_xq_mu); return v; }
-/* TOTK_LAG_READBACK=1 (opt-in; with the frame fence lag): the game reads back buffers the GPU writes (compute
+/* TOTK_LAG_READBACK (with the frame fence lag; default 2, =0 off): the game reads back buffers the GPU writes (compute
    results, ~10 ranges a frame) after its frame-fence wait, which the lag answered one frame early: 95% of those reads came
    before their producer's GPU work had completed (2026-10-22), and objects in the distance vanished while the camera
    moved. A buffer readback (mtl_pool_invalidate over memory a GPU command writes) first waits for the frame fence
-   placement the lagged wait skipped. Returns 1 when it had to wait; the time is added to *ns.
-   Off by default: the game reads these buffers right after its frame wait, so the wait gives back the whole lag (bench at
-   the player's shrine save, 900p: 101 -> 59 FPS in the world, fence lag off 61) while the early reads drop 83% -> 20%. */
+   placement the lagged wait skipped (mode 1). Returns 1 when it had to wait; the time is added to *ns.
+   Mode 1 gives back the whole lag, since the game reads these buffers right after its frame wait (bench at the player's
+   shrine save, 900p: 101 -> 59 FPS in the world, fence lag off 61). Mode 2, the default, waits only for the early commit
+   after each producer dispatch (nvn_mtl.m rb_lag2_wait): about 90 FPS there, and the vanishing objects are gone (David's
+   play, 2026-10-22). */
 static _Atomic int g_lag_rb = -1;   // TOTK_LAG_READBACK at start, then the settings window's Diagnostics switch (nvn_lag_readback_set)
-static int lag_readback_on(void) { int v = atomic_load_explicit(&g_lag_rb, memory_order_relaxed); if (v < 0) { const char *e = getenv("TOTK_LAG_READBACK"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 0;
+static int lag_readback_on(void) { int v = atomic_load_explicit(&g_lag_rb, memory_order_relaxed); if (v < 0) { const char *e = getenv("TOTK_LAG_READBACK"); v = e ? atoi(e) : 2; if (v < 0 || v > 2) v = 0;
     if (v) LOG("[nvn] buffer readbacks wait for %s (TOTK_LAG_READBACK=%d)", v == 2 ? "their producer's early commit in the frame the lagged wait skipped" : "the lagged frame fence", v); atomic_store(&g_lag_rb, v); } return v; }
 void nvn_lag_readback_set(int v) { if (v < 0 || v > 2) v = 0; atomic_store(&g_lag_rb, v); LOG("[nvn] buffer readbacks (settings): mode %d", v); }
 int nvn_lag_readback_get(void) { return lag_readback_on(); }
