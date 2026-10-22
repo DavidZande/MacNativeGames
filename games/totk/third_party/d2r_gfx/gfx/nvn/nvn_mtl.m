@@ -5527,6 +5527,12 @@ static NSArray *rt_local(const uint8_t *control, int st);
 /* From upstream PR #28: the draw predictor (pso_predict_rest) only looks programs up. prog_get hashes shader code and can
    start translations and library loads for a draw that is only predicted, on the submit thread inside the frame. A
    program not built yet is just not predicted; when it is actually drawn, prog_get handles it as before. */
+// The shader key: SHA-256 of the control section and the code, in hex (prog_get; prediction of unseen programs).
+static void shader_key_of(const uint8_t *control, const void *code, uint32_t length, char key[65]) {
+    uint8_t md[32];CC_SHA256_CTX ctx;CC_SHA256_Init(&ctx);CC_SHA256_Update(&ctx,control,0x880);
+    CC_SHA256_Update(&ctx,code,length);CC_SHA256_Final(md,&ctx);
+    for(unsigned j=0;j<32;j++)snprintf(key+2*j,3,"%02x",md[j]);
+}
 static __unsafe_unretained NvProg *prog_get_cached(const prog_t *cp) {   // submit thread only
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;
@@ -8082,6 +8088,56 @@ static int prog_prediction_stages(const prog_t *p, NvShader **vs, NvShader **fs)
     }
     *vs = stages[0]; *fs = stages[1]; return 1;
 }
+/* From upstream PR #209 (feeeei): a program the game has not drawn yet, or a binding variant it has not drawn with, was
+   skipped by prediction (resolving it translates and compiles on the submission thread), so in a world entry most of
+   those pipelines were compiled one after another at their draws, although their shaders were already loaded (the
+   warm-up's libraries, or another program with the same shader). Prediction now does the draw's lookup without
+   translating (totk_rt_variant_cached) and uses the shader only when g_shcache already holds it, so the draw later gets
+   the same shader objects, the same pipeline key and the pipeline compiled in the background. No program is created and
+   no program's variants change. TOTK_PSO_PREDICT_UNSEEN=0 turns this off. Unlike upstream, a guess whose descriptor needs
+   a patched function not compiled yet is not deferred (pso_desc compiles it, as for any prediction). */
+static int pred_unseen_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_PREDICT_UNSEEN"); v = !e || atoi(e); MLOG("[totk] prediction of unseen programs / variants (TOTK_PSO_PREDICT_UNSEEN): %s", v ? "on" : "off"); } return v; }
+static uint64_t g_pp_unseen, g_pp_unseen_hit, g_pp_unseen_ns;   // draws scanned whose program / variant was not resolved; of them, predicted from loaded shaders; time looking them up
+static NvShader *loaded_variant(NSString *key, int st) {
+    NSString *v = key && g_shcache.count ? totk_rt_variant_cached(key, rt_answers(st)) : nil;
+    return v ? g_shcache[[v stringByAppendingString:@"_b"]] : nil;
+}
+static int prog_prediction_unseen(const prog_t *p, NvShader **vs, NvShader **fs) {
+    if (!p || !pred_unseen_on()) return 0;
+    NvProg *pr = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
+    if (pr && pr->missing) return 0;
+    NvShader *stages[2] = {nil, nil};
+    if (pr) for (int st = 0; st < 2; st++) {
+        if (!pr->sh[st]) { if (!st) return 0; continue; }
+        uint64_t sig = stage_sig(st);
+        stages[st] = sig == pr->sig[st] ? pr->sh[st] : pr->alt[st][@(sig)];
+        if (stages[st]) continue;
+        if (pr->miss_has[st] && sig == pr->miss_sig[st]) return 0;   // iOS: known not translated
+        if (!(stages[st] = loaded_variant(pr->key[st], st))) return 0;
+    } else {
+        // The stages' shader keys, kept per program serial (a new serial at every SetShaders): hashing the code again
+        // in every scan took much of a scan's time. Empty: not a vertex / fragment program.
+        static NSMutableDictionary<NSNumber *, NSArray *> *keys;
+        NSArray *ks = p->serial ? keys[@(p->serial)] : nil;
+        if (!ks) {
+            NSMutableArray *a = [NSMutableArray array]; int have[2] = {0, 0};
+            for (unsigned i = 0; i < p->nstage && p->nstage <= 6; i++) {   // as prog_get
+                const uint8_t *control = p->sd[i].control; const void *code = (const void *)(uintptr_t)p->sd[i].data; uint32_t length = 0, st = 0;
+                if (!control || !code) { [a removeAllObjects]; break; }
+                memcpy(&length, control + 0x704, 4); memcpy(&st, control + 0x714, 4);
+                if (!length || length > 16 * 1024 * 1024 || st > 1 || have[st]) { [a removeAllObjects]; break; }
+                char key[65]; shader_key_of(control, code, length, key); have[st] = 1;
+                [a addObject:@[@(key), @(st)]];
+            }
+            if (!have[0]) [a removeAllObjects];
+            ks = a;
+            if (p->serial) { if (!keys || keys.count >= 4096) keys = [NSMutableDictionary dictionary]; keys[@(p->serial)] = ks; }
+        }
+        if (!ks.count) return 0;
+        for (NSArray *e in ks) { int st = [e[1] intValue]; if (!(stages[st] = loaded_variant(e[0], st))) return 0; }
+    }
+    *vs = stages[0]; *fs = stages[1]; return 1;
+}
 // Attach modes guessed for one draw: v = 0 the pass's own depth / stencil, 1 neither, 2 stencil only, 3 depth only
 // (ds_scan drops the planes no draw uses, which is only known at replay).
 static const uint8_t PRED_DEPTH[4] = {1, 0, 0, 1}, PRED_STENCIL[4] = {1, 0, 1, 0};
@@ -8119,6 +8175,8 @@ static void pso_predict_rest(void) {
     }
     uint64_t started = bp_now();
     static struct { pso_key k; void *vs, *fs; } qa[QN], qb[QN]; int na = 0, nb = 0;
+    // unseen programs looked up in this scan (prog_prediction_unseen), a hash table whose entries of earlier scans are free
+    enum { UN = 1024 }; static struct { const prog_t *p; uint64_t serial, s0, s1, scan; void *vs, *fs; } um[UN]; static uint64_t ugen; ugen++;
     int stop = 0;   // which budget ended the scan: 1 commands, 2 keys, 3 time (0: end of the submission)
     for (int guard = 0; ; guard++) {
         if (guard >= max_ops) { stop = 1; break; }
@@ -8141,7 +8199,27 @@ static void pso_predict_rest(void) {
         if (hq.op == OP_DRAW || hq.op == OP_DRAW_IDX) {
             draws++;
             NvShader *vs = nil, *fs = nil;
-            if (!S.prog || !prog_prediction_stages(S.prog, &vs, &fs)) continue;   // lookup only (prog_get_cached), the state's variant
+            if (!S.prog) continue;
+            if (!prog_prediction_stages(S.prog, &vs, &fs)) {   // lookup only (prog_get_cached), the state's variant
+                if (!pred_unseen_on()) continue;
+                g_pp_unseen++;
+                // the same unseen program with the same signatures again in this scan: the answer found before
+                uint64_t s0 = stage_sig(0), s1 = stage_sig(1);
+                uint64_t h = ((uint64_t)(uintptr_t)S.prog ^ S.prog->serial * 0x9E3779B97F4A7C15ull ^ s0 * 0xC2B2AE3D27D4EB4Full ^ s1 * 0x165667B19E3779F9ull) * 0x9E3779B97F4A7C15ull;
+                typeof(um[0]) *e = NULL; int found = 0;
+                for (unsigned j = 0, i = (unsigned)(h >> 54); j < 8 && !e; j++) {   // open addressing, 8 probes
+                    typeof(um[0]) *c = &um[(i + j) & (UN - 1)];
+                    if (c->scan != ugen) e = c;
+                    else if (c->p == S.prog && c->serial == S.prog->serial && c->s0 == s0 && c->s1 == s1) e = c, found = 1;
+                }
+                if (found) { if (!e->vs) continue; vs = (__bridge NvShader *)e->vs; fs = (__bridge NvShader *)e->fs; }
+                else {
+                    uint64_t t0 = bp_now(); int ok = prog_prediction_unseen(S.prog, &vs, &fs); g_pp_unseen_ns += bp_now() - t0;
+                    if (e) *e = (typeof(um[0])){S.prog, S.prog->serial, s0, s1, ugen, ok ? (__bridge void *)vs : NULL, ok ? (__bridge void *)fs : NULL};
+                    if (!ok) continue;
+                }
+                g_pp_unseen_hit++;
+            }
             for (int v = 0; v < 4; v++) {
                 if (!pred_guess_wanted(v, dfull, sfull, fs)) continue;
                 pso_key k; pso_key_fill(&k, vs, fs, cf, PRED_DEPTH[v] ? dfull : 0, PRED_STENCIL[v] ? sfull : 0, samples, 0);
@@ -8164,6 +8242,9 @@ static void pso_predict_rest(void) {
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("并行预编：本次提交余下 %d 次绘制，丢给后台 %d 条管线", draws, (int)g_pp_kicked - kicked0);
     g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
     g_pp_more = stop != 0;
+    if (g_pp_scans % 100 == 0 && g_pp_unseen)
+        MLOG("[pso-predict] unseen programs / variants: %llu draws scanned, %llu predicted from loaded shaders (lookups %.1f ms)",
+             (unsigned long long)g_pp_unseen, (unsigned long long)g_pp_unseen_hit, g_pp_unseen_ns / 1e6);
     if (g_pp_scans % 100 == 0) {
         pthread_mutex_lock(&g_pp_mu); uint64_t full = g_pp_full, waits = g_pp_waits, wait_ns = g_pp_wait_ns; int busy = 0;
         for (int i = 0; i < PSO_PEND_MAX; i++) busy += g_pp[i].used; pthread_mutex_unlock(&g_pp_mu);
