@@ -566,6 +566,7 @@ static int fence_lag_active(void);
 static int async_replay(void);
 static struct { int fenced; uint64_t fence; } g_lag_prev;   /* TOTK_FENCE_LAG: the frame fence's previous placement */
 static uint64_t g_lag_waits, g_lag_early;
+static _Atomic uint64_t g_lag_real;   /* the frame fence placement the last lagged wait did not wait for: (token << 1) | is_token */
 static int is_frame_fence(const NVNsync *s) { return g_game_sys && (uintptr_t)s == *(const uintptr_t *)(uintptr_t)(g_game_sys + 0x1d8); }
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; int tok; uint64_t v = fence_now(&tok);
     if (async_replay() && is_frame_fence(s)) { g_lag_prev.fenced = ((sync_t *)s)->fenced; g_lag_prev.fence = ((sync_t *)s)->fence; }
@@ -583,6 +584,7 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     sync_t lag;   /* TOTK_FENCE_LAG: the frame fence waits for the previous frame's placement instead */
     if (fence_lag_active() && is_frame_fence(s) && g_lag_prev.fenced) {
+        atomic_store(&g_lag_real, ((const sync_t *)s)->fence << 1 | ((((const sync_t *)s)->fenced & 4) != 0));
         lag = (sync_t){o->magic, g_lag_prev.fenced, g_lag_prev.fence}; o = &lag; g_lag_waits++;
         if ((g_lag_waits & 1023) == 1) LOG("[nvn] fence lag: %llu frame-fence waits answered one frame late, %llu of them before the current frame's fence", (unsigned long long)g_lag_waits, (unsigned long long)g_lag_early);
         int ctok = (((const sync_t *)s)->fenced & 4) != 0; if (!(ctok ? fence_wait(((const sync_t *)s)->fence, 0) : mtl_wait(((const sync_t *)s)->fence, 0))) g_lag_early++;
@@ -2091,6 +2093,24 @@ void nvn_x_drain(void) { x_drain(); }
 uint64_t nvn_x_backlog(void);   // submissions queued for the translation thread and not replayed yet (readback diagnostic)
 static uint64_t x_sub_queued(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); return v; }
 static uint64_t x_sub_ran(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_done; pthread_mutex_unlock(&g_xq_mu); return v; }
+/* TOTK_LAG_READBACK=1 (opt-in; with the frame fence lag): the game reads back buffers the GPU writes (compute
+   results, ~10 ranges a frame) after its frame-fence wait, which the lag answered one frame early: 95% of those reads came
+   before their producer's GPU work had completed (2026-10-22), and objects in the distance vanished while the camera
+   moved. A buffer readback (mtl_pool_invalidate over memory a GPU command writes) first waits for the frame fence
+   placement the lagged wait skipped. Returns 1 when it had to wait; the time is added to *ns.
+   Off by default: the game reads these buffers right after its frame wait, so the wait gives back the whole lag (bench at
+   the player's shrine save, 900p: 101 -> 59 FPS in the world, fence lag off 61) while the early reads drop 83% -> 20%. */
+static int lag_readback_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_LAG_READBACK"); v = e && atoi(e) > 0; if (v) LOG("[nvn] buffer readbacks wait for the lagged frame fence (TOTK_LAG_READBACK=1)"); } return v; }
+int nvn_lag_readback_on(void) { return fence_lag_active() && lag_readback_on(); }
+int nvn_lag_readback_wait(uint64_t *ns) {
+    if (!nvn_lag_readback_on()) return 0;
+    uint64_t r = atomic_load(&g_lag_real), k = r >> 1; int tok = r & 1;
+    if (!k || (tok ? fence_wait(k, 0) : mtl_wait(k, 0))) return 0;
+    uint64_t t0 = now_ns();
+    if (!(tok ? fence_wait(k, 2000000000ull) : mtl_wait(k, 2000000000ull))) LOG("[nvn] buffer readback: the frame fence was not reached in 2 s; reading anyway");
+    if (ns) *ns += now_ns() - t0;
+    return 1;
+}
 uint64_t nvn_x_backlog(void) { uint64_t q = x_sub_queued(), r = x_sub_ran(); return q > r ? q - r : 0; }
 /* Local change (TOTK_FENCE_LAG, default on; needs the translation thread, TOTK_ASYNC_REPLAY): the game keeps one frame in flight. Its main
    thread waits on the frame fence (game system +0x1d8, fenced by the render thread right after the frame's submit,

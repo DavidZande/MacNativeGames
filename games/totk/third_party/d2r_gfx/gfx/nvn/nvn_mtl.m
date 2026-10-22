@@ -2843,8 +2843,10 @@ static rb_prod_ent g_rbp[1024]; static unsigned g_rbp_i;
 typedef struct { char key[9]; uint64_t reads, unfinished, backlog, bytes; } rb_buf_row;
 static rb_buf_row g_rbb[24]; static int g_rbb_n; static uint64_t g_rb_noprod, g_rb_backlog_any;
 static int rb_on(void);
+extern int nvn_lag_readback_on(void) __attribute__((weak)), nvn_lag_readback_wait(uint64_t *ns) __attribute__((weak));
+static int rb_lag_on(void) { return nvn_lag_readback_on && nvn_lag_readback_on(); }
 static void rb_prod(uint64_t lo, uint64_t n, const char *key) {
-    if (!rb_on() || !n) return;
+    if ((!rb_on() && !rb_lag_on()) || !n) return;
     pthread_mutex_lock(&g_rb_mu_early);
     rb_prod_ent *e = &g_rbp[g_rbp_i++ & 1023]; e->lo = lo; e->hi = lo + n; e->fence = g_fence + 1; e->frame = atomic_load(&g_cur_frame); snprintf(e->key, sizeof e->key, "%s", key ? key : "?");
     pthread_mutex_unlock(&g_rb_mu_early);
@@ -2858,6 +2860,20 @@ static void rb_note(const tex_t *t, int what, uint64_t age) {   // what: 1 writt
     if (!r && g_rb_n < 24) { r = &g_rb[g_rb_n++]; memset(r, 0, sizeof *r); r->w = t->d.width; r->h = t->d.height; r->fmt = t->d.format; r->lv = t->d.levels; }
     if (r) { r->reads++; if (what == 1) r->back++; else if (what == 0) r->skip++; else r->sup++; r->age_sum += age; if (age > r->age_max) r->age_max = age; }
     pthread_mutex_unlock(&g_rb_mu);
+}
+/* TOTK_LAG_READBACK (hle_nvn.c): a buffer readback over memory a GPU command writes waits for the frame fence the lagged
+   wait skipped. Called on the game's thread before the bytes are read. */
+static uint64_t g_rbl_waits, g_rbl_ns, g_rbl_checked;
+static void rb_lag_wait(uint64_t lo, uint64_t n) {
+    if (!rb_lag_on()) return;
+    int hit = 0;
+    pthread_mutex_lock(&g_rb_mu);
+    for (unsigned k = 0; k < 1024 && !hit; k++) { const rb_prod_ent *e = &g_rbp[k]; hit = e->hi > lo && e->lo < lo + n; }
+    g_rbl_checked++;
+    pthread_mutex_unlock(&g_rb_mu);
+    if (!hit) return;
+    uint64_t ns = 0;
+    if (nvn_lag_readback_wait(&ns)) { pthread_mutex_lock(&g_rb_mu); g_rbl_waits++; g_rbl_ns += ns; pthread_mutex_unlock(&g_rb_mu); }
 }
 static void rb_call(int overlaps, uint64_t lo_, uint64_t n) {
     if (!rb_on()) return;
@@ -2883,7 +2899,9 @@ static void rb_call(int overlaps, uint64_t lo_, uint64_t n) {
         static uint64_t last_rep[32];
         for (int i = 0; i < 32; i++) { if (g_cnt_report[i] != last_rep[i]) o += snprintf(line + o, sizeof line - o, " %d=%.1f", i, (g_cnt_report[i] - last_rep[i]) / nf); last_rep[i] = g_cnt_report[i]; }
         MLOG("%s", line);
-        MLOG("[readback]   buffer reads: %llu with no known GPU producer; %llu made while the translation thread still had submissions queued", (unsigned long long)g_rb_noprod, (unsigned long long)g_rb_backlog_any);
+        MLOG("[readback]   buffer reads: %llu with no known GPU producer; %llu made while the translation thread still had submissions queued; lagged-fence waits %llu of %llu checked (%.2f ms a frame)", (unsigned long long)g_rb_noprod, (unsigned long long)g_rb_backlog_any,
+             (unsigned long long)g_rbl_waits, (unsigned long long)g_rbl_checked, g_rbl_ns / 1e6 / nf);
+        g_rbl_waits = g_rbl_ns = g_rbl_checked = 0;
         for (int i = 0; i < g_rbb_n; i++) { const rb_buf_row *r = &g_rbb[i];
             MLOG("[readback]   buffer written by %s: %.2f reads a frame (%.1f KB), producer GPU work not finished at %llu of %llu reads, translation queue busy at %llu",
                  r->key, r->reads / nf, r->bytes / nf / 1024, (unsigned long long)r->unfinished, (unsigned long long)r->reads, (unsigned long long)r->backlog); }
@@ -2900,11 +2918,11 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { @autorelea
 static void mtl_pool_invalidate_inner(const pool_t *p, uint64_t off, uint64_t n) {
     if (!p || !p->mem || !atomic_load(&g_wb_on)) return;
     pthread_mutex_lock(&g_smu);
-    if (!g_wb.n) { pthread_mutex_unlock(&g_smu); rb_call(0, (uint64_t)(uintptr_t)(p->mem + off), n); return; }
+    if (!g_wb.n) { pthread_mutex_unlock(&g_smu); rb_lag_wait((uint64_t)(uintptr_t)(p->mem + off), n); rb_call(0, (uint64_t)(uintptr_t)(p->mem + off), n); return; }
     const uint8_t *a = p->mem + off, *z = a + n;
     int overlaps=0;
     for(uint32_t i=0;i<g_wb.cap;i++){wb_ent *e=g_wb.vals?g_wb.vals[i]:NULL;if(e&&e->t.mem<z&&e->t.mem+e->t.L.size>a){overlaps=1;break;}}
-    pthread_mutex_unlock(&g_smu);rb_call(overlaps,(uint64_t)(uintptr_t)a,n);if(!overlaps)return;
+    pthread_mutex_unlock(&g_smu);if(!overlaps)rb_lag_wait((uint64_t)(uintptr_t)a,n);rb_call(overlaps,(uint64_t)(uintptr_t)a,n);if(!overlaps)return;
     uint64_t i0=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     { extern void nvn_x_drain(void) __attribute__((weak)); if(nvn_x_drain)nvn_x_drain(); }
     uint64_t i1=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);

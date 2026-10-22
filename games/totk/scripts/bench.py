@@ -304,7 +304,7 @@ def play(name, args, rd, cmd_file, perf_off, phase, phases, raw_phases, samples_
         loading = lambda: any(draws(x) < 100 for x in perf_rows_since(perf_off)[press_row:])
         for i in range(4):
             send(cmd_file, f'key {KEY_A} 150'); send(cmd_file, f'shot {rd}/{name}-press{i + 1}.png')
-            if wait_for(loading, 8): break
+            if wait_for(loading, 8 if i < 3 else 45): break   # the last press waits longer: a slow title can take that long to start loading
         if not loading(): raise RuntimeError('no loading screen after pressing A')
         def world():
             r = perf_rows_since(perf_off)[press_row:]
