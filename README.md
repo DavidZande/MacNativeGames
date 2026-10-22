@@ -21,8 +21,9 @@ environment switch listed.
 | No pipeline builds on the render thread | one 8.7 s freeze at world entry gone | `TOTK_PSO_OMIT_SYNC=1` |
 | Shaders precompiled to `.metallib` and loaded from disk | after a shader cache clear: startup wait 74 → 17 s | `TOTK_RT_METALLIB=0` |
 | RomFS read cache | world-entry read time −30–35 % | `TOTK_ROMFS_CACHE=0` |
+| GPU results the game reads back wait for the compute work that writes them | objects no longer vanish while the camera moves; up to ~10 % FPS in busy areas | `TOTK_LAG_READBACK=0` |
 
-Also: a settings window (Cmd-,), rolling save backups, screenshots (F12), and a stutter recorder (F9) that writes
+Also: a settings window (Cmd-,) with live diagnostic switches, rolling save backups, screenshots (F12), and a stutter recorder (F9) that writes
 frame timings to `~/Library/Logs/MacNativeGames/flight/`. The commit-by-commit breakdown for upstream is in
 [UPSTREAMING.md](UPSTREAMING.md). The investigation notes are kept at the
 [`notes-2026-10-21`](https://github.com/DavidZande/MacNativeGames/tree/notes-2026-10-21/docs) tag.
